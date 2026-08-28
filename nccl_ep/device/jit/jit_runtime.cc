@@ -474,24 +474,7 @@ CUresult launch_function(
         CU_LAUNCH_PARAM_END
     };
 
-    // Default path: plain cuLaunchKernel (no cooperative / cluster attributes).
     const bool needs_cluster = (variant.cluster_dim_x > 1 || variant.cluster_dim_y > 1 || variant.cluster_dim_z > 1);
-    if (!variant.cooperative && !needs_cluster) {
-        return cuLaunchKernel(
-            function,
-            variant.num_blocks,
-            1,
-            1,
-            variant.block_dim,
-            1,
-            1,
-            static_cast<unsigned int>(variant.dynamic_smem_bytes),
-            reinterpret_cast<CUstream>(stream),
-            single_arg ? single_arg_array : nullptr,
-            single_arg ? nullptr : extra);
-    }
-
-    // Attributes path: use cuLaunchKernelEx with cooperative and/or cluster dim.
     // LL kernels need cooperative for cg::this_grid().sync() and use a cluster
     // dim of 2 when num_blocks is even.
     // Value-initialize attrs[] so the union/pad bytes are well-defined.
@@ -519,7 +502,7 @@ CUresult launch_function(
     config.blockDimZ = 1;
     config.sharedMemBytes = static_cast<unsigned int>(variant.dynamic_smem_bytes);
     config.hStream = reinterpret_cast<CUstream>(stream);
-    config.attrs = attrs;
+    config.attrs = num_attrs == 0 ? nullptr : attrs;
     config.numAttrs = num_attrs;
 
     return cuLaunchKernelEx(&config, function, single_arg ? single_arg_array : nullptr, single_arg ? nullptr : extra);
