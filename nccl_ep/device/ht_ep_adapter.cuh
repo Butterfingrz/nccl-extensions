@@ -491,7 +491,8 @@ ncclResult_t launch_dispatch_pull(
     void* caller_offsets = nullptr,
     void* caller_counts = nullptr,
     void* caller_recv_total = nullptr,
-    bool caller_out_is_int64 = false);
+    bool caller_out_is_int64 = false,
+    bool nucs = false);
 
 // Minimum shared-memory bytes launch_dispatch_pull requires for a given row width
 // (int4 units): what a single pull warp needs, static and dynamic. Callers compare this
@@ -532,7 +533,8 @@ ncclResult_t launch_combine_push(
     const int32_t* srcpos_map = nullptr,
     bool backward = false,
     // When true, run the intra-LSA head/tail sync as separate kernels around this launch.
-    bool unfused_sync = false);
+    bool unfused_sync = false,
+    bool nucs = false);
 
 ncclResult_t launch_combine_reduce_stage(
     void* attn_output,

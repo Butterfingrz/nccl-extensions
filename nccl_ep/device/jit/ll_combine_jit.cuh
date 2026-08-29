@@ -137,8 +137,10 @@ inline ncclResult_t launch_ll_combine(
     int numWarps,
     int dynamic_smem_bytes,
     const combine_kernel_args_t& args,
-    cudaStream_t stream) {
-    const LlCombineAlgo algo = ll_combine_select_algo(nvlinkOnly, qrecipe, useLogFmt, layout, cftEnabled, hidden, tokenDtype);
+    cudaStream_t stream,
+    bool nucs) {
+    const LlCombineAlgo algo =
+        ll_combine_select_algo(nvlinkOnly, qrecipe, useLogFmt, layout, cftEnabled, hidden, tokenDtype);
     const bool twoSidedRmLsa = algo == LlCombineAlgo::k2SidedRmLsa;
 
     const char* recipe_literal = twoSidedRmLsa ? "" : ::nccl_ep::jit::combine_recipe_literal(qrecipe);
@@ -166,6 +168,7 @@ inline ncclResult_t launch_ll_combine(
     variant.num_blocks = numSms;
     variant.block_dim = numWarps * 32;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
+    variant.nucs = nucs;
     if (qrecipe == NCCL_EP_COMB_QUANT_NVFP4) {
         // Recipe validation has already checked toolkit and device support.
         variant.min_sm = 100;

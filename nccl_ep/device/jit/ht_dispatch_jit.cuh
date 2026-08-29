@@ -235,6 +235,7 @@ inline ncclResult_t launch_dispatch(
     variant.num_blocks = config.num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
+    variant.nucs = env != nullptr && nccl_ep_env_flag_on(env->nucs);
 
     // Dump the effective kernel parameters once per distinct variant, just before
     // the launch, when the env config asks for verbose output on this rank.
@@ -641,7 +642,7 @@ inline std::string dispatch_pull_jit_source(int hidden_int4, int blocks_per_sm, 
 
 inline ncclResult_t
 launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, ncclEpDispQuant_t recipe,
-                        cudaStream_t stream) {
+                     cudaStream_t stream, bool nucs) {
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
@@ -707,6 +708,7 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
     const int payload_warps = pull_warps - map_warps;
     variant.dynamic_smem_bytes = pull_dynamic_smem_bytes(hidden_int4, scale_tma_row_bytes, payload_warps) +
         static_cast<int>(map_smem_bytes);
+    variant.nucs = nucs;
 
     std::string error;
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);

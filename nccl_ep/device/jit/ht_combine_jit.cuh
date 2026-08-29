@@ -195,6 +195,7 @@ inline ncclResult_t launch_combine(
     variant.num_blocks = config.num_of_blocks;
     variant.block_dim = L.block_dim;
     variant.dynamic_smem_bytes = dynamic_smem_bytes;
+    variant.nucs = env != nullptr && nccl_ep_env_flag_on(env->nucs);
 
     // Dump the effective kernel parameters once per distinct variant, just before
     // the launch, when the env config asks for verbose output on this rank.
@@ -525,7 +526,8 @@ inline ncclResult_t launch_combine_push(
     ::ht_ep::combine_push_param_t& param,
     cudaStream_t stream,
     ncclDataType_t token_dtype = ncclBfloat16,
-    bool backward = false) {
+    bool backward = false,
+    bool nucs = false) {
     static const int variant_identity = 0;
     assert((row_bytes % 16) == 0);
     const int hidden_int4 = row_bytes / 16;
@@ -591,6 +593,7 @@ inline ncclResult_t launch_combine_push(
     variant.block_dim = block_dim;
     variant.dynamic_smem_bytes =
         static_cast<int>(::ht_ep::combine_push_dynamic_smem_bytes(hidden_int4, slots));
+    variant.nucs = nucs;
 
     std::string error;
     const ::nccl_ep::jit::JitKernelStatus status =

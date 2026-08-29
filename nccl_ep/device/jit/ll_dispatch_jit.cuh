@@ -166,7 +166,8 @@ inline ncclResult_t launch_ll_dispatch(
     NcclEpDispatchLsaMode lsaMode,
     int maxDynamicSmem,
     const dispatch_kernel_args_t& args,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool nucs) {
     const bool cftEnabled = cft_smem_bytes != 0;
     const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout, cftEnabled, lsaMode, hidden, tokenDtype);
     const bool twoSidedRmLsa = algo == LlDispatchAlgo::k2SidedRmLsa;
@@ -247,6 +248,7 @@ inline ncclResult_t launch_ll_dispatch(
     // disabled, see ll_dispatch_select_algo) use dynamic shared memory; store-only dispatch needs
     // none.
     variant.dynamic_smem_bytes = cftEnabled ? cft_smem_bytes : tmaDynamicSmemBytes;
+    variant.nucs = nucs;
     // Always cooperative: kDefault needs its grid-wide SEND/RECV sync;
     // k2SidedRmLsa/k2SidedRmLsaTma use it for efficient cross-CTA atomic coordination.
     variant.cooperative = true;

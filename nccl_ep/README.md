@@ -346,6 +346,10 @@ export NCCL_DEV_API_JIT=1
 > The runtime lib and headers must come from the same NCCL installation; mixing Device API layouts is unsupported.
 > Forward compatibility is unsupported: the runtime NCCL version must not be older than the build version.
 
+Set `NCCL_EP_ENABLE_NUCS=1` to request NVLink utilization-centric scheduling communication kernels.
+It is disabled by default and requires the library to be built with CUDA 13.3 or newer headers
+and run with a CUDA 13.3 or newer driver.
+
 ### High-Throughput tuning
 
 ```bash

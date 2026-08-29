@@ -5038,13 +5038,13 @@ ncclResult_t ncclEpDispatch(
                 switch (recipe) {
                     case NCCL_EP_DISP_QUANT_NONE:
                         return nccl_ep::ll::call_dispatch(
-                            params, NCCL_EP_DISP_QUANT_NONE, stream);
+                            params, NCCL_EP_DISP_QUANT_NONE, stream, nccl_ep_env_flag_on(group->env.nucs));
                     case NCCL_EP_DISP_QUANT_FWD:
                         return nccl_ep::ll::call_dispatch(
-                            params, NCCL_EP_DISP_QUANT_FWD, stream);
+                            params, NCCL_EP_DISP_QUANT_FWD, stream, nccl_ep_env_flag_on(group->env.nucs));
                     case NCCL_EP_DISP_QUANT_DS_FP8E3M4:
                         return nccl_ep::ll::call_dispatch(
-                            params, NCCL_EP_DISP_QUANT_DS_FP8E3M4, stream);
+                            params, NCCL_EP_DISP_QUANT_DS_FP8E3M4, stream, nccl_ep_env_flag_on(group->env.nucs));
                     default:
                         std::fprintf(stderr,
                                      "NCCL EP warning: unsupported LL dispatch recipe %d\n",
@@ -6130,7 +6130,8 @@ ncclResult_t ncclEpDispatch(
                     pull_caller_offsets,
                     pull_caller_counts,
                     pull_caller_recv_total,
-                    pull_caller_out_is_int64));
+                    pull_caller_out_is_int64,
+                    nccl_ep_env_flag_on(group->env.nucs)));
             } else {
                 // Count mode: the permute builds the flat2em rows inline from the
                 // MAP-written LERM (FWD only; BWD reuses the rows persisted by the FWD
@@ -6402,7 +6403,7 @@ ncclResult_t ncclEpCombine(
             // false: combine reads inData directly and uses windows only to
             // translate peer recv-buffer ptrs; the kernel's zeroCopy mode is
             // dispatch-shaped, so config.zero_copy is a dispatch-only switch.
-            auto launch_combine = [&](auto* topk_idx_data, bool topk_is_int64) {
+            auto launch_combine = [&](auto* topk_idx_data, bool topk_is_int64) -> ncclResult_t {
                 nccl_ep::ll::CombineParams params{};
                 params.inData = x_data;
                 params.inGlobalScales = global_scales ? static_cast<const float*>(global_scales->data) : nullptr;
@@ -6449,7 +6450,8 @@ ncclResult_t ncclEpCombine(
                 params.quantizationRecipe = quantization_recipe;
                 params.nvlinkOnly = nvlink_only;
                 params.cftEnabled = handle->group->ll_cft_buffers.initialized;
-                return nccl_ep::ll::call_combine(params, stream);
+                return nccl_ep::ll::call_combine(
+                    params, stream, nccl_ep_env_flag_on(handle->group->env.nucs));
             };
             switch (topk_idx->datatype) {
             case ncclInt32:
@@ -6718,7 +6720,8 @@ ncclResult_t ncclEpCombine(
                 backward_combine ? static_cast<const float*>(topk_weights->data) : nullptr,
                 backward_combine ? handle->ht.srcpos_map : nullptr,
                 backward_combine,
-                nccl_ep_env_flag_on(group->env.ht_unfused_sync)));
+                nccl_ep_env_flag_on(group->env.ht_unfused_sync),
+                nccl_ep_env_flag_on(group->env.nucs)));
             NCCLCHECK(nccl_ep::ht::launch_combine_reduce_stage(
                 combined_x->data,
                 staging,
@@ -7089,7 +7092,8 @@ ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
     clean_params.barrierSignalBase = ep_group->clean_barrier_signal_base;
     clean_params.timeoutCycles = ep_group->timeout_cycles;
 
-    NCCLCHECK(nccl_ep::ll::call_clean_low_latency_buffer(clean_params, stream));
+    NCCLCHECK(nccl_ep::ll::call_clean_low_latency_buffer(
+        clean_params, stream, nccl_ep_env_flag_on(ep_group->env.nucs)));
 
     // Reset all ranks to active (1 = active).
     // Sync the stream before returning so all_active outlives the async copy.

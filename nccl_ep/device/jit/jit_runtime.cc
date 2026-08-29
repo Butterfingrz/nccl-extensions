@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -41,6 +42,36 @@
 
 namespace nccl_ep {
 namespace jit {
+
+bool ensure_nucs_available() {
+#if CUDA_VERSION < 13030
+    if (announce_once("nucs_unavailable_cuda_headers")) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] NUCS was requested but this library was built with CUDA headers older than 13.3; "
+            "the launch is not supported.\n");
+    }
+    return false;
+#else
+    static const CUresult driver_support = [] {
+        int driver_version = 0;
+        const CUresult rc = cuDriverGetVersion(&driver_version);
+        if (rc != CUDA_SUCCESS) return rc;
+        return driver_version >= 13030 ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
+    }();
+    if (driver_support != CUDA_SUCCESS && announce_once("nucs_unavailable_cuda_driver")) {
+        std::fprintf(
+            stderr,
+            driver_support == CUDA_ERROR_NOT_SUPPORTED
+                ? "[nccl_ep] NUCS was requested but the CUDA driver is older than 13.3; "
+                  "the launch is not supported.\n"
+                : "[nccl_ep] NUCS was requested but the CUDA driver version could not be queried; "
+                  "the launch is not supported.\n");
+    }
+    return driver_support == CUDA_SUCCESS;
+#endif
+}
+
 namespace {
 
 struct LoadedKernelModule {
@@ -478,8 +509,16 @@ CUresult launch_function(
     // LL kernels need cooperative for cg::this_grid().sync() and use a cluster
     // dim of 2 when num_blocks is even.
     // Value-initialize attrs[] so the union/pad bytes are well-defined.
-    CUlaunchAttribute attrs[2]{};
+    CUlaunchAttribute attrs[3]{};
     unsigned int num_attrs = 0;
+    if (variant.nucs) {
+        if (!ensure_nucs_available()) return CUDA_ERROR_NOT_SUPPORTED;
+#if CUDA_VERSION >= 13030
+        attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_NVLINK_UTIL_CENTRIC_SCHEDULING;
+        attrs[num_attrs].value.nvlinkUtilCentricScheduling = 1;
+#endif
+        ++num_attrs;
+    }
     if (variant.cooperative) {
         attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
         attrs[num_attrs].value.cooperative = 1;

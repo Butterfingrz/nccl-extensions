@@ -41,6 +41,7 @@ struct JitKernelVariant {
     // Optional launch attributes (default = off).
     // Cooperative launch enables cg::this_grid().sync() inside the kernel.
     // Cluster dim > 1 enables distributed shared memory across the cluster.
+    bool nucs = false;
     bool cooperative = false;
     int cluster_dim_x = 1;
     int cluster_dim_y = 1;
@@ -81,6 +82,9 @@ JitKernelStatus launch_jit_kernel_cached(
     std::size_t kernel_param_size,
     cudaStream_t stream,
     std::string* error);
+
+// Returns whether NUCS is available with both the build headers and runtime driver.
+bool ensure_nucs_available();
 
 JitKernelStatus launch_jit_kernel(
     const JitKernelVariant& variant,

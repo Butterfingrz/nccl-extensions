@@ -2084,7 +2084,8 @@ ncclResult_t combine_impl(
         params.combine_recipe);
 
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
-    jit::combine_dump_warp_timing(combine_layout, num_blocks, d_wt, d_bt, stream);
+    if (combine_res == ncclSuccess)
+        jit::combine_dump_warp_timing(combine_layout, num_blocks, d_wt, d_bt, stream);
     CUDA_CHECK(cudaFree(d_wt));
     CUDA_CHECK(cudaFree(d_bt));
 #endif
@@ -2510,7 +2511,8 @@ ncclResult_t launch_dispatch_pull(
     void* caller_offsets,
     void* caller_counts,
     void* caller_recv_total,
-    bool caller_out_is_int64) {
+    bool caller_out_is_int64,
+    bool nucs) {
     assert(experts_per_rank > 0 && top_k <= ::ht_ep::kPullDispatchMaxActive);
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
@@ -2583,7 +2585,8 @@ ncclResult_t launch_dispatch_pull(
         }
         NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
     }
-    const ncclResult_t status = ::nccl_ep::ht::jit::launch_dispatch_pull(static_cast<int>(grid), p, recipe, stream);
+    const ncclResult_t status =
+        ::nccl_ep::ht::jit::launch_dispatch_pull(static_cast<int>(grid), p, recipe, stream, nucs);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
     if (unfused_sync) {
         NCCLCHECK(jit::launch_lsa_tail_sync(dcomm, grid_barrier_counter, head_sync_flag, stream));
@@ -2678,7 +2681,8 @@ ncclResult_t launch_combine_push(
     const float* topk_weights_em,
     const int32_t* srcpos_map,
     bool backward,
-    bool unfused_sync) {
+    bool unfused_sync,
+    bool nucs) {
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
     assert(sm_count > 0);
@@ -2716,7 +2720,7 @@ ncclResult_t launch_combine_push(
 
     if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(
-        top_k, row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward);
+        top_k, row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward, nucs);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
     if (unfused_sync) {
         NCCLCHECK(jit::launch_lsa_tail_sync(dcomm, grid_barrier_counter, head_sync_flag, stream));

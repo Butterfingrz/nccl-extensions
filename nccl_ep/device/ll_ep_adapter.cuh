@@ -442,11 +442,15 @@ struct CleanLowLatencyBufferParams {
 ncclResult_t call_dispatch(
     const DispatchParams& params,
     ncclEpDispQuant_t recipe,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    bool nucs = false);
 
-ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream = 0);
+ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream = 0, bool nucs = false);
 
-ncclResult_t call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream = 0);
+ncclResult_t call_clean_low_latency_buffer(
+    const CleanLowLatencyBufferParams& params,
+    cudaStream_t stream = 0,
+    bool nucs = false);
 
 } // namespace ll
 } // namespace nccl_ep

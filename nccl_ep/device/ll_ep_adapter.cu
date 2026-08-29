@@ -7,6 +7,7 @@
 #include "device/ll_ep_adapter.cuh"
 #include "device/macros.cuh"
 #include "common.hpp"
+#include "jit/jit_runtime.hpp"
 #include "jit/ll_dispatch_jit.cuh"
 #include "jit/ll_combine_jit.cuh"
 #include "jit/ll_clean_jit.cuh"
@@ -34,7 +35,8 @@ using ::nccl_ep::ceil_div;
 ncclResult_t call_dispatch(
     const DispatchParams& params,
     ncclEpDispQuant_t recipe,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool nucs) {
     if (params.numTopk <= 0 || params.numTopk > MAX_NUM_TOPK) {
         std::fprintf(stderr, "ncclEpDispatch: LL top-k %d is outside [1, %d]\n", params.numTopk, MAX_NUM_TOPK);
         return ncclInvalidArgument;
@@ -171,7 +173,8 @@ ncclResult_t call_dispatch(
         params.lsaMode,
         params.maxDynamicSmem,
         args,
-        stream);
+        stream,
+        nucs);
 }
 
 // ============================================================================
@@ -180,7 +183,7 @@ ncclResult_t call_dispatch(
 // Resolves (numSms, numWarps), computes the dynamic SMEM budget, packs args,
 // and hands off to launch_ll_combine() for JIT compile + launch.
 // ============================================================================
-ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
+ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool nucs) {
     if (params.numDeviceSms <= 0 || params.numExperts <= 0 || params.numCombinedTokens < 0) {
         std::fprintf(
             stderr,
@@ -307,13 +310,15 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
         numWarps,
         smem_size,
         args,
-        stream);
+        stream,
+        nucs);
 }
 
 // ============================================================================
 // LL buffer-clean wrapper
 // ============================================================================
-ncclResult_t call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream) {
+ncclResult_t
+call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& params, cudaStream_t stream, bool nucs) {
     clean_low_latency_buffer_kernel_args_t args{};
     args.clean_0 = params.clean_0;
     args.num_clean_int_0 = params.num_clean_int_0;
@@ -326,7 +331,7 @@ ncclResult_t call_clean_low_latency_buffer(const CleanLowLatencyBufferParams& pa
     args.barrierSignalBase = params.barrierSignalBase;
     args.timeoutCycles = params.timeoutCycles;
 
-    return jit::launch_ll_clean_low_latency_buffer(args, stream);
+    return jit::launch_ll_clean_low_latency_buffer(args, stream, nucs);
 }
 
 } // namespace ll
