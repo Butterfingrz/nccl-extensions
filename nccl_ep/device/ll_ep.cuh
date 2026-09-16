@@ -26,6 +26,7 @@
 #include "ll/ll_lsa_primitives.cuh"
 #include "ll/ll_mask.cuh"
 #include "ll/ll_logfmt.cuh"
+#include "ll_ep_cft.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -243,10 +244,16 @@ __forceinline__ __device__ int waitForRecvTokensRelaxed(
         } else {
             // TODO: Double check that we can rely on this + __threadfence_system() in dispatch?
             // to ensure consistency on "another" SM that's going to access the data buffer protected by this atomic
+            // Keep the acquire in the loop: its cache invalidation also acts
+            // as backoff. Hoisting it regressed store-path dispatch by 1.45%.
             while ((numRecvTokens = ld_acquire_sys_global((recvCntBuf + rankLaneIdx * numRanks + srcRank))) ==
                        0 // data not arrived
                    && (waitRecvCost = clock64() - startTime) <= timeoutCycles // not timeout
             );
+            // Clear the consumed count. This bank is reused two LL operations
+            // later, after the intervening round trip orders this store before
+            // the peer's next write. CFT relies on this instead of a bank wipe.
+            if (numRecvTokens != 0) st_relaxed_sys_global(recvCntBuf + rankLaneIdx * numRanks + srcRank, 0);
         }
     }
 
@@ -336,6 +343,48 @@ __forceinline__ __device__ void copyRecvTokenData(
     }
 }
 
+// CFT counts only set the receive target; the byte counter releases peer data.
+// Self data is ready after the grid barrier (or split-kernel boundary), after
+// all CTAs drain their TMA stores. Counts can therefore be published immediately.
+// Consumers clear the count words before the bank is reused two LL ops later.
+__device__ __forceinline__ void cftPublishCountEarly(
+    int expertBeginIdx,
+    int expertEndIdx,
+    const int* sharedNumTokensSentPerRank,
+    int laneId,
+    int currRank,
+    int numRanks,
+    int numLocalExperts,
+    size_t recvCntOff,
+    int* recvCntBuf,
+    int* asyncErrorFlag,
+    const ncclWindow_t* windows,
+    ncclDevComm* devComm) {
+    const int rankBeginIdx = expertBeginIdx / numLocalExperts;
+    const int rankEndIdx = expertEndIdx / numLocalExperts + 1;
+    // All expert count slots share one window at stride numRanks. Translate
+    // the first slot once to avoid repeating the peer lookup for every expert.
+    const auto chPtr = reinterpret_cast<uint64_t>(recvCntBuf + currRank);
+    const size_t chOff = recvCntOff + currRank * sizeof(int);
+    for (int dstRank = rankBeginIdx + laneId; dstRank < rankEndIdx; dstRank += 32) {
+        const int firstExpertIdx = dstRank * numLocalExperts;
+        if (firstExpertIdx < expertBeginIdx || firstExpertIdx >= expertEndIdx) continue;
+
+        const int numTokensSent = sharedNumTokensSentPerRank[dstRank - rankBeginIdx];
+        const auto dstP2pPtr = ncclGetP2pPtr(chPtr, chOff, currRank, dstRank, windows, devComm);
+        // CFT count publication requires a P2P mapping for every destination.
+        if (dstP2pPtr == 0) {
+            cftReportSendFailure(asyncErrorFlag, currRank, dstRank, "early count (no p2p mapping)");
+            continue;
+        }
+        int* const dstCnt = reinterpret_cast<int*>(dstP2pPtr);
+#pragma unroll 1  // Keep one copy of the store body.
+        for (int le = 0; le < numLocalExperts; ++le) {
+            st_relaxed_sys_global(dstCnt + le * numRanks, -numTokensSent - 1);
+        }
+    }
+}
+
 // Templated on the wire dtype (kTokenDtype) like combine/HT. All element widths come
 // from size_u8<kTokenDtype>(); the read stride is the input element width whether or
 // not the output is FP8 (so FP32-input quantization reads the correct stride too).
@@ -401,6 +450,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     ncclWindow_t rcvScalesWin = args.rcvScalesWin;
     size_t rcvScalesOffs = args.rcvScalesOffs;
 
+    // CFT parameters are zero-initialized unless collective setup succeeded.
+    const cft_dispatch_args_t cft = args.cft;
     const auto smId = static_cast<int>(blockIdx.x);
     const auto threadId = static_cast<int>(threadIdx.x);
     const auto warpId = threadId / 32, laneId = get_lane_id();
@@ -452,6 +503,26 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     constexpr int kNumMaxWarpGroups = kLlDispatchMaxWarpGroups;
     __shared__ int sharedNumTokensSentPerRank[kNumMaxWarpGroups];
 
+    // Tiles, peer IDs and destination scratch use dynamic shared memory;
+    // ll_ep_adapter.cu reserves the matching size. Request 128-byte alignment
+    // for transfer performance. Completion mbarriers must also be in shared
+    // memory: one for fabric puts and one per TMA staging slot.
+    using CftGeom = CftTileGeometry<kHidden, kNumTopk, kLayout>;
+    extern __shared__ __align__(128) uint8_t cft_dyn_smem_[];
+    __shared__ nccl_ep::cft::Smem cft_data_smem;  // 16 B aligned like ncclCftSmem
+    __shared__ __align__(8) uint64_t cft_tma_mbars[CftGeom::kRingDepth];
+#if NCCL_EP_CFT_DEVICE_SUPPORTED
+    // Device-only type (embeds cft::Cft); every use below is behind the same guard.
+    CftSendContext<CftGeom> cftSend =
+        cftCarveSendContext<CftGeom>(cft_dyn_smem_, &cft_data_smem, cft_tma_mbars, numRanks);
+#endif
+    // Rank-uniform gate for every CFT use site (send, count publish, receive).
+    const bool cft_enabled = cftDispatchEnabled<kRecipe, kTokenDtype>(cft, recvDataWindow, rcvScalesWin, rankMask);
+    // Initialize before the receive-only jump, which must not skip local state.
+#if NCCL_EP_CFT_DEVICE_SUPPORTED
+    if (cft_enabled && warpId == 0) cftInitSender(cftSend, cft.peerLeIds, numRanks, laneId);
+#endif
+
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0) goto LOW_LATENCY_DISPATCH_RECV;
 
@@ -476,6 +547,18 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
         // region using the slot index and picks NVLink (split layout) or
         // RDMA (interleaved layout) addressing internally.
         const size_t srcRankRegionBytes = static_cast<size_t>(maxTokensPerRank) * numBytesPerMsg;
+
+#if NCCL_EP_CFT_DEVICE_SUPPORTED
+        // Stage the first token; later payloads are staged by cftSendToken.
+        const CftSelfDestination cftSelf =
+            cftSelfDestination(recvBuf, currRank, numRanks, srcRankRegionBytes, maxTokensPerRank, dispatch_hdr_sz);
+        const CftMessageLayout cftMsg{dispatch_hdr_sz, hiddenBytes, payloadBytes, numBytesPerMsg};
+        if (cft_enabled && warpId == 0 && laneId == 0) cftCheckBulkAlignment(cftSelf, cftMsg);
+        if (cft_enabled && warpId == 0 && laneId == 0 && smId < numTokens) {
+            cftStagePayload(cftSend, 0, static_cast<const int4*>(inData) + static_cast<size_t>(smId) * hiddenBf16Int4,
+                            cftMsg);
+        }
+#endif
 
         // Split token processing across SMs
         for (int tokenIdx = smId; tokenIdx < numTokens; tokenIdx += numSms) {
@@ -551,11 +634,11 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
                 }
                 minTopkIdx = warp_reduce_min(minTopkIdx);
 
-                // If this warp is the first in topK for the dstRank, send the token.
-                if (minTopkIdx == warpId) {
+                // The first top-k warp for each rank sends on the store path.
+                // CFT sends all destinations through warp 0 below.
+                if (minTopkIdx == warpId && !cft_enabled) {
                     int slotIdx = laneId == 0 ? atomicAdd(rankSentCnt + dstRank, 1) : 0;
                     slotIdx = __shfl_sync(0xffffffff, slotIdx, 0);
-
                     // evenly distribute sends by available channels
                     const auto ctxHash = slotIdx % numLocalExperts;
                     // Per-srcRank region base on the peer; sendToken picks the
@@ -598,7 +681,20 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
                     }
                 }
             }
+#if NCCL_EP_CFT_DEVICE_SUPPORTED
+            // Warp 0 sends every destination from one staged tile, including
+            // self via TMA. It runs for each token regardless of its top-k entry.
+            if (cft_enabled && warpId == 0) {
+                cftSendToken<kNumTopk>(cftSend, cft, cftSelf, cftMsg, tokenIdx, numSms, numTokens, inTopkIdx,
+                                       static_cast<const int4*>(inData), hiddenBf16Int4, sendBufBase, rankSentCnt,
+                                       numLocalExperts, currRank, laneId, timeoutCycles, asyncErrorFlag);
+            }
+#endif
         }
+#if NCCL_EP_CFT_DEVICE_SUPPORTED
+        // Drain self TMA stores and fabric completions before leaving the CTA.
+        if (cft_enabled && warpId == 0 && laneId == 0) cftDrainSender(cftSend, timeoutCycles, asyncErrorFlag, currRank);
+#endif
     } else if (warpId == numWarps - 1) {
         // The reserved control warp is not part of the forwarding pipeline. Clear every
         // rank-major routing entry while sends are in flight; the cooperative
@@ -613,7 +709,9 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             }
         }
         EP_DEVICE_ASSERT(numSms > 1);
-        if (smId == 0) {
+        // CFT consumers clear their own count/flag words. A bank wipe would
+        // race early count publication, which does not wait for the wipe flag.
+        if (smId == 0 && !cft_enabled) {
             cleanNextRecvCntBuf(nextRecvCntBuf, nextRecvCntBufSize, laneId);
             // Notify before executing `int_p`
             __syncwarp();
@@ -648,14 +746,22 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             sharedNumTokensSentPerRank,
             laneId);
 
-// Note: however, only one warp updates the counter for each rank
+        if (cft_enabled) {
+            __syncwarp();
+            cftPublishCountEarly(
+                expertBeginIdx, expertEndIdx, sharedNumTokensSentPerRank, laneId,
+                currRank, numRanks, numLocalExperts, recvCntOff, recvCntBuf,
+                asyncErrorFlag, windows, devComm);
+        } else {
+            // One counting warp updates rankDone per rank on the store path.
 #pragma unroll
-        for (int i = rankBeginIdx + laneId; i < rankEndIdx; i += 32) {
-            int firstExpertIdx = i * numLocalExperts;
-            if (firstExpertIdx >= expertBeginIdx and firstExpertIdx < expertEndIdx) {
-                atomic_add_release_global(
-                    rankDone + i,
-                    FINISHED_SUM_TAG - sharedNumTokensSentPerRank[i - rankBeginIdx]);
+            for (int i = rankBeginIdx + laneId; i < rankEndIdx; i += 32) {
+                int firstExpertIdx = i * numLocalExperts;
+                if (firstExpertIdx >= expertBeginIdx and firstExpertIdx < expertEndIdx) {
+                    atomic_add_release_global(
+                        rankDone + i,
+                        FINISHED_SUM_TAG - sharedNumTokensSentPerRank[i - rankBeginIdx]);
+                }
             }
         }
     }
@@ -670,24 +776,29 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
         const auto dstExpertLocalIdx = responsibleExpertIdx % numLocalExperts;
         const auto numTokensSent = sharedNumTokensSentPerRank[dstRank - rankBeginIdx];
 
-        // Wait local sends issued and send expert counts
-        while (ld_acquire_global(rankDone + dstRank) != FINISHED_SUM_TAG * 2);
-        auto recvCntPtr = reinterpret_cast<uint64_t>(recvCntBuf + dstExpertLocalIdx * numRanks + currRank);
-        size_t recvCntOffset = recvCntOff + (dstExpertLocalIdx * numRanks + currRank) * sizeof(int);
-        // We are writing the rank counter (same value) via multiple expert-specific channels rank count to flush all previous tokens
-        sendExpertCount(
-            numTokensSent,
-            dstRank,
-            dstExpertLocalIdx,
-            currRank,
-            numRanks,
-            recvCntPtr,
-            recvCntOffset,
-            recvCntBuf,
-            rankMask,
-            signalsBase,
-            windows,
-            devComm);
+        // CFT counts were published by the counting warp. The store path
+        // must wait for payload completion before publishing its count.
+        if (not cft_enabled) {
+            // Also wait for the next-bank wipe: a peer may publish its next
+            // operation's count/flag as soon as it receives this count.
+            const int rankDoneTarget = FINISHED_SUM_TAG * 2;
+            while (ld_acquire_global(rankDone + dstRank) != rankDoneTarget);
+            auto recvCntPtr = reinterpret_cast<uint64_t>(recvCntBuf + dstExpertLocalIdx * numRanks + currRank);
+            size_t recvCntOffset = recvCntOff + (dstExpertLocalIdx * numRanks + currRank) * sizeof(int);
+            sendExpertCount(
+                numTokensSent,
+                dstRank,
+                dstExpertLocalIdx,
+                currRank,
+                numRanks,
+                recvCntPtr,
+                recvCntOffset,
+                recvCntBuf,
+                rankMask,
+                signalsBase,
+                windows,
+                devComm);
+        }
 
         // Clean `packed_recv_count` (expert-major only: outCnt is the per-expert slot allocator)
         if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
@@ -734,17 +845,21 @@ LOW_LATENCY_DISPATCH_RECV:
         int numRecvTokens;
         EP_DEVICE_ASSERT(numWarpsPerGroup > 1 and numWarpGroups <= kLlDispatchMaxWarpGroups);
 
-        // Per-source wire layout: NVLink (intra-LSA) peers use the split layout,
-        // cross-LSA RDMA peers the interleaved one. The mapping mirrors the
-        // sender-side ncclGetP2pPtr check above.
-        bool isNvlinkSrc = false;
+        // Match the sender's transport choice; self sends never use fabric.
+        const bool cft_for_recv = cftPairUsesCft(cft_enabled, srcRank, currRank)
+                                  && (cft.recvByteCounters != nullptr);
+
+        // recvBuf wire layout for non-CFT sources: NVLink (intra-LSA) peers use the
+        // split layout, cross-LSA RDMA peers the interleaved one.
+        bool isIntraLsa_srcRank = false;
         {
             ncclTeam lsa = ncclTeamLsa(*devComm);
             ncclTeam world = ncclTeamWorld(*devComm);
-            isNvlinkSrc = ncclTeamRankIsMember(lsa, world, srcRank);
+            isIntraLsa_srcRank = ncclTeamRankIsMember(lsa, world, srcRank);
         }
 
         if (subWarpId == 1 and laneId == 0) {
+            // Both transports receive the token count through recvCntBuf.
             numRecvTokens = waitForRecvTokensRelaxed(
                 srcRank,
                 rankLaneIdx,
@@ -760,6 +875,15 @@ LOW_LATENCY_DISPATCH_RECV:
                 recvStats,
                 waitStats,
                 timeoutCycles);
+
+            // For CFT, wait for the corresponding bytes and acquire the data.
+            if (cft_for_recv) {
+#if NCCL_EP_CFT_DEVICE_SUPPORTED
+                numRecvTokens = cftAwaitPayload(cftRecvChannel(cft, srcRank, rankLaneIdx, numLocalExperts),
+                                                numRecvTokens, numBytesPerMsg, timeoutCycles, asyncErrorFlag,
+                                                currRank, srcRank, rankLaneIdx);
+#endif
+            }
             atomic_add_release_global(rankArrivedCnt + srcRank, 1);
             sharedNumRecvTokens[warpGroupId] = numRecvTokens;
         }
@@ -778,10 +902,14 @@ LOW_LATENCY_DISPATCH_RECV:
             }
         }
 
-        // Per-source receive region: the sender's slot is relative to this
-        // receiver (relativeRankSlot); both layouts read from it below.
-        const uint8_t* const srcRankRecvBase = reinterpret_cast<const uint8_t*>(recvBuf) +
-            static_cast<size_t>(relativeRankSlot(srcRank, currRank, numRanks)) * maxTokensPerRank * numBytesPerMsg;
+        // CFT and RDMA use interleaved messages; NVLink stores use split layout.
+        const bool isNvlinkSrc = !cft_for_recv && isIntraLsa_srcRank;
+
+        // CFT indexes source regions by absolute rank; stores use relative rank.
+        const uint8_t* const srcRankRecvBase = cft_for_recv
+            ? cftRecvRegion(cft, srcRank)
+            : reinterpret_cast<const uint8_t*>(recvBuf) +
+                  static_cast<size_t>(relativeRankSlot(srcRank, currRank, numRanks)) * maxTokensPerRank * numBytesPerMsg;
 
         if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
             for (int i = rankLaneIdx * numWarpsPerGroup + subWarpId; i < numRecvTokens * numTopk;
@@ -1040,9 +1168,13 @@ __forceinline__ __device__ void waitForRecvFlag(
                 devComm, ctxIdWait, signalsBase + responsibleExpertIdx, /*threshold=*/1, startTime, timeoutCycles,
                 &waitRecvCost);
         } else {
-            while (ld_acquire_sys_global(recvFlagBuf + responsibleExpertIdx) == 0 // recv not ready
+            int flag;
+            while ((flag = ld_acquire_sys_global(recvFlagBuf + responsibleExpertIdx)) == 0 // recv not ready
                    && (waitRecvCost = clock64() - startTime) <= timeoutCycles // not timeout
             );
+            // Count and flag banks alternate across LL epochs. Clear this
+            // word here so CFT dispatch can skip the next-bank wipe.
+            if (flag != 0) st_relaxed_sys_global(recvFlagBuf + responsibleExpertIdx, 0);
         }
     }
     // Mask rank if timeout

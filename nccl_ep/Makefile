@@ -84,7 +84,9 @@ NCCL_EP_JIT_HEADERS := \
     device/ll/ll_mask.cuh \
     device/ll/ll_logfmt.cuh \
     device/ll/ll_dispatch_lsa.cuh \
-    device/ll/ll_combine_lsa.cuh
+    device/ll/ll_combine_lsa.cuh \
+    device/cft.cuh \
+    device/ll_ep_cft.cuh
 NCCL_EP_JIT_STAGED_HEADERS := include/common.hpp include/ep_enums.h include/cuda_fp_features.h
 NCCL_EP_JIT_STAGED_TARGETS := $(NCCL_EP_JIT_STAGED_HEADERS:include/%=$(JIT_DIR)/%)
 NCCL_EP_JIT_HEADER_TARGETS := $(NCCL_EP_JIT_HEADERS:%=$(JIT_DIR)/%) $(NCCL_EP_JIT_STAGED_TARGETS)
@@ -128,7 +130,7 @@ COMBINE_MAX_ACC ?= 64
 DEPFLAGS = -MMD -MP
 
 # Source files for library
-HOST_SRC := nccl_ep.cc nccl_ep_env.cc
+HOST_SRC := nccl_ep.cc nccl_ep_cft.cc nccl_ep_env.cc
 DEVICE_SRC := device/ll_ep_adapter.cu \
               device/ht_ep_adapter.cu
 HOST_SRC += device/jit/jit_utils.cc \

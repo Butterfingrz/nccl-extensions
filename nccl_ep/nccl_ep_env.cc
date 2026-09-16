@@ -92,6 +92,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_flag(cfg->ht_em_ag_scan_mode);
     parse_flag(cfg->ht_em_count_unfused);
     parse_flag(cfg->disable_guard);
+    parse_flag(cfg->ll_cft);
 
     parse_timeout_ms(cfg->timeout_ms);
     parse_choice(cfg->dispatch_copy_mode);
@@ -109,6 +110,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_ulong(cfg->combine_num_stages_g2s);
     parse_ulong(cfg->combine_num_stages_s2g);
     parse_ulong(cfg->combine_num_pipelines);
+    parse_ulong(cfg->ll_cft_debug_min_driver);
 }
 
 void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
@@ -125,6 +127,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.ht_em_count_unfused,
         &cfg.dispatch_copy_mode,
         &cfg.disable_guard,
+        &cfg.ll_cft,
         &cfg.timeout_ms,
         &cfg.comm_num_sms,
         &cfg.dispatch_num_sms,
@@ -137,6 +140,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.combine_num_stages_g2s,
         &cfg.combine_num_stages_s2g,
         &cfg.combine_num_pipelines,
+        &cfg.ll_cft_debug_min_driver,
     };
 
     std::fprintf(stderr, "[nccl_ep][env] NCCL EP environment configuration:\n");

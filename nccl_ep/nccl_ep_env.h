@@ -79,6 +79,14 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar combine_num_stages_g2s{"NCCL_EP_COMBINE_NUM_STAGES_G2S", ncclEpEnvType::ulong};
     ncclEpEnvVar combine_num_stages_s2g{"NCCL_EP_COMBINE_NUM_STAGES_S2G", ncclEpEnvType::ulong};
     ncclEpEnvVar combine_num_pipelines{"NCCL_EP_COMBINE_NUM_PIPELINES", ncclEpEnvType::ulong};
+    // Opt-in counted fabric transport for LL dispatch payloads within one
+    // NVLink domain. Requires Blackwell+, CUDA 13.3+ (build, runtime and JIT),
+    // driver 610.43.02+ (API 13030), fabric endpoints and Fabric Manager.
+    // All ranks must agree; any platform/setup failure rejects the group
+    // collectively with ncclInvalidUsage. Unset to use the store path.
+    ncclEpEnvVar ll_cft{"NCCL_EP_LL_CFT", ncclEpEnvType::flag};
+    // Debug-only driver API floor override for testing platform rejection.
+    ncclEpEnvVar ll_cft_debug_min_driver{"NCCL_EP_LL_CFT_DEBUG_MIN_DRIVER", ncclEpEnvType::ulong};
 };
 
 // True iff a flag variable was explicitly set to an "on" value (1/on/true).

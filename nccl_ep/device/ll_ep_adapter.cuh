@@ -34,6 +34,15 @@ inline bool ll_dispatch_stage_quant(int hidden, int max_shared_bytes) {
     return required <= std::min(max_shared_bytes, 48 * 1024);
 }
 
+// CFT currently stages BF16/FP16 payload elements.
+constexpr int kCftElementBytes = sizeof(uint16_t);
+
+// Two token-parity banks of 32 (rank, slot) pairs. Shared by host sizing and
+// the device layout; allocated only when CFT is active.
+constexpr int kCftDestScratchInts = 2 * 2 * 32;
+constexpr int kCftDestScratchBytes = kCftDestScratchInts * static_cast<int>(sizeof(int));
+static_assert(kCftDestScratchBytes == 512, "CFT dest scratch is 512 B by layout contract");
+
 // LL combine uses dynamic shared memory for independent send and receive
 // phases. Keep this host-side accounting next to the launch parameters so it
 // can be checked before configuring a JIT kernel.
@@ -91,21 +100,31 @@ inline combine_smem_config_t choose_combine_smem_config(
 // ============================================================================
 // Packed kernel parameter structs.
 //
-// These structs are written by the host-side adapters and consumed by the
-// JIT-compiled kernel entry points. The JIT entry receives the struct as
-// `const __grid_constant__ <struct> p`, then unpacks `p.foo` into the
-// templated `*_kernel_impl(...)` device function defined in ll_ep.cuh.
-//
-// The struct layouts must match what the kernel expects, so any field added
-// here must also be threaded through the matching kernel entry: the JIT sources
-// device/jit/ll_dispatch_jit.cuh, ll_combine_jit.cuh, and ll_clean_jit.cuh.
+// The host adapters pack these structs for the JIT entry points. Dispatch
+// implementations take the whole struct; combine and clean entries unpack it.
+// Keep their bindings in sync when adding fields.
 // ============================================================================
+
+// CFT dispatch parameters, zero-initialized unless collective setup succeeded.
+// CFT carries payloads; token counts still use recvCntBuf.
+struct cft_dispatch_args_t {
+    const uint32_t* peerLeIds;         // device [numRanks]: peer endpoint IDs; 0 is valid, [currRank] is unused
+    void*           recvBase;          // this rank's FABRIC recv buffer VA, parity-resolved (receiver reads here)
+    uint64_t        bytesCntrBaseOff;  // byte offset to the byte-counter region within each peer's fabric buf
+    // Remote puts add this parity offset; host-provided receive pointers
+    // already include it. Both use the group-scoped dispatch counter.
+    uint64_t        parityOff;
+    size_t          srcRankRegionBytes; // bytes per srcRank slot group in the data region
+                                        // (tokensPerRank * worst-case slot stride)
+    uint64_t*       recvByteCounters;   // this rank's byte counter array [numRanks * (256/8)], parity-resolved
+    uint64_t*       cumulByteExpect;    // device [numRanks*numLocalExperts]: cumulative expected bytes, parity-resolved
+};
 
 struct dispatch_kernel_args_t {
     // INPUT
     const void* inData;
     const void* inScalesBuf;      // non-null for QUANT_FWD; runtime-typed storage
-    const void* inTopkIdx;        // cast to const TopkIdxT* by the JIT entry
+    const void* inTopkIdx;        // cast to const TopkIdxT* by dispatch_kernel_impl
     const float* inTopkWeights;
     int* rankMask;
     int* asyncErrorFlag;
@@ -155,6 +174,8 @@ struct dispatch_kernel_args_t {
     size_t recvDataOffset;
     ncclWindow_t rcvScalesWin;
     size_t rcvScalesOffs;
+    // LL CFT (counted fabric transport) parameters; see cft_dispatch_args_t.
+    cft_dispatch_args_t cft;
 };
 
 struct combine_kernel_args_t {
@@ -297,6 +318,15 @@ struct DispatchParams {
     // Actual token wire dtype. Selects the kTokenDtype kernel specialization;
     // FP16 and BF16 share the same two-byte copy specialization.
     ncclDataType_t tokenDtype = ncclBfloat16;
+
+    // Populated after CFT setup succeeds on every rank.
+    const uint32_t* cftPeerLeIds = nullptr;
+    void*           cftRecvBase = nullptr;
+    uint64_t        cftBytesCntrBaseOff = 0;
+    uint64_t        cftParityOff = 0;
+    size_t          cftSrcRankRegionBytes = 0;
+    uint64_t*       cftRecvByteCounters = nullptr;
+    uint64_t*       cftCumulByteExpect = nullptr;
 };
 
 struct CombineParams {
@@ -349,6 +379,10 @@ struct CombineParams {
     int* rankMask = nullptr;
     int* asyncErrorFlag = nullptr;
     uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
+
+    // CFT dispatch requires combine to clear each consumed finish flag.
+    // The general combine kernel provides that protocol.
+    bool cftEnabled = false;
 
     // Per-call behavior toggles that select the JIT kernel specialization.
     bool useLogFmt = false;

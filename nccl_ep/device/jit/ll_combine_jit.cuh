@@ -37,13 +37,16 @@ constexpr int kLlCombineMaxUnrolls = 4;
 //                 LSA-only kernel below.
 //   k2SidedRmLsa: LSA-only rank-major kernel that stages payload through
 //                 RDMA buffers on both send and receive. Selected for every
-//                 LSA-only, NONE-recipe, rank-major call.
+//                 LSA-only, NONE-recipe, rank-major call with CFT disabled.
 enum class LlCombineAlgo { kDefault, k2SidedRmLsa };
 
 // Picks the most performant kernel based on the configuration
 inline LlCombineAlgo ll_combine_select_algo(
-    bool nvlinkOnly, ncclEpCombQuant_t qrecipe, bool useLogFmt, ncclEpLayout_t layout) {
-    const bool lsaEligible = nvlinkOnly && qrecipe == NCCL_EP_COMB_QUANT_NONE && !useLogFmt &&
+    bool nvlinkOnly, ncclEpCombQuant_t qrecipe, bool useLogFmt, ncclEpLayout_t layout,
+    bool cftEnabled = false) {
+    // CFT dispatch skips the next-bank wipe. Pair it with the general combine
+    // kernel, which clears consumed flags; the LSA kernel leaves them set.
+    const bool lsaEligible = !cftEnabled && nvlinkOnly && qrecipe == NCCL_EP_COMB_QUANT_NONE && !useLogFmt &&
         layout == NCCL_EP_LAYOUT_RANK_MAJOR;
     return lsaEligible ? LlCombineAlgo::k2SidedRmLsa : LlCombineAlgo::kDefault;
 }
@@ -116,6 +119,7 @@ inline std::string ll_combine_jit_source(
 
 inline ncclResult_t launch_ll_combine(
     bool nvlinkOnly,
+    bool cftEnabled,
     bool useLogFmt,
     ncclEpCombQuant_t qrecipe,
     unsigned int device_sm,
@@ -129,7 +133,7 @@ inline ncclResult_t launch_ll_combine(
     int dynamic_smem_bytes,
     const combine_kernel_args_t& args,
     cudaStream_t stream) {
-    const LlCombineAlgo algo = ll_combine_select_algo(nvlinkOnly, qrecipe, useLogFmt, layout);
+    const LlCombineAlgo algo = ll_combine_select_algo(nvlinkOnly, qrecipe, useLogFmt, layout, cftEnabled);
     const bool twoSidedRmLsa = algo == LlCombineAlgo::k2SidedRmLsa;
 
     const char* recipe_literal = twoSidedRmLsa ? "" : ::nccl_ep::jit::combine_recipe_literal(qrecipe);

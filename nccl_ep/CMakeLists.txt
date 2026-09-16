@@ -64,6 +64,7 @@ add_custom_target(nccl-submodule
 # Source files
 set(NCCL_EP_HOST_SRC
     nccl_ep.cc
+    nccl_ep_cft.cc
     nccl_ep_env.cc
     device/jit/jit_utils.cc
     device/jit/jit_cache.cc
@@ -150,6 +151,8 @@ set(NCCL_EP_JIT_HEADERS
     device/ll/ll_logfmt.cuh
     device/ll/ll_dispatch_lsa.cuh
     device/ll/ll_combine_lsa.cuh
+    device/cft.cuh
+    device/ll_ep_cft.cuh
 )
 
 file(MAKE_DIRECTORY "${NCCL_EP_JIT_SOURCE_DIR}")

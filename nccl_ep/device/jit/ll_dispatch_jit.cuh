@@ -29,12 +29,10 @@ constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel"
 // chosen automatically per call by ll_dispatch_select_algo() below -- callers
 // never pick a kernel directly.
 //   kDefault:     the general kernel (every recipe/layout, RDMA/GIN capable).
-//                 Selected whenever the call isn't LSA-only, or its
-//                 recipe/layout combination isn't eligible for the LSA-only
-//                 kernel below.
+//                 Also used for CFT; the LSA-only kernel has no CFT transport.
 //   k2SidedRmLsa: LSA-only rank-major kernel that stages payload through
-//                 RDMA buffers. Selected for every LSA-only rank-major call
-//                 using NONE or fused DS_FP8E3M4. NONE still writes each token's payload
+//                 RDMA buffers. Selected for LSA-only rank-major calls with
+//                 CFT disabled, using NONE or fused DS_FP8E3M4. NONE still writes each token's payload
 //                 directly into the peer's registered output window instead
 //                 of staging through RDMA whenever the EP group's zero-copy
 //                 flag (ncclEpGroupConfig_t::zero_copy) is ON and a window
@@ -44,10 +42,11 @@ enum class LlDispatchAlgo { kDefault, k2SidedRmLsa };
 
 // Picks the most performant kernel based on the configuration
 inline LlDispatchAlgo ll_dispatch_select_algo(
-    bool nvlinkOnly, ncclEpDispQuant_t recipe, ncclEpLayout_t layout) {
+    bool nvlinkOnly, ncclEpDispQuant_t recipe, ncclEpLayout_t layout, bool cftEnabled = false) {
     const bool lsaRecipe =
         recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
-    const bool lsaEligible = nvlinkOnly && lsaRecipe && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
+    const bool lsaEligible =
+        !cftEnabled && nvlinkOnly && lsaRecipe && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
     return lsaEligible ? LlDispatchAlgo::k2SidedRmLsa : LlDispatchAlgo::kDefault;
 }
 
@@ -117,9 +116,10 @@ inline ncclResult_t launch_ll_dispatch(
     int numSms,
     int numWarps,
     bool stageQuant,
+    int cft_smem_bytes,
     const dispatch_kernel_args_t& args,
     cudaStream_t stream) {
-    const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout);
+    const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout, cft_smem_bytes != 0);
     const bool twoSidedRmLsa = algo == LlDispatchAlgo::k2SidedRmLsa;
     // Keep the compact thread limit with a one-block launch bound: repeated
     // single- and multi-node tuning did not favor the tighter register budget.
@@ -148,12 +148,10 @@ inline ncclResult_t launch_ll_dispatch(
     variant.runtime_key = key;
     variant.num_blocks = numSms;
     variant.block_dim = numWarps * 32;
-    // Dispatch uses only statically allocated shared memory.
-    variant.dynamic_smem_bytes = 0;
-    // Always cooperative: kDefault needs it for its grid-wide SEND/RECV
-    // sync. k2SidedRmLsa doesn't require cooperative launch, but we still
-    // use it to ensure efficient cross-CTA atomic-based coordination (see
-    // syncAndSendCounts's doc comment in ll_dispatch_lsa.cuh).
+    // CFT staging uses dynamic shared memory; store-only dispatch needs none.
+    variant.dynamic_smem_bytes = cft_smem_bytes;
+    // Always cooperative: kDefault needs its grid-wide SEND/RECV sync;
+    // k2SidedRmLsa uses it for efficient cross-CTA atomic coordination.
     variant.cooperative = true;
     // Pair SMs into clusters of 2 when possible to share distributed SMEM.
     variant.cluster_dim_x = (numSms % 2 == 0) ? 2 : 1;

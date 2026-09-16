@@ -24,6 +24,7 @@
 #include <nccl.h>
 #include <nccl_device.h>
 #include "nccl_ep.h"
+#include "nccl_ep_cft.h"
 #include "nccl_ep_env.h"
 #include "common.hpp"
 
@@ -679,7 +680,7 @@ ncclResult_t ncclEpTensorDestroy(ncclEpTensor_t* tensor) {
 // This operates on a single in-place host buffer, unlike batchAllGatherIpcHandles
 // which batches multiple IPC handles via a packed device buffer.
 // Each rank contributes element_size bytes at offset rank * element_size.
-static void
+void
 ncclAllGatherHost(void* host_buffer, size_t element_size, int rank, int nRanks, ncclComm_t comm, cudaStream_t stream) {
     const size_t total_size = element_size * nRanks;
     void* d_buffer;
@@ -966,6 +967,9 @@ struct ncclEpGroup {
         bool initialized;
         bool internode_initialized;
     } ht_buffers;
+
+    // LL CFT (counted fabric transport) state; see nccl_ep_cft.h.
+    ncclEpLlCftBuffers ll_cft_buffers;
 
     // HT eager recv sizing (config.max_recv_tokens_per_rank == NCCL_EP_AUTO):
     // max_recv_tokens holds the derived internal bound; the caller sizes
@@ -2167,6 +2171,21 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     *out_ep_group = new (raw_memory) ncclEpGroup();
     ncclEpGroup_t ep_group = *out_ep_group;
 
+    // Collective rejection after nccl_dev_comm is created. Preserve the
+    // original error if teardown throws, and clear the caller's group handle.
+    auto reject_group = [&](ncclResult_t res) -> ncclResult_t {
+        ncclEpGroup_t rejected = *out_ep_group;
+        *out_ep_group = nullptr;
+        cudaStreamDestroy(stream);
+        if (rejected != nullptr) {
+            try {
+                ncclEpGroupDestroy(rejected);
+            } catch (...) {
+            }
+        }
+        return res;
+    };
+
     // Store configuration
     ep_group->comm = comm;
     ep_group->config = *in_config;
@@ -2214,6 +2233,33 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     CUDA_CHECK(cudaDeviceGetAttribute(
         &ep_group->max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, ep_group->cuda_device_id));
     ep_group->device_smem_optin = device_prop.sharedMemPerBlockOptin;
+
+    // Gather local platform facts now; reject only after the collective vote
+    // below so peers cannot be stranded in setup. This query does not throw.
+    ncclEpCftPlatformFacts cft_facts{};
+    ncclEpCftPlatformFloors cft_floors{};
+    if (low_latency_mode && nccl_ep_env_flag_on(ep_group->env.ll_cft)) {
+        nccl_ep_cft_platform_query(ep_group->cuda_device_id, &cft_facts);
+        // TEST HOOK (NCCL_EP_DEBUG=1 only): raise the driver floor so the
+        // rejection path can be exercised on a supported machine.
+        const ncclEpEnvVar& hook = ep_group->env.ll_cft_debug_min_driver;
+        if (nccl_ep_env_flag_on(ep_group->env.debug) && hook.is_set) {
+            cft_floors.min_driver = static_cast<int32_t>(std::min<unsigned long>(hook.value.ul, 0x7fffffffUL));
+            fprintf(stderr,
+                    "[nccl_ep][ll_cft] rank %d: TEST HOOK %s=%lu raises the required driver API level to %d\n",
+                    ep_group->rank, hook.name, hook.value.ul, cft_floors.min_driver);
+        }
+        const ncclEpCftPlatformVerdict verdict = nccl_ep_cft_platform_judge(cft_facts, cft_floors);
+        if (nccl_ep_env_flag_on(ep_group->env.debug)) {
+            fprintf(stderr, "[nccl_ep][ll_cft] rank %d: platform %s\n", ep_group->rank,
+                    nccl_ep_cft_platform_summary(cft_facts, verdict).c_str());
+        }
+        if (verdict.failed != 0) {
+            fprintf(stderr, "[nccl_ep][ll_cft] rank %d: %s cannot be enabled on this platform: %s\n",
+                    ep_group->rank, ep_group->env.ll_cft.name,
+                    nccl_ep_cft_platform_reasons(cft_facts, verdict, cft_floors).c_str());
+        }
+    }
 
     // Resolve the shared budget first. New operation-specific config fields
     // inherit it when AUTO, preserving the V1/V2 behavior exactly.
@@ -2681,6 +2727,92 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->ll_epoch_state), sizeof(nccl_ep::LowLatencyEpochState)));
         CUDA_CHECK(cudaMemset(ep_group->ll_epoch_state, 0, sizeof(nccl_ep::LowLatencyEpochState)));
 
+        // Agree on CFT before endpoint setup and mask-window registration,
+        // both of which would deadlock if only a subset of ranks entered.
+        bool want_ll_cft = false;
+        {
+            // Include each rank's floors so debug overrides produce the same
+            // collective verdict on every rank.
+            struct CftVote {
+                uint8_t want_cft;
+                uint8_t enable_mask;
+                uint8_t pad_[6];
+                ncclEpCftPlatformFacts facts;
+                ncclEpCftPlatformFloors floors;
+            };
+            std::vector<CftVote> vote(ep_group->nRanks, CftVote{});
+            vote[ep_group->rank].want_cft = nccl_ep_env_flag_on(ep_group->env.ll_cft) ? 1 : 0;
+            vote[ep_group->rank].enable_mask = ep_group->config.enable_mask ? 1 : 0;
+            vote[ep_group->rank].facts = cft_facts;
+            vote[ep_group->rank].floors = cft_floors;
+            ncclAllGatherHost(vote.data(), sizeof(CftVote), ep_group->rank, ep_group->nRanks, comm, stream);
+            for (int r = 1; r < ep_group->nRanks; ++r) {
+                if (vote[r].want_cft != vote[0].want_cft) {
+                    fprintf(stderr,
+                            "NCCL EP: %s must be set identically on every rank "
+                            "(rank 0 = %s, rank %d = %s); it selects the LL dispatch wire "
+                            "protocol, so a mixed setting desynchronises senders and receivers\n",
+                            ep_group->env.ll_cft.name,
+                            vote[0].want_cft ? "on" : "off", r, vote[r].want_cft ? "on" : "off");
+                    return reject_group(ncclInvalidUsage);
+                }
+            }
+            // All ranks judge the same facts before creating any endpoints.
+            if (vote[0].want_cft) {
+                std::string unsupported;
+                int32_t group_support_level = INT32_MAX;
+                for (int r = 0; r < ep_group->nRanks; ++r) {
+                    const ncclEpCftPlatformVerdict v = nccl_ep_cft_platform_judge(vote[r].facts, vote[r].floors);
+                    group_support_level = std::min(group_support_level, v.support_level);
+                    if (v.failed == 0) continue;
+                    if (!unsupported.empty()) unsupported += "; ";
+                    unsupported += "rank " + std::to_string(r) + ": " +
+                                   nccl_ep_cft_platform_reasons(vote[r].facts, v, vote[r].floors);
+                }
+                if (!unsupported.empty()) {
+                    fprintf(stderr,
+                            "NCCL EP: %s was requested but the platform does not support counted fabric "
+                            "transport: %s. %s is strict — it selects the LL dispatch WIRE PROTOCOL, so "
+                            "group creation fails on every rank instead of falling back to the store path. "
+                            "Unset %s to use the store path everywhere. (CFT needs Blackwell or later, CUDA "
+                            "13.3 or later at build and run time, driver 610.43.02 or later and a running "
+                            "Fabric Manager.)\n",
+                            ep_group->env.ll_cft.name, unsupported.c_str(), ep_group->env.ll_cft.name,
+                            ep_group->env.ll_cft.name);
+                    return reject_group(ncclInvalidUsage);
+                }
+                if (nccl_ep_env_flag_on(ep_group->env.debug)) {
+                    fprintf(stderr,
+                            "[nccl_ep][ll_cft] rank %d: platform supported on every rank; group CFT support "
+                            "level %d (min over ranks, NCCL gpuCftSupport semantics)\n",
+                            ep_group->rank, group_support_level);
+                }
+            }
+            // Masking cannot quiesce CFT buffers or restore parity on
+            // re-admission. Reject the combination collectively.
+            if (vote[0].want_cft) {
+                std::string masked_ranks;
+                for (int r = 0; r < ep_group->nRanks; ++r) {
+                    if (vote[r].enable_mask) {
+                        if (!masked_ranks.empty()) masked_ranks += ", ";
+                        masked_ranks += std::to_string(r);
+                    }
+                }
+                if (!masked_ranks.empty()) {
+                    fprintf(stderr,
+                            "NCCL EP: %s is mutually exclusive with the fault-tolerance "
+                            "(masking) feature, but enable_mask=1 was requested by rank(s) %s. "
+                            "ncclEpMaskClean's barriers skip masked peers, so they cannot make a "
+                            "CFT recv buffer quiescent before zeroing it, and the fabric ISA "
+                            "offers no drain; the result would be silently stale data. Set "
+                            "enable_mask=0 or unset %s on every rank.\n",
+                            ep_group->env.ll_cft.name, masked_ranks.c_str(), ep_group->env.ll_cft.name);
+                    return reject_group(ncclInvalidUsage);
+                }
+            }
+            want_ll_cft = (vote[0].want_cft != 0);
+        }
+
         if (ep_group->config.enable_mask) {
             // Allocate the cross-rank sync buffer used by clean_low_latency_buffer.
             // Its size depends only on nRanks (a group-level constant), so it is
@@ -2706,23 +2838,47 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         if (ep_group->config.rdma_buffer_size != NCCL_EP_AUTO) {
             NCCLCHECK(ll_resize_rdma_buffer(ep_group, ep_group->config.rdma_buffer_size));
         }
+
+        // Setup succeeds or returns an error collectively. Return setup
+        // failures to the caller rather than using an aborting check macro.
+        if (want_ll_cft) {
+            const ncclResult_t cft_res = nccl_ep_cft_init(
+                &ep_group->ll_cft_buffers,
+                comm,
+                ep_group->rank,
+                ep_group->nRanks,
+                ep_group->cuda_device_id,
+                ep_group->num_local_experts,
+                ep_group->config.max_dispatch_tokens_per_rank,
+                ep_group->config.max_token_bytes,
+                ep_group->env.ll_cft.name,
+                nccl_ep_env_flag_on(ep_group->env.debug),
+                stream);
+            if (cft_res != ncclSuccess) return reject_group(cft_res);
+        }
     }
 
-    // Allocate mask buffer and async error flag for active-mask support
-    if (ep_group->config.enable_mask && ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
-        size_t mask_bytes = ep_group->nRanks * sizeof(int);
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->mask_buffer), mask_bytes));
-        // Initialize all ranks as active (1 = active, 0 = masked/failed)
-        std::vector<int> all_active(ep_group->nRanks, 1);
-        CUDA_CHECK(
-            cudaMemcpyAsync(ep_group->mask_buffer, all_active.data(), mask_bytes, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(
-            cudaHostAlloc(reinterpret_cast<void**>(&ep_group->async_error_flag), sizeof(int), cudaHostAllocMapped));
-        *ep_group->async_error_flag = 0;
-    }
+    // Release finite CFT endpoint resources if the remaining CUDA setup throws.
+    try {
+        // Allocate mask buffer and async error flag for active-mask support
+        if (ep_group->config.enable_mask && ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+            size_t mask_bytes = ep_group->nRanks * sizeof(int);
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->mask_buffer), mask_bytes));
+            // Initialize all ranks as active (1 = active, 0 = masked/failed)
+            std::vector<int> all_active(ep_group->nRanks, 1);
+            CUDA_CHECK(
+                cudaMemcpyAsync(ep_group->mask_buffer, all_active.data(), mask_bytes, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(
+                cudaHostAlloc(reinterpret_cast<void**>(&ep_group->async_error_flag), sizeof(int), cudaHostAllocMapped));
+            *ep_group->async_error_flag = 0;
+        }
 
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaStreamDestroy(stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    } catch (...) {
+        nccl_ep_cft_destroy(&ep_group->ll_cft_buffers, ep_group->cuda_device_id);
+        throw;
+    }
     return ncclSuccess;
 }
 
@@ -2740,6 +2896,10 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
     // Clean up HT cross-LSA-team resources (GIN deregistration must happen before ncclCommDestroy)
     if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->ht_buffers.internode_initialized) {
         destroy_ht_internode(ep_group);
+    }
+    // Clean up LL CFT fabric resources
+    if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY && ep_group->ll_cft_buffers.initialized) {
+        nccl_ep_cft_destroy(&ep_group->ll_cft_buffers, ep_group->cuda_device_id);
     }
     // Clean up mask buffer and async error flag
     if (ep_group->mask_buffer != nullptr) {
@@ -4585,6 +4745,11 @@ ncclResult_t ncclEpDispatch(
             assert(recv_count->sizes[0] == group->num_local_experts);
         }
 
+        // Alternate CFT buffers per group dispatch, independently of handles
+        // and the store-path epoch ring. The intervening combine round trip
+        // prevents a fast rank from overwriting data a peer is still reading.
+        const int cft_parity = group->ll_cft_buffers.dispatch_parity;
+        group->ll_cft_buffers.dispatch_parity ^= 1;
         const auto& buffer = handle->ll.layout.buffer;
         const auto next_clean_meta = buffer.clean_meta_offset();
 
@@ -4593,10 +4758,14 @@ ncclResult_t ncclEpDispatch(
         const bool nvlink_only = (group->lsa_team_size == group->nRanks);
         const bool recipe_zcopy_ok =
             recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_FWD;
+        // Disable zero-copy group-wide under CFT: output-window availability
+        // can differ by rank, but the kernel's transport choice must agree.
+        const bool cft_active = group->ll_cft_buffers.initialized;
         const bool zcopy_ok =
             nvlink_only &&
             handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
-            recipe_zcopy_ok;
+            recipe_zcopy_ok &&
+            !cft_active;
         const bool zcopy_rcv_x = zcopy_ok && recv_x->win_hdl != ncclWindow_t{};
         const bool zcopy_rcv_scales =
             zcopy_ok && recipe == NCCL_EP_DISP_QUANT_FWD &&
@@ -4606,6 +4775,7 @@ ncclResult_t ncclEpDispatch(
             !nvlink_only ? "requires nvlink-only topology (lsa_team_size == nRanks)" :
             handle->layout != NCCL_EP_LAYOUT_RANK_MAJOR ? "requires NCCL_EP_LAYOUT_RANK_MAJOR" :
             !recipe_zcopy_ok ? "is unsupported by this LL dispatch recipe" :
+            cft_active ? "is mutually exclusive with NCCL_EP_LL_CFT (counted fabric transport)" :
             "requires outputs->tokens or outputs->scales to be backed by an NCCL window";
         const char* zcopy_detail = zcopy_reason;
         if (zcopy_rcv_x) {
@@ -4727,6 +4897,34 @@ ncclResult_t ncclEpDispatch(
                 params.recvTopkIdxKind = recv_topk_idx_kind;
                 params.phases = phases;
                 params.tokenDtype = x->datatype;
+                // Pass the same parity to the sender offsets and receive pointers.
+                if (group->ll_cft_buffers.initialized) {
+                    auto& lb = group->ll_cft_buffers;
+                    const uint64_t parity_off =
+                        static_cast<uint64_t>(cft_parity) * lb.parity_stride;
+                    params.cftParityOff = parity_off;
+                    params.cftPeerLeIds = lb.peer_le_dev;
+                    params.cftRecvBase = reinterpret_cast<uint8_t*>(lb.recv_base) + parity_off;
+                    params.cftBytesCntrBaseOff  = lb.byte_cntr_base_off;
+                    params.cftSrcRankRegionBytes = lb.src_rank_region_bytes;
+                    // Reject messages that would overflow the reserved source region.
+                    const size_t cft_msg_bytes =
+                        nccl_ep::ll::get_dispatch_hdr_sz(handle->num_topk, handle->layout) +
+                        static_cast<size_t>(hidden) * ncclTypeSize(x->datatype);
+                    if (cft_msg_bytes > lb.slot_stride_bound) {
+                        fprintf(stderr,
+                                "NCCL EP: LL CFT dispatch message of %zu bytes (top-k %d, hidden %d) exceeds "
+                                "the %zu-byte fabric slot stride reserved at group creation\n",
+                                cft_msg_bytes, handle->num_topk, hidden, lb.slot_stride_bound);
+                        return ncclInvalidArgument;
+                    }
+                    const auto base = reinterpret_cast<uint8_t*>(lb.recv_base) + parity_off;
+                    params.cftRecvByteCounters  = reinterpret_cast<uint64_t*>(base + lb.byte_cntr_base_off);
+                    // Each (source, expert, parity) keeps a cumulative byte target.
+                    const size_t cumul_off =
+                        static_cast<size_t>(cft_parity) * lb.cumul_slots_per_parity;
+                    params.cftCumulByteExpect = lb.cumul_byte_expect_dev + cumul_off;
+                }
                 // Keep recipe dispatch explicit at the kernel launch boundary. The
                 // selected branch becomes the JIT kernel's quantization variant.
                 switch (recipe) {
@@ -5922,8 +6120,8 @@ ncclResult_t ncclEpCombine(
         assert(x->ndim > 0);
 
         // LSA-eligibility input to ll_combine_select_algo (device/jit/ll_combine_jit.cuh),
-        // which always picks the RDMA-staged 2-sided kernel whenever the
-        // topology/recipe/layout is LSA-eligible.
+        // which picks the RDMA-staged 2-sided kernel for eligible calls
+        // unless CFT requires the general combine kernel.
         const bool nvlink_only = (handle->group->lsa_team_size == handle->group->nRanks);
 
         const ncclEpTensor_t* topk_idx = &handle->topk_idx;
@@ -6107,6 +6305,7 @@ ncclResult_t ncclEpCombine(
                 params.tokenDtype = x->datatype;
                 params.quantizationRecipe = quantization_recipe;
                 params.nvlinkOnly = nvlink_only;
+                params.cftEnabled = handle->group->ll_cft_buffers.initialized;
                 return nccl_ep::ll::call_combine(params, stream);
             };
             switch (topk_idx->datatype) {

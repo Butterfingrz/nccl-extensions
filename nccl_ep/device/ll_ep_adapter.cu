@@ -57,6 +57,9 @@ ncclResult_t call_dispatch(
     if (numWarpGroups <= 0 || numWarpsPerGroup <= 0) return ncclInvalidUsage;
 
     const int numWarps = numWarpGroups * numWarpsPerGroup;
+    // One warp group per expert sets the receive grid; sends share that grid.
+    // Widening it may displace overlapped model work, so benchmark with that
+    // work present before changing the grid.
     const int numSms = ceil_div(params.numExperts, numWarpGroups);
     if (params.numTopk + kLlDispatchControlWarps > numWarps) {
         std::fprintf(stderr, "ncclEpDispatch: LL top-k %d needs %d forwarding/control warps, geometry provides %d\n",
@@ -111,12 +114,51 @@ ncclResult_t call_dispatch(
     args.recvDataOffset = params.recvDataOffset;
     args.rcvScalesWin = params.rcvScalesWin;
     args.rcvScalesOffs = params.rcvScalesOffs;
+    args.cft.peerLeIds          = params.cftPeerLeIds;
+    args.cft.recvBase           = params.cftRecvBase;
+    args.cft.bytesCntrBaseOff   = params.cftBytesCntrBaseOff;
+    args.cft.parityOff          = params.cftParityOff;
+    args.cft.srcRankRegionBytes = params.cftSrcRankRegionBytes;
+    args.cft.recvByteCounters   = params.cftRecvByteCounters;
+    args.cft.cumulByteExpect    = params.cftCumulByteExpect;
 
     DispatchKernelSpec kernel_spec;
     ncclResult_t r = resolveDispatchKernelSpec(
         recipe, params.tokenDtype, params.scaleDtype, &kernel_spec);
     if (r != ncclSuccess) {
         return r;
+    }
+
+    // Match CftTileGeometry and cftCarveSendContext in ll_ep_cft.cuh.
+    // This gate must match cftDispatchEnabled except for its device-architecture
+    // check: the host may over-reserve shared memory, but must not under-reserve.
+    const bool cft_active = (params.cftPeerLeIds != nullptr) &&
+                            (recipe == NCCL_EP_DISP_QUANT_NONE) &&
+                            (params.recvDataWindow == ncclWindow_t{}) &&
+                            (params.rcvScalesWin == ncclWindow_t{}) &&
+                            (params.rankMask == nullptr) &&
+                            (params.tokenDtype != ncclFloat32);
+
+    // Check the opt-in shared-memory limit before configuring the JIT launch.
+    static const int max_dyn_smem = [] {
+        int v = 0;
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) return 0;
+        return v;
+    }();
+
+    int cft_smem_bytes = 0;
+    if (cft_active) {
+        // Match CftTileGeometry::kTileHdrBytes and its two-slot staging ring.
+        const int tile_hdr_bytes =
+            static_cast<int>(align<size_t>(get_dispatch_hdr_sz(params.numTopk, params.layout), 128));
+        const int tile_bytes = params.hidden * kCftElementBytes + tile_hdr_bytes;
+        cft_smem_bytes = 2 * tile_bytes;
+        // Peer IDs and destination scratch follow the tiles.
+        cft_smem_bytes += static_cast<int>(align<size_t>(params.numRanks * sizeof(uint32_t), 16));
+        cft_smem_bytes += kCftDestScratchBytes;
+        EP_HOST_ASSERT(max_dyn_smem == 0 || cft_smem_bytes <= max_dyn_smem);
     }
 
     return jit::launch_ll_dispatch(
@@ -131,6 +173,7 @@ ncclResult_t call_dispatch(
         numSms,
         numWarps,
         stageQuant,
+        cft_smem_bytes,
         args,
         stream);
 }
@@ -172,7 +215,8 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
     // LSA path declares that static usage, so only trim the budget when
     // this call is actually eligible for it.
     const bool lsaCombineEligible =
-        jit::ll_combine_select_algo(params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout) ==
+        jit::ll_combine_select_algo(
+            params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout, params.cftEnabled) ==
         jit::LlCombineAlgo::k2SidedRmLsa;
     const int max_dynamic_smem_for_combine =
         params.maxDynamicSmem - (lsaCombineEligible ? combine_smem::kLsaStaticSmemBytes : 0);
@@ -253,6 +297,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
 
     return jit::launch_ll_combine(
         params.nvlinkOnly,
+        params.cftEnabled,
         params.useLogFmt,
         params.quantizationRecipe,
         params.deviceSm,
