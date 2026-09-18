@@ -771,11 +771,8 @@ struct ncclEpGroup {
     // number of dispatch chunks so a partial final chunk stays within an LSA team's region.
     int ht_aligned_max_tokens = 0;
 
-    // Resolved HT dispatch/combine tokens-per-chunk for this group. RDMA configs
-    // default to HT_TOKENS_PER_CHUNK_RDMA_DEFAULT (64); LSA-only configs default to
-    // a dispatch-grid-proportional size (NUM_OF_TOKENS_PER_GROUP times the dispatch
-    // budget, rounded up to a multiple of 32). Either may be overridden by NCCL_EP_TOKENS_PER_CHUNK.
-    int ht_tokens_per_chunk = 0;
+    // Resolved per-phase chunks. Cross-LSA dispatch and combine share the combine chunk.
+    int ht_combine_tokens_per_chunk = 0;
     int ht_dispatch_tokens_per_chunk = 0;
 
     struct {
@@ -1779,10 +1776,10 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     auto align_size = [](size_t sz, size_t alignment) { return (sz + alignment - 1) & ~(alignment - 1); };
 
     // Chunk-aligned stride for the cross-LSA-team RDMA buffers, resolved once at group
-    // creation (ep_group->ht_aligned_max_tokens / ht_tokens_per_chunk); the
+    // creation (ep_group->ht_aligned_max_tokens / ht_combine_tokens_per_chunk); the
     // dispatch/combine kernels must use the same stride and chunk size.
     const int ht_max_tokens = ep_group->ht_aligned_max_tokens;
-    const int ht_tokens_per_chunk = ep_group->ht_tokens_per_chunk;
+    const int ht_combine_tokens_per_chunk = ep_group->ht_combine_tokens_per_chunk;
     size_t combine_gin_RED_tokens_sz = align_size(
         static_cast<size_t>(ht_max_tokens) * (rdma_team_size - 1) * ep_group->config.max_token_bytes,
         GIN_ALIGNMENT);
@@ -1793,7 +1790,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         GIN_ALIGNMENT);
     size_t combine_gin_G2S_prob_sz = combine_gin_RED_prob_sz;
 
-    int max_chunks_per_rank = (ht_max_tokens + ht_tokens_per_chunk - 1) / ht_tokens_per_chunk;
+    int max_chunks_per_rank = (ht_max_tokens + ht_combine_tokens_per_chunk - 1) / ht_combine_tokens_per_chunk;
     size_t flags_sz =
         align_size(static_cast<size_t>(rdma_team_size - 1) * max_chunks_per_rank * sizeof(uint64_t), GIN_ALIGNMENT);
     // RDMA sync-guard: NUM_LSA_TEAMS uint64 internal-buffer readiness slots per direction.
@@ -1956,7 +1953,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         reqs.ginSignalCount = ep_group->gin_config.num_total_signals;
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
         reqs.ginContextCount = ep_group->gin_config.qps_per_rank; // reserved + data contexts
-        reqs.ginQueueDepth = 3 * ht_tokens_per_chunk + 1;
+        reqs.ginQueueDepth = 3 * ht_combine_tokens_per_chunk + 1;
         // Dispatch uses sessions [0, dispatch_num_sms); all combine CTAs rendezvous
         // through one tail CTA at session dispatch_num_sms. Therefore
         // combine_num_sms does not affect this resource count.
@@ -2646,30 +2643,15 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
 
     // Initialize HT intra-LSA buffers (windows, completion flags, etc.)
     if (ht_mode) {
-        // Resolve the dispatch/combine tokens-per-chunk for this group. RDMA
-        // (multi-LSA-team) configs use the tuned 64-token default; LSA-only configs
-        // use a dispatch-grid-proportional size so one chunk is one wave across
-        // the dispatch SMs (NUM_OF_TOKENS_PER_GROUP tokens per SM). This keeps
-        // combine grid tuning from changing dispatch scheduling. Either may be overridden by
-        // NCCL_EP_TOKENS_PER_CHUNK. The chunk must be a multiple of 32 (warp width;
-        // also covers the uint4 routing-map-load and token-group granularities), so
-        // non-conforming values are rounded up with a warning.
-        auto round_up_32 = [](int v) { return (v + 31) & ~31; };
-        int chunk =
-            (ep_group->rdma_team_size > 1) ?
-                HT_TOKENS_PER_CHUNK_RDMA_DEFAULT :
-                round_up_32(
-                    NCCL_EP_HT_COMBINE_TOK_PER_GROUP * static_cast<int>(ep_group->dispatch_num_sms));
-        if (ep_group->env.tokens_per_chunk.is_set && ep_group->env.tokens_per_chunk.value.ul > 0) {
-            const int requested = static_cast<int>(ep_group->env.tokens_per_chunk.value.ul);
-            chunk = round_up_32(requested);
-            if (chunk != requested) {
-                fprintf(stderr, "[nccl_ep] %s=%d rounded up to %d (must be a multiple of 32)\n",
-                        ep_group->env.tokens_per_chunk.name, requested, chunk);
-            }
+        const int chunk = nccl_ep_resolve_combine_chunk(
+            ep_group->env, static_cast<int>(ep_group->dispatch_num_sms), ep_group->rdma_team_size);
+        ep_group->ht_combine_tokens_per_chunk = chunk;
+        ep_group->ht_dispatch_tokens_per_chunk =
+            nccl_ep_resolve_dispatch_chunk(ep_group->env, chunk, ep_group->rdma_team_size);
+        if (nccl_ep_env_verbose(ep_group->env)) {
+            fprintf(stderr, "[nccl_ep] HT chunks: dispatch=%d combine=%d\n",
+                    ep_group->ht_dispatch_tokens_per_chunk, chunk);
         }
-        ep_group->ht_tokens_per_chunk = chunk;
-        ep_group->ht_dispatch_tokens_per_chunk = chunk;
         // Chunk-aligned cross-LSA-team RDMA stride; also the max-tokens template arg for
         // the dispatch/combine kernels (guarantees MAX_NUM_OF_TOKENS_PER_RANK % chunk == 0).
         ep_group->ht_aligned_max_tokens = ((ep_group->config.max_dispatch_tokens_per_rank + chunk - 1) / chunk) * chunk;
@@ -6984,7 +6966,7 @@ ncclResult_t ncclEpCombine(
                 nccl_ep::ht::call_combine(
                     params,
                     group->ht_aligned_max_tokens, // chunk-aligned stride
-                    group->ht_tokens_per_chunk, // tokens per dispatch/combine chunk
+                    group->ht_combine_tokens_per_chunk,
                     group->rdma_team_size, // num_lsa_teams (RDMA domain size)
                     backward_combine, // backward mode flag
                     static_cast<int>(group->combine_num_sms),

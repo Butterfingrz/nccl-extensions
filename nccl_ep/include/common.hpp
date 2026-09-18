@@ -27,11 +27,6 @@ static constexpr uint16_t kTopkIdxInvalid = 0xFFFFu;
 #define NUM_WAIT_NANOSECONDS 500
 #define MAX_SUPPORTED_TOKENS_PER_RANK 8192  // Must match kernel template in ht_ep_adapter.cu
 #define FINISHED_SUM_TAG (MAX_SUPPORTED_TOKENS_PER_RANK * 2)
-// Default HT tokens-per-chunk for RDMA / multi-node configurations. LSA-only
-// (single-node) configs default to a grid-proportional size instead; either can
-// be overridden via NCCL_EP_TOKENS_PER_CHUNK (see ncclEpCreateGroup). The chunk
-// size is resolved per group into ncclEpGroup::ht_tokens_per_chunk.
-#define HT_TOKENS_PER_CHUNK_RDMA_DEFAULT 64
 
 // Timeout for GPU-side wait loops. When exceeded, the peer is masked (if active-mask
 // is enabled) or the kernel traps. Setting this too low risks false positives: a rank

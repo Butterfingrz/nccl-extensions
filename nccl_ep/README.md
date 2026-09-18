@@ -305,6 +305,8 @@ all NCCL EP outputs elsewhere.
 
 ### Environment Setup
 
+`NCCL_EP_DISPATCH_TOKENS_PER_CHUNK` optionally reduces the HT dispatch chunk without changing combine. It applies only within one LSA team. Use a positive multiple of 32 that divides the shared `NCCL_EP_TOKENS_PER_CHUNK` value (or its resolved default). Invalid requests are warned about and ignored. Unset preserves the existing behavior. `NCCL_EP_ENV_VERBOSE=1` reports both resolved sizes. This controls communication scheduling, not the application's batch size.
+
 Make sure to set the generic environment according to the
 [Set the environment](#set-the-environment) section.
 

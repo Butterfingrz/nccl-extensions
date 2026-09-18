@@ -75,6 +75,7 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar shuffle_sms{"NCCL_EP_SHUFFLE_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar preprocess_num_sms{"NCCL_EP_PREPROCESS_NUM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar tokens_per_chunk{"NCCL_EP_TOKENS_PER_CHUNK", ncclEpEnvType::ulong};
+    ncclEpEnvVar dispatch_tokens_per_chunk{"NCCL_EP_DISPATCH_TOKENS_PER_CHUNK", ncclEpEnvType::ulong};
     ncclEpEnvVar dispatch_num_stages{"NCCL_EP_DISPATCH_NUM_STAGES", ncclEpEnvType::ulong};
     ncclEpEnvVar dispatch_num_pipelines{"NCCL_EP_DISPATCH_NUM_PIPELINES", ncclEpEnvType::ulong};
     ncclEpEnvVar combine_num_stages_g2s{"NCCL_EP_COMBINE_NUM_STAGES_G2S", ncclEpEnvType::ulong};
@@ -121,5 +122,8 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg);
 // stderr. Always prints — the caller decides when (e.g. gated on verbose at
 // group init, or unconditionally when reporting a misconfiguration).
 void nccl_ep_env_print(const ncclEpEnvConfig& cfg);
+
+int nccl_ep_resolve_combine_chunk(const ncclEpEnvConfig& cfg, int dispatch_num_sms, int num_lsa_teams);
+int nccl_ep_resolve_dispatch_chunk(const ncclEpEnvConfig& cfg, int combine_chunk, int num_lsa_teams);
 
 #endif  // NCCL_EP_ENV_H_

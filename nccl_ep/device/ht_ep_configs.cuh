@@ -15,6 +15,8 @@
 // HT-specific configuration constants
 // ============================================================================
 #define NCCL_EP_HT_DFLT_NUM_SMS 16
+// Shared dispatch/combine chunk default across LSA teams.
+#define HT_TOKENS_PER_CHUNK_RDMA_DEFAULT 64
 // ============================================================================
 // Dispatch configuration constants
 // ============================================================================
