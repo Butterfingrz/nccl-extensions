@@ -182,6 +182,95 @@ __forceinline__ __device__ void cleanNextRecvCntBuf(int* nextRecvCntBuf, int nex
     for (int i = laneId; i < nextRecvCntBufSize; i += 32) nextRecvCntBuf[i] = 0;
 }
 
+// CFT-path variant of the counting-warp scan. Same inputs and output as
+// countTokensPerRank_mask (per destination rank in [rankBeginIdx, rankEndIdx):
+// the number of tokens with at least one top-k expert on that rank), selected
+// only when the dispatch runs over CFT. The store path keeps
+// countTokensPerRank_mask (source preserved); see the counting-warp branch.
+//
+// On the CFT path the count is published as soon as it is known (payload
+// completion is tracked by the hardware byte counter), so the counting warp
+// sits directly in front of the publish and the scan is on the receiver's
+// critical path. The scan is latency-bound (every SM re-reads the whole top-k
+// table through L2), so it is software-pipelined: each lane issues the loads of
+// kTokensPerLane tokens x kTopkChunk entries (32 independent `__ldg` in flight
+// per lane) before it consumes any of them. The consume is branch-free per
+// entry: one unsigned range check (`idx - loExpert < widthExperts`, which also
+// rejects negative/unused slots) and an exact division by numLocalExperts via
+// multiply-high with magic = ~0u / d (the quotient estimate is x/d or x/d-1;
+// one compare fixes it), setting one bit of the token's rank mask. The
+// per-token masks are counted with warp ballots, so there is no per-lane
+// counter array and no local memory on the path. Output is identical to
+// countTokensPerRank_mask for every input it accepts.
+//
+// TopkIdxT is int32_t or int64_t; an entry is narrowed to int exactly as in
+// countTokensPerRank_mask (the caller is responsible for ensuring expert ids do
+// not overflow).
+template <typename TopkIdxT>
+__forceinline__ __device__ void countTokensPerRankCft(
+    const TopkIdxT* inTopkIdx,
+    int numTokens,
+    int numTopk,
+    int numLocalExperts,
+    int rankBeginIdx,
+    int rankEndIdx,
+    int* sharedRankCount,
+    int laneId) {
+    constexpr int kTokensPerLane = 4;  // tokens per lane per pipelined batch
+    constexpr int kTopkChunk = 8;      // entries per token issued before consuming
+    const int rankRangeSize = rankEndIdx - rankBeginIdx;
+    // One bit per rank in a 32-bit mask (countTokensPerRank_mask's `1 << k` is
+    // 32-bit too, so ranges above 32 never worked on either scan).
+    assert(rankRangeSize >= 1 and rankRangeSize <= 32);
+
+    const uint32_t d = static_cast<uint32_t>(numLocalExperts);
+    const int loExpert = rankBeginIdx * numLocalExperts;
+    const uint32_t widthExperts = static_cast<uint32_t>(rankRangeSize) * d;
+    // For 0 <= x < 2^31 and d >= 1: __umulhi(x, magic) is x/d or x/d - 1.
+    const uint32_t magic = 0xffffffffu / d;
+
+    int myCount = 0;  // lane r accumulates rank rankBeginIdx + r
+    for (int i0 = 0; i0 < numTokens; i0 += 32 * kTokensPerLane) {
+        uint32_t rankBits[kTokensPerLane] = {};
+        for (int k0 = 0; k0 < numTopk; k0 += kTopkChunk) {
+            // Issue every load of this batch first...
+            int idx[kTokensPerLane][kTopkChunk];
+#pragma unroll
+            for (int t = 0; t < kTokensPerLane; ++t) {
+                const int tok = i0 + laneId + 32 * t;
+                const TopkIdxT* row = inTopkIdx + static_cast<size_t>(tok) * numTopk + k0;
+#pragma unroll
+                for (int k = 0; k < kTopkChunk; ++k) {
+                    idx[t][k] = (tok < numTokens and k0 + k < numTopk) ? static_cast<int>(__ldg(row + k)) : -1;
+                }
+            }
+            // ...then consume them. The quotient is computed unconditionally
+            // so the in-window test compiles to a predicate, not a per-entry
+            // branch (ptxas branches around a 6-instruction guarded body).
+#pragma unroll
+            for (int t = 0; t < kTokensPerLane; ++t) {
+#pragma unroll
+                for (int k = 0; k < kTopkChunk; ++k) {
+                    const uint32_t x = static_cast<uint32_t>(idx[t][k] - loExpert);
+                    uint32_t q = __umulhi(x, magic);  // (idx - loExpert) / numLocalExperts, or one less
+                    q += (x - q * d >= d) ? 1u : 0u;
+                    if (x < widthExperts) rankBits[t] |= 1u << q;
+                }
+            }
+        }
+        // Count: rank r's total is the number of tokens whose bit r is set.
+        for (int r = 0; r < rankRangeSize; ++r) {
+#pragma unroll
+            for (int t = 0; t < kTokensPerLane; ++t) {
+                const unsigned hit = __ballot_sync(0xffffffffu, (rankBits[t] >> r) & 1u);
+                if (laneId == r) myCount += __popc(hit);
+            }
+        }
+    }
+    if (laneId < rankRangeSize) sharedRankCount[laneId] = myCount;
+    __syncwarp();
+}
+
 // Send expert count to destination rank
 __forceinline__ __device__ void sendExpertCount(
     int numTokensSent,
@@ -735,11 +824,6 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             }
         }
 
-        // Count tokens per expert from topk indices
-        constexpr int kNumMaxRanks = 32;
-        int rankCount[kNumMaxRanks] = {0};
-        uint64_t rankMap[kNumMaxRanks] = {0};
-
         const auto expertBeginIdx = smId * numWarpGroups;
         const auto expertEndIdx = min(expertBeginIdx + numWarpGroups, numExperts);
 
@@ -748,25 +832,38 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
         const int rankBeginIdx = expertBeginIdx / numLocalExperts;
         const int rankEndIdx = expertEndIdx / numLocalExperts + 1;
 
-        countTokensPerRank_mask(
-            inTopkIdx,
-            numTokens,
-            numTopk,
-            numLocalExperts,
-            rankBeginIdx,
-            rankEndIdx,
-            rankCount,
-            rankMap,
-            sharedNumTokensSentPerRank,
-            laneId);
-
         if constexpr (kCft) {
+            // Early count publication puts this scan on the CFT receive path.
+            countTokensPerRankCft(
+                inTopkIdx,
+                numTokens,
+                numTopk,
+                numLocalExperts,
+                rankBeginIdx,
+                rankEndIdx,
+                sharedNumTokensSentPerRank,
+                laneId);
             __syncwarp();
             cftPublishCountEarly(
                 expertBeginIdx, expertEndIdx, sharedNumTokensSentPerRank, laneId,
                 currRank, numRanks, numLocalExperts, recvCntOff, recvCntBuf,
                 asyncErrorFlag, windows, devComm);
         } else {
+            constexpr int kNumMaxRanks = 32;
+            int rankCount[kNumMaxRanks] = {0};
+            uint64_t rankMap[kNumMaxRanks] = {0};
+            countTokensPerRank_mask(
+                inTopkIdx,
+                numTokens,
+                numTopk,
+                numLocalExperts,
+                rankBeginIdx,
+                rankEndIdx,
+                rankCount,
+                rankMap,
+                sharedNumTokensSentPerRank,
+                laneId);
+
             // One counting warp updates rankDone per rank on the store path.
 #pragma unroll
             for (int i = rankBeginIdx + laneId; i < rankEndIdx; i += 32) {
