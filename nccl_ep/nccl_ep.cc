@@ -1440,10 +1440,12 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     //   [ 8..16) combine_expected_gin_flag_val   (uint64_t)
     //   [16..20) dispatch_expected_lsa_flag_val (uint32_t)
     //   [20..24) combine_expected_lsa_flag_val  (uint32_t)
-    //   [24..28) dispatch_grid_barrier_counter (uint32_t)
-    //   [28..32) combine_grid_barrier_counter  (uint32_t)
+    //   [24..28) dispatch_grid_barrier_counter      (uint32_t)
+    //   [28..32) dispatch_head_sync_counter         (uint32_t)
+    //   [32..36) combine_grid_barrier_counter       (uint32_t)
+    //   [36..40) combine_head_sync_counter          (uint32_t)
     {
-        constexpr size_t kCounterBlockBytes = 32;
+        constexpr size_t kCounterBlockBytes = 40;
         void* block = nullptr;
         CUDA_CHECK(ep_group->alloc.alloc_fn(&block, kCounterBlockBytes, ep_group->alloc.context));
         ep_group->ht_buffers.dev_counter_block = block;
@@ -1453,7 +1455,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         ep_group->ht_buffers.dispatch_expected_lsa_flag_val = reinterpret_cast<uint32_t*>(base + 16);
         ep_group->ht_buffers.combine_expected_lsa_flag_val = reinterpret_cast<uint32_t*>(base + 20);
         ep_group->ht_buffers.dispatch_grid_barrier_counter = reinterpret_cast<uint32_t*>(base + 24);
-        ep_group->ht_buffers.combine_grid_barrier_counter = reinterpret_cast<uint32_t*>(base + 28);
+        ep_group->ht_buffers.combine_grid_barrier_counter = reinterpret_cast<uint32_t*>(base + 32);
 
         // Initialize the expected counters to the first-invocation value
         // (grid-barrier counters stay at 0). Bootstrap is outside any user

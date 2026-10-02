@@ -1150,7 +1150,7 @@ struct dispatch_kernel_param_base_t {
     void* gin_base_ptr; // Base pointer for offset calculations
     // Memory Region info
     struct dispatch_memory_region_info_t mr_info;
-    // Grid barrier counter for fused device_sync in dispatch tail (per-rank, not IPC-shared)
+    // Dispatch tail counter followed by its head-sync counter (per-rank, not IPC-shared).
     uint32_t* dispatch_grid_barrier_counter;
     // When true (EM layout with local fanout enabled),
     // sender S2G dedups consecutive same-dest entries; secondary slots are filled
@@ -1220,7 +1220,7 @@ struct combine_kernel_param_base_t {
     int num_of_tokens_per_rank;
     // Actual token count; gates the cross_lsa_red TMA store.
     int num_real_tokens;
-    // Per-rank grid-barrier counter that elects the last block at the combine tail.
+    // Combine tail counter followed by its head-sync counter.
     uint32_t* combine_grid_barrier_counter;
     // NCCL GIN context
     ncclDevComm_t* dcomm; // Device communicator (device pointer)
@@ -5024,6 +5024,21 @@ __device__ __forceinline__ void dispatch_push_map_warp(
     dispatch_push_map_publish_outputs<EXPERTS_PER_RANK>(ctx, pub, map_warp);
 }
 
+// Elect the first block to claim *state (result broadcast to all threads in the block).
+__device__ __forceinline__ bool elect_first_block(uint32_t* state, uint32_t claimed_state) {
+    int elected = 0;
+    if (threadIdx.x == 0) elected = atomicCAS(state, 0u, claimed_state) == 0u;
+    return __syncthreads_or(elected);
+}
+
+// Elect the first block to claim *state (result broadcast within the calling warp).
+__device__ __forceinline__ bool elect_first_block_warp(
+    uint32_t* state, uint32_t claimed_state, int lane) {
+    int elected = 0;
+    if (lane == 0) elected = atomicCAS(state, 0u, claimed_state) == 0u;
+    return __shfl_sync(0xffffffffu, elected, 0);
+}
+
 // Elect the last block to arrive at *counter (result broadcast to all threads in the block).
 __device__ __forceinline__ bool elect_last_block(const int* counter, int num_blocks) {
     __syncthreads();
@@ -5103,6 +5118,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
     using head_rdma_warp = warp_group<1, 1>;
     using head_lsa_warp = warp_group<1, 2>;
 
+    uint32_t* dispatch_head_sync_counter = param.dispatch_grid_barrier_counter + 1;
+
     // The head phase runs on warps 0, 1, 2 (mbarrier init / RDMA guard / intra-LSA
     // barrier), so the block must always contain at least 3 warps -- even when the
     // communication groups need fewer (flat layout + single LSA team + 1 pipeline
@@ -5140,43 +5157,50 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                     *param.expected_gin_flag_val);
         }
     } else if (head_tid < head_init_warp::size() + head_rdma_warp::size() + head_lsa_warp::size()) {
-        // warp 2: intra-LSA LSA barrier. Fused count mode fans this rank's finished
-        // count row out to every LSA peer first (self slot always written, even for
-        // LSA_TEAM_SZ==1), then runs the barrier with acq_rel so the MAP warps see it
-        // after sync. Unfused mode already has rows local (AllGathered in UpdateHandle),
-        // so it skips the fan-out and uses a plain guard barrier.
-        const bool count_fanout = param.dispatch_push_count.active && param.dispatch_push_count.fused_meta_dispatch;
-        if (count_fanout) {
-            const int lane = head_tid & 31;
-            const int me = my_lteam * LSA_TEAM_SZ + param.local_rank; // global sender-row index
-            const size_t row_ints = (size_t)param.dispatch_push_count.num_src_ranks +
-                                    (size_t)param.experts_per_rank * param.dispatch_push_count.num_src_ranks;
-            // Split by consumer scope: every block ships the cnt_rank prefix (dispatch_push_map_build_rank_base
-            // needs it on every block); only block 0 ships the cnt_expert tail
-            // (dispatch_push_map_publish_outputs is block 0 / MAP warp 0 only). Idempotent-write is
-            // preserved: non-zero blocks write a prefix of what block 0 writes, at identical
-            // addresses.
-            const size_t n_ship = (blockIdx.x == 0) ? row_ints : (size_t)param.dispatch_push_count.num_src_ranks;
-            const int32_t* my_row = param.dispatch_push_count.own_row;
-            for (int p = 0; p < LSA_TEAM_SZ; p++) {
-                int32_t* dst = reinterpret_cast<int32_t*>(
-                    param.dispatch_push_count.recv_tables_ptrs[p] + param.dispatch_push_count.published_offset) + (size_t)me * row_ints;
-                for (int i = lane; i < (int)n_ship; i += 32) dst[i] = my_row[i];
+        // warp 2: one first-admitted block publishes count metadata and runs the
+        // intra-LSA barrier, then releases the other local blocks.
+        const bool count_fanout =
+            param.dispatch_push_count.active && param.dispatch_push_count.fused_meta_dispatch;
+        const bool lsa_head_sync = param.guard_enabled || count_fanout;
+        if (lsa_head_sync) {
+            const int lane = head_lsa_warp::thread_rank();
+            const bool head_lsa_leader =
+                elect_first_block_warp(dispatch_head_sync_counter, 1u, lane);
+            if (head_lsa_leader) {
+                if (count_fanout) {
+                    const int me =
+                        my_lteam * LSA_TEAM_SZ + param.local_rank; // global sender-row index
+                    const size_t row_ints =
+                        (size_t)param.dispatch_push_count.num_src_ranks +
+                        (size_t)param.experts_per_rank *
+                            param.dispatch_push_count.num_src_ranks;
+                    const int32_t* my_row = param.dispatch_push_count.own_row;
+                    for (int p = 0; p < LSA_TEAM_SZ; p++) {
+                        int32_t* dst = reinterpret_cast<int32_t*>(
+                            param.dispatch_push_count.recv_tables_ptrs[p] +
+                            param.dispatch_push_count.published_offset) +
+                            (size_t)me * row_ints;
+                        for (int i = lane; i < (int)row_ints; i += 32) dst[i] = my_row[i];
+                    }
+                    // Order every leader-warp count store before lane 0 publishes readiness.
+                    __syncwarp();
+                }
+                if constexpr (LSA_TEAM_SZ != 1) {
+                    ncclLsaBarrierSession<ncclCoopWarp> bar(
+                        ncclCoopWarp(), *param.dcomm, ncclTeamTagLsa(), 0u);
+                    bar.sync(
+                        ncclCoopWarp(),
+                        count_fanout ? cuda::memory_order_acq_rel : cuda::memory_order_relaxed);
+                }
             }
-            __threadfence_system();
-        }
-        if constexpr (LSA_TEAM_SZ != 1) {
-            // Peer publish/synchronize barrier (a 1-member team needs no barrier; the
-            // __threadfence_system above plus the block __syncthreads order the self write).
-            if (param.guard_enabled || count_fanout) {
-                ncclLsaBarrierSession<ncclCoopWarp> bar(
-                    ncclCoopWarp(),
-                    *param.dcomm,
-                    ncclTeamTagLsa(),
-                    (uint32_t)blockIdx.x);
-                bar.sync(
-                    ncclCoopWarp(),
-                    count_fanout ? cuda::memory_order_acq_rel : cuda::memory_order_relaxed);
+            if (lane == 0) {
+                int* counter = reinterpret_cast<int*>(dispatch_head_sync_counter);
+                if (head_lsa_leader) {
+                    nccl_ep::st_release_gpu_global(counter, 2);
+                } else {
+                    while (nccl_ep::ld_relaxed_gpu_global(dispatch_head_sync_counter) != 2u) {}
+                    (void)nccl_ep::ld_acquire_global(counter);
+                }
             }
         }
     }
@@ -5370,6 +5394,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 } while (flag_data != expected_val);
                 nccl_ep::memory_fence();
                 atomicExch((unsigned int*)param.dispatch_grid_barrier_counter, 0u);
+                atomicExch(dispatch_head_sync_counter, 0u);
                 if (!param.local_dup_enabled)
                     *param.expected_lsa_flag_val += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
@@ -5492,6 +5517,8 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
     cur_smem_t* smem_buffer_ptr = &smem_layout;
 
     // ===== FUSED DEVICE SYNC (combine head) =====
+    uint32_t* combine_head_sync_counter = param.combine_grid_barrier_counter + 1;
+    const bool head_leader = elect_first_block(combine_head_sync_counter, 1u);
     using head_init_warp = warp_group<1, 0>; // warp 0
     using head_rdma_warp = warp_group<1, 1>; // warp 1
     const int head_tid = (int)threadIdx.x;
@@ -5500,8 +5527,9 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
 #ifdef NCCL_EP_HT_ENABLE_WARP_TIMING
             _wt_head_start = clock64();
 #endif
-            // Inter-rank completion barrier: block 0 signals (red.release orders prior stores), every block polls.
-            if (blockIdx.x == 0) nccl_ep::red_add_release_sys_global(param.lsa_S2G_flags, 1u);
+            // Inter-rank completion barrier: the first admitted block signals
+            // (red.release orders prior stores), every block polls.
+            if (head_leader) nccl_ep::red_add_release_sys_global(param.lsa_S2G_flags, 1u);
             const uint32_t expected_val = *param.expected_lsa_flag_val;
             uint32_t flag_data;
             do {
@@ -5715,6 +5743,7 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             // warp 0: reset the grid counter + bump the intra-LSA round.
             if (tail_tid == 0) {
                 atomicExch((unsigned int*)param.combine_grid_barrier_counter, 0u);
+                atomicExch(combine_head_sync_counter, 0u);
                 *param.expected_lsa_flag_val += static_cast<uint32_t>(param.ranks_per_lsa_team);
             }
         } else if (tail_tid < tail_reset_warp::size() + tail_rdma_warp::size()) {
@@ -6706,12 +6735,10 @@ struct lsa_map_publish_param_t {
     int32_t* layout_ready;
 };
 
-// ready: the value the head gate publishes/waits for. Fused pull-count publishes its
-// metadata before this gate and signals ready=2 so a straggler that only observed the
-// (unrelated) ready=1 value from a prior dispatch on this flag cannot proceed early.
-__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_t* head_sync_flag, int ready = 1) {
+__device__ __forceinline__ void lsa_grid_head_gate_elected(
+    ncclDevComm_t* dcomm, uint32_t* head_sync_flag, bool leader, int ready) {
     int* head_flag = reinterpret_cast<int*>(head_sync_flag);
-    if (blockIdx.x == 0) {
+    if (leader) {
         if (threadIdx.x < 32) {
             ncclLsaBarrierSession<ncclCoopWarp> bar(ncclCoopWarp(), *dcomm, ncclTeamTagLsa(), 0u);
             bar.sync(ncclCoopWarp(), cuda::memory_order_acq_rel);
@@ -6728,6 +6755,14 @@ __device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_
         }
         __syncthreads();
     }
+}
+
+// ready: the value the head gate publishes/waits for. Fused pull-count publishes its
+// metadata before this gate and signals ready=2 so a straggler that only observed the
+// (unrelated) ready=1 value from a prior dispatch on this flag cannot proceed early.
+__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_t* head_sync_flag, int ready = 1) {
+    const bool leader = elect_first_block(head_sync_flag, static_cast<uint32_t>(ready + 1));
+    lsa_grid_head_gate_elected(dcomm, head_sync_flag, leader, ready);
 }
 
 // Block-uniform LSA grid tail barrier shared by pull dispatch and push combine.
@@ -6844,12 +6879,12 @@ __device__ __forceinline__ void dispatch_pull_pad_fill(
     }
 }
 
-// CTA 0 publishes this handle's metadata before the peer head barrier.
+// CTA 0 in the standalone kernel, or the elected fused head CTA, publishes metadata.
 __device__ __forceinline__ void dispatch_pull_map_publish(
     const int32_t* __restrict__ own_row, const uint16_t* __restrict__ own_topk,
     const uint8_t* const* __restrict__ meta_ptrs, size_t row_stride, int topk_off_bytes,
-    int tokens_per_rank, int top_k, int my_rank, int nRanks) {
-    if (blockIdx.x != 0) return;
+    int tokens_per_rank, int top_k, int my_rank, int nRanks, bool elected_cta = false) {
+    if (!elected_cta && blockIdx.x != 0) return;
     const int count_ints = own_row ? topk_off_bytes / sizeof(int32_t) : 0;
     for (int i = threadIdx.x; i < count_ints; i += blockDim.x) {
         const int32_t v = own_row[i];
@@ -7363,12 +7398,18 @@ __device__ __forceinline__ void dispatch_pull(
     if constexpr (kFusedMap) {
         // When unfused, a standalone publish kernel and head-sync kernel already did this.
         if (!unfused_sync) {
-            // Reset the layout flag before publication and the fresh peer head gate.
-            if (blockIdx.x == 0 && threadIdx.x == 0) *layout_ready = 0;
-            dispatch_pull_map_publish(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot, meta_ptrs, meta_stride,
-                topk_off_bytes, tokens_per_rank, top_k, my_rank, lsa_team_size);
-            __syncthreads();
-            lsa_grid_head_gate(dcomm, head_sync_flag, 2);
+            constexpr int kMapReady = 2;
+            const bool head_leader =
+                elect_first_block(head_sync_flag, static_cast<uint32_t>(kMapReady + 1));
+            if (head_leader) {
+                if (threadIdx.x == 0) *layout_ready = 0;
+                __syncthreads();
+                dispatch_pull_map_publish(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot,
+                    meta_ptrs, meta_stride, topk_off_bytes, tokens_per_rank, top_k, my_rank,
+                    lsa_team_size, /*elected_cta=*/true);
+                __syncthreads();
+            }
+            lsa_grid_head_gate_elected(dcomm, head_sync_flag, head_leader, kMapReady);
         }
     } else if (!unfused_sync) {
         lsa_grid_head_gate(dcomm, head_sync_flag);

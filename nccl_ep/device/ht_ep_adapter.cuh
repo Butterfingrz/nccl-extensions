@@ -676,7 +676,7 @@ struct DispatchParams {
     uint32_t* expected_lsa_flag_val;
     uint64_t* gin_G2S_flags;
     uint32_t* lsa_S2G_flags;
-    // Grid barrier counter for fused device_sync in dispatch tail
+    // Dispatch tail counter followed by its head-sync counter.
     uint32_t* dispatch_grid_barrier_counter;
 
     // GIN context (from ep_group, multi-LSA-team only)
@@ -768,7 +768,7 @@ struct CombineParams {
     uint32_t* expected_lsa_flag_val;
     uint64_t* gin_G2S_flags;
     uint32_t* lsa_S2G_flags;
-    // Per-rank grid-barrier counter that elects the last block at the combine tail.
+    // Combine tail counter followed by its head-sync counter.
     uint32_t* combine_grid_barrier_counter;
 
     // GIN context (multi-LSA-team only)
