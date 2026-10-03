@@ -129,24 +129,13 @@ ncclResult_t call_dispatch(
         return r;
     }
 
-    // Match CftTileGeometry and cftCarveSendContext in ll_ep_cft.cuh.
-    // This gate must match cftDispatchEnabled except for its device-architecture
-    // check: the host may over-reserve shared memory, but must not under-reserve.
+    // Select the CFT JIT variant only for supported dispatch configurations.
     const bool cft_active = (params.cftPeerLeIds != nullptr) &&
                             (recipe == NCCL_EP_DISP_QUANT_NONE) &&
                             (params.recvDataWindow == ncclWindow_t{}) &&
                             (params.rcvScalesWin == ncclWindow_t{}) &&
                             (params.rankMask == nullptr) &&
                             (params.tokenDtype != ncclFloat32);
-
-    // Check the opt-in shared-memory limit before configuring the JIT launch.
-    static const int max_dyn_smem = [] {
-        int v = 0;
-        int dev = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess) return 0;
-        if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) return 0;
-        return v;
-    }();
 
     int cft_smem_bytes = 0;
     if (cft_active) {
@@ -158,7 +147,12 @@ ncclResult_t call_dispatch(
         // Peer IDs and destination scratch follow the tiles.
         cft_smem_bytes += static_cast<int>(align<size_t>(params.numRanks * sizeof(uint32_t), 16));
         cft_smem_bytes += kCftDestScratchBytes;
-        EP_HOST_ASSERT(max_dyn_smem == 0 || cft_smem_bytes <= max_dyn_smem);
+        if (cft_smem_bytes > params.maxDynamicSmem) {
+            std::fprintf(stderr,
+                         "ncclEpDispatch: LL CFT requires %d bytes of shared memory, device limit is %d bytes\n",
+                         cft_smem_bytes, params.maxDynamicSmem);
+            return ncclInvalidArgument;
+        }
     }
 
     return jit::launch_ll_dispatch(

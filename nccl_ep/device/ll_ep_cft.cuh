@@ -61,33 +61,16 @@ __device__ __forceinline__ void cftReportRecvFailure(
     trap();
 }
 
-// Predicates: is CFT live, does this pair use it
+// Sender/receiver transport choice
 
 // Shared sender/receiver transport predicate. Strict CFT initialization
 // ensures every peer is available; self-sends use local stores because fabric
 // loopback puts are unsupported. Keep all pair decisions in this helper.
 //
-// Remote CFT requires a single NVLink domain; qualification covers eight
-// ranks across two nodes within that domain.
-// TODO: reject cross-domain groups explicitly during group creation.
+// Host setup requires one LSA team for the P2P count channel. That team may
+// span multiple physical nodes in the same NVLink domain.
 __device__ __forceinline__ bool cftPairUsesCft(bool cftEnabled, int srcRank, int dstRank) {
     return cftEnabled && (srcRank != dstRank);
-}
-
-// Rank-uniform gate for the send, count, and receive paths. CFT requires
-// unquantized two-byte tokens, no zero-copy windows, and no rank masking.
-// Keep this in sync with cft_active in ll_ep_adapter.cu, which sizes dynamic
-// shared memory. The host also disables zero-copy when CFT is active.
-template <ncclEpDispQuant_t kRecipe, ncclDataType_t kTokenDtype>
-__device__ __forceinline__ bool cftDispatchEnabled(
-    const cft_dispatch_args_t& cft, ncclWindow_t recvDataWindow, ncclWindow_t rcvScalesWin, const int* rankMask) {
-    return (cft.peerLeIds != nullptr) &&
-           (kRecipe == NCCL_EP_DISP_QUANT_NONE) &&
-           (recvDataWindow == ncclWindow_t{}) &&
-           (rcvScalesWin == ncclWindow_t{}) &&
-           (rankMask == nullptr) &&
-           (kTokenDtype != ncclFloat32) &&  // fp32 tile would overflow smem
-           (NCCL_EP_CFT_DEVICE_SUPPORTED != 0);
 }
 
 // Sender state
@@ -148,7 +131,7 @@ struct CftSendContext {
 };
 
 // Bind the dynamic shared-memory regions and static mbarriers. The kernel
-// builds this context on every warp but dereferences it only when CFT is active.
+// builds this context only in CFT variants; warp 0 owns the sender state.
 template <class Geometry>
 __device__ __forceinline__ CftSendContext<Geometry> cftCarveSendContext(
     uint8_t* dynSmem, nccl_ep::cft::Smem* dataSmem, uint64_t* tmaMbars, int numRanks) {

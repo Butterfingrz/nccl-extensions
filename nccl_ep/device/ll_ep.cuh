@@ -389,10 +389,15 @@ __device__ __forceinline__ void cftPublishCountEarly(
 // from size_u8<kTokenDtype>(); the read stride is the input element width whether or
 // not the output is FP8 (so FP32-input quantization reads the correct stride too).
 template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, ncclEpLayout_t kLayout, bool kNvlinkOnly,
-          typename TopkIdxT, ncclDataType_t kTokenDtype, typename ScaleT>
+          typename TopkIdxT, ncclDataType_t kTokenDtype, typename ScaleT, bool kCft>
 __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_t& args) {
     EP_STATIC_ASSERT(kNumTopk > 0 && kNumTopk <= combine_smem::kWarpSize - kLlDispatchControlWarps,
                      "LL dispatch top-k must leave one control warp");
+    EP_STATIC_ASSERT(!kCft || (kRecipe == NCCL_EP_DISP_QUANT_NONE && size_u8<kTokenDtype>() == kCftElementBytes),
+                     "CFT dispatch requires unquantized two-byte tokens");
+#if defined(__CUDA_ARCH__)
+    EP_STATIC_ASSERT(!kCft || NCCL_EP_CFT_DEVICE_SUPPORTED, "CFT dispatch requires device CFT support");
+#endif
     constexpr int numTopk = kNumTopk;
     // Bind every args field to a same-named local (struct sendOff/recvOff/
     // recvCntOff bind as *Base). All bindings must stay ahead of the
@@ -503,24 +508,21 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     constexpr int kNumMaxWarpGroups = kLlDispatchMaxWarpGroups;
     __shared__ int sharedNumTokensSentPerRank[kNumMaxWarpGroups];
 
-    // Tiles, peer IDs and destination scratch use dynamic shared memory;
-    // ll_ep_adapter.cu reserves the matching size. Request 128-byte alignment
-    // for transfer performance. Completion mbarriers must also be in shared
-    // memory: one for fabric puts and one per TMA staging slot.
+#if NCCL_EP_CFT_DEVICE_SUPPORTED
     using CftGeom = CftTileGeometry<kHidden, kNumTopk, kLayout>;
-    extern __shared__ __align__(128) uint8_t cft_dyn_smem_[];
-    __shared__ nccl_ep::cft::Smem cft_data_smem;  // 16 B aligned like ncclCftSmem
-    __shared__ __align__(8) uint64_t cft_tma_mbars[CftGeom::kRingDepth];
-#if NCCL_EP_CFT_DEVICE_SUPPORTED
-    // Device-only type (embeds cft::Cft); every use below is behind the same guard.
-    CftSendContext<CftGeom> cftSend =
-        cftCarveSendContext<CftGeom>(cft_dyn_smem_, &cft_data_smem, cft_tma_mbars, numRanks);
-#endif
-    // Rank-uniform gate for every CFT use site (send, count publish, receive).
-    const bool cft_enabled = cftDispatchEnabled<kRecipe, kTokenDtype>(cft, recvDataWindow, rcvScalesWin, rankMask);
-    // Initialize before the receive-only jump, which must not skip local state.
-#if NCCL_EP_CFT_DEVICE_SUPPORTED
-    if (cft_enabled && warpId == 0) cftInitSender(cftSend, cft.peerLeIds, numRanks, laneId);
+    CftSendContext<CftGeom> cftSend;
+    if constexpr (kCft) {
+        EP_DEVICE_ASSERT(cft.peerLeIds != nullptr && recvDataWindow == ncclWindow_t{} &&
+                         rcvScalesWin == ncclWindow_t{} && rankMask == nullptr);
+        // Only CFT variants reserve tiles and completion barriers. The host
+        // reserves matching dynamic storage for tiles, peer IDs and scratch.
+        extern __shared__ __align__(128) uint8_t cft_dyn_smem_[];
+        __shared__ nccl_ep::cft::Smem cft_data_smem;
+        __shared__ __align__(8) uint64_t cft_tma_mbars[CftGeom::kRingDepth];
+        cftSend = cftCarveSendContext<CftGeom>(cft_dyn_smem_, &cft_data_smem, cft_tma_mbars, numRanks);
+        // Initialize before the receive-only jump, which must not skip local state.
+        if (warpId == 0) cftInitSender(cftSend, cft.peerLeIds, numRanks, laneId);
+    }
 #endif
 
     // Sending phase
@@ -553,10 +555,15 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
         const CftSelfDestination cftSelf =
             cftSelfDestination(recvBuf, currRank, numRanks, srcRankRegionBytes, maxTokensPerRank, dispatch_hdr_sz);
         const CftMessageLayout cftMsg{dispatch_hdr_sz, hiddenBytes, payloadBytes, numBytesPerMsg};
-        if (cft_enabled && warpId == 0 && laneId == 0) cftCheckBulkAlignment(cftSelf, cftMsg);
-        if (cft_enabled && warpId == 0 && laneId == 0 && smId < numTokens) {
-            cftStagePayload(cftSend, 0, static_cast<const int4*>(inData) + static_cast<size_t>(smId) * hiddenBf16Int4,
-                            cftMsg);
+        if constexpr (kCft) {
+            if (warpId == 0 && laneId == 0) {
+                cftCheckBulkAlignment(cftSelf, cftMsg);
+                if (smId < numTokens) {
+                    cftStagePayload(cftSend, 0,
+                                    static_cast<const int4*>(inData) + static_cast<size_t>(smId) * hiddenBf16Int4,
+                                    cftMsg);
+                }
+            }
         }
 #endif
 
@@ -598,10 +605,9 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
 
             // Cast and write data to send buffer (consumed by the RDMA path).
             // NVLink dsts cast directly from inData instead, in the per-warp
-            // send branch below. When kNvlinkOnly is set, every dst is
-            // guaranteed to take the NVLink direct path so the staging-buffer
-            // payload is never read and the cast can be skipped entirely.
-            if constexpr (!kNvlinkOnly) {
+            // send branch below. CFT stages through TMA; kNvlinkOnly stores
+            // write directly to peers. Neither needs this staged payload.
+            if constexpr (!kCft && !kNvlinkOnly) {
                 using src_t = const typename recipe_types::source_vec_t*;
                 castAndWriteToSendBuf<kRecipe, ScaleT>(
                     static_cast<src_t>(srcDataInt4),
@@ -619,81 +625,87 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             // Make sure that all working warps in the SM have completed the header writing.
             syncSmGroup(SYNC_DISP_SEND_COPY, numWritingThreads);
 
-            // Do filtering to avoid duplicate sending of tokens to the same rank.
-            if (dstExpertIdx >= 0) {
-                // Optimized: rank-level slot allocation (aggregates across experts)
-                int minTopkIdx = numTopk;
-                for (int i = laneId; i < numTopk; i += 32) {
-                    const auto otherExpertIdx = sendBufHdr->rtr[i].expert_id;
-                    const auto otherRank = getExpertRankIdx(otherExpertIdx, numLocalExperts);
-                    // if another expert is located on the same rank - disqualify this warp
-                    // from sending the token to avoid duplication
-                    if (otherRank == dstRank) {
-                        minTopkIdx = min(minTopkIdx, i);
+            if constexpr (!kCft) {
+                // Do filtering to avoid duplicate sending of tokens to the same rank.
+                if (dstExpertIdx >= 0) {
+                    // Optimized: rank-level slot allocation (aggregates across experts)
+                    int minTopkIdx = numTopk;
+                    for (int i = laneId; i < numTopk; i += 32) {
+                        const auto otherExpertIdx = sendBufHdr->rtr[i].expert_id;
+                        const auto otherRank = getExpertRankIdx(otherExpertIdx, numLocalExperts);
+                        // if another expert is located on the same rank - disqualify this warp
+                        // from sending the token to avoid duplication
+                        if (otherRank == dstRank) {
+                            minTopkIdx = min(minTopkIdx, i);
+                        }
                     }
-                }
-                minTopkIdx = warp_reduce_min(minTopkIdx);
+                    minTopkIdx = warp_reduce_min(minTopkIdx);
 
-                // The first top-k warp for each rank sends on the store path.
-                // CFT sends all destinations through warp 0 below.
-                if (minTopkIdx == warpId && !cft_enabled) {
-                    int slotIdx = laneId == 0 ? atomicAdd(rankSentCnt + dstRank, 1) : 0;
-                    slotIdx = __shfl_sync(0xffffffff, slotIdx, 0);
-                    // evenly distribute sends by available channels
-                    const auto ctxHash = slotIdx % numLocalExperts;
-                    // Per-srcRank region base on the peer; sendToken picks the
-                    // NVLink (split layout, direct from `inData`) or RDMA
-                    // (interleaved, gin.put from staging) path internally.
-                    const size_t srcRankOffset =
-                        static_cast<size_t>(relativeRankSlot(currRank, dstRank, numRanks)) * srcRankRegionBytes;
-                    const auto srcRankLocalPtr = reinterpret_cast<uint64_t>(recvBuf) + srcRankOffset;
-                    const auto sendBufInt4 = reinterpret_cast<const int4*>(sendBufBase);
-                    sendToken<kRecipe, kNvlinkOnly, ScaleT>(
-                        sendBufInt4,
-                        srcDataInt4,
-                        srcRankLocalPtr,
-                        recvOff + srcRankOffset,
-                        slotIdx,
-                        tokenIdx,
-                        sendOff,
-                        numBytesPerMsg,
-                        dispatch_hdr_sz,
-                        hiddenBytes,
-                        hiddenBf16Int4,
-                        numScales,
-                        maxTokensPerRank,
-                        dstRank,
-                        ctxHash,
-                        currRank,
-                        roundScale,
-                        rankMask,
-                        windows,
-                        devComm,
-                        recvDataWindow,
-                        recvDataOffset,
-                        rcvScalesWin,
-                        rcvScalesOffs,
-                        inScalesTok,
-                        laneId);
-                    if (laneId == 0) {
-                        // Mark that one more token is sent to the rank
-                        atomic_add_release_global(rankDone + dstRank, 1);
+                    // The first top-k warp for each rank sends on the store path.
+                    // CFT sends all destinations through warp 0 below.
+                    if (minTopkIdx == warpId) {
+                        int slotIdx = laneId == 0 ? atomicAdd(rankSentCnt + dstRank, 1) : 0;
+                        slotIdx = __shfl_sync(0xffffffff, slotIdx, 0);
+                        // evenly distribute sends by available channels
+                        const auto ctxHash = slotIdx % numLocalExperts;
+                        // Per-srcRank region base on the peer; sendToken picks the
+                        // NVLink (split layout, direct from `inData`) or RDMA
+                        // (interleaved, gin.put from staging) path internally.
+                        const size_t srcRankOffset =
+                            static_cast<size_t>(relativeRankSlot(currRank, dstRank, numRanks)) * srcRankRegionBytes;
+                        const auto srcRankLocalPtr = reinterpret_cast<uint64_t>(recvBuf) + srcRankOffset;
+                        const auto sendBufInt4 = reinterpret_cast<const int4*>(sendBufBase);
+                        sendToken<kRecipe, kNvlinkOnly, ScaleT>(
+                            sendBufInt4,
+                            srcDataInt4,
+                            srcRankLocalPtr,
+                            recvOff + srcRankOffset,
+                            slotIdx,
+                            tokenIdx,
+                            sendOff,
+                            numBytesPerMsg,
+                            dispatch_hdr_sz,
+                            hiddenBytes,
+                            hiddenBf16Int4,
+                            numScales,
+                            maxTokensPerRank,
+                            dstRank,
+                            ctxHash,
+                            currRank,
+                            roundScale,
+                            rankMask,
+                            windows,
+                            devComm,
+                            recvDataWindow,
+                            recvDataOffset,
+                            rcvScalesWin,
+                            rcvScalesOffs,
+                            inScalesTok,
+                            laneId);
+                        if (laneId == 0) {
+                            // Mark that one more token is sent to the rank
+                            atomic_add_release_global(rankDone + dstRank, 1);
+                        }
                     }
                 }
             }
 #if NCCL_EP_CFT_DEVICE_SUPPORTED
             // Warp 0 sends every destination from one staged tile, including
             // self via TMA. It runs for each token regardless of its top-k entry.
-            if (cft_enabled && warpId == 0) {
-                cftSendToken<kNumTopk>(cftSend, cft, cftSelf, cftMsg, tokenIdx, numSms, numTokens, inTopkIdx,
-                                       static_cast<const int4*>(inData), hiddenBf16Int4, sendBufBase, rankSentCnt,
-                                       numLocalExperts, currRank, laneId, timeoutCycles, asyncErrorFlag);
+            if constexpr (kCft) {
+                if (warpId == 0) {
+                    cftSendToken<kNumTopk>(cftSend, cft, cftSelf, cftMsg, tokenIdx, numSms, numTokens, inTopkIdx,
+                                           static_cast<const int4*>(inData), hiddenBf16Int4, sendBufBase, rankSentCnt,
+                                           numLocalExperts, currRank, laneId, timeoutCycles, asyncErrorFlag);
+                }
             }
 #endif
         }
 #if NCCL_EP_CFT_DEVICE_SUPPORTED
         // Drain self TMA stores and fabric completions before leaving the CTA.
-        if (cft_enabled && warpId == 0 && laneId == 0) cftDrainSender(cftSend, timeoutCycles, asyncErrorFlag, currRank);
+        if constexpr (kCft) {
+            if (warpId == 0 && laneId == 0) cftDrainSender(cftSend, timeoutCycles, asyncErrorFlag, currRank);
+        }
 #endif
     } else if (warpId == numWarps - 1) {
         // The reserved control warp is not part of the forwarding pipeline. Clear every
@@ -711,13 +723,15 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
         EP_DEVICE_ASSERT(numSms > 1);
         // CFT consumers clear their own count/flag words. A bank wipe would
         // race early count publication, which does not wait for the wipe flag.
-        if (smId == 0 && !cft_enabled) {
-            cleanNextRecvCntBuf(nextRecvCntBuf, nextRecvCntBufSize, laneId);
-            // Notify before executing `int_p`
-            __syncwarp();
+        if constexpr (!kCft) {
+            if (smId == 0) {
+                cleanNextRecvCntBuf(nextRecvCntBuf, nextRecvCntBufSize, laneId);
+                // Notify before executing `int_p`
+                __syncwarp();
 #pragma unroll
-            for (int i = laneId; i < numRanks; i += 32) {
-                atomic_add_release_global(rankDone + i, FINISHED_SUM_TAG);
+                for (int i = laneId; i < numRanks; i += 32) {
+                    atomic_add_release_global(rankDone + i, FINISHED_SUM_TAG);
+                }
             }
         }
 
@@ -746,7 +760,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             sharedNumTokensSentPerRank,
             laneId);
 
-        if (cft_enabled) {
+        if constexpr (kCft) {
             __syncwarp();
             cftPublishCountEarly(
                 expertBeginIdx, expertEndIdx, sharedNumTokensSentPerRank, laneId,
@@ -778,7 +792,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
 
         // CFT counts were published by the counting warp. The store path
         // must wait for payload completion before publishing its count.
-        if (not cft_enabled) {
+        if constexpr (!kCft) {
             // Also wait for the next-bank wipe: a peer may publish its next
             // operation's count/flag as soon as it receives this count.
             const int rankDoneTarget = FINISHED_SUM_TAG * 2;
@@ -823,7 +837,7 @@ LOW_LATENCY_DISPATCH_RECV:
     // Resent counters for the next dispatch
     if (responsibleExpertIdx < numRanks) {
         rankSentCnt[responsibleExpertIdx] = 0;
-        rankDone[responsibleExpertIdx] = 0;
+        if constexpr (!kCft) rankDone[responsibleExpertIdx] = 0;
     }
 
     // Receiving and packing
@@ -846,7 +860,7 @@ LOW_LATENCY_DISPATCH_RECV:
         EP_DEVICE_ASSERT(numWarpsPerGroup > 1 and numWarpGroups <= kLlDispatchMaxWarpGroups);
 
         // Match the sender's transport choice; self sends never use fabric.
-        const bool cft_for_recv = cftPairUsesCft(cft_enabled, srcRank, currRank)
+        const bool cft_for_recv = cftPairUsesCft(kCft, srcRank, currRank)
                                   && (cft.recvByteCounters != nullptr);
 
         // recvBuf wire layout for non-CFT sources: NVLink (intra-LSA) peers use the
@@ -877,11 +891,13 @@ LOW_LATENCY_DISPATCH_RECV:
                 timeoutCycles);
 
             // For CFT, wait for the corresponding bytes and acquire the data.
-            if (cft_for_recv) {
+            if constexpr (kCft) {
 #if NCCL_EP_CFT_DEVICE_SUPPORTED
-                numRecvTokens = cftAwaitPayload(cftRecvChannel(cft, srcRank, rankLaneIdx, numLocalExperts),
-                                                numRecvTokens, numBytesPerMsg, timeoutCycles, asyncErrorFlag,
-                                                currRank, srcRank, rankLaneIdx);
+                if (cft_for_recv) {
+                    numRecvTokens = cftAwaitPayload(cftRecvChannel(cft, srcRank, rankLaneIdx, numLocalExperts),
+                                                    numRecvTokens, numBytesPerMsg, timeoutCycles, asyncErrorFlag,
+                                                    currRank, srcRank, rankLaneIdx);
+                }
 #endif
             }
             atomic_add_release_global(rankArrivedCnt + srcRank, 1);

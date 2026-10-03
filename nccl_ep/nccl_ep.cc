@@ -2759,6 +2759,14 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             }
             // All ranks judge the same facts before creating any endpoints.
             if (vote[0].want_cft) {
+                if (props.nLsaTeams != 1) {
+                    fprintf(stderr,
+                            "NCCL EP: %s requires all ranks in one NCCL LSA team for P2P token-count "
+                            "publication, but this group has %d LSA teams. Unset %s on every rank "
+                            "to use the store path.\n",
+                            ep_group->env.ll_cft.name, props.nLsaTeams, ep_group->env.ll_cft.name);
+                    return reject_group(ncclInvalidUsage);
+                }
                 std::string unsupported;
                 int32_t group_support_level = INT32_MAX;
                 for (int r = 0; r < ep_group->nRanks; ++r) {
@@ -2897,10 +2905,6 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
     if (ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->ht_buffers.internode_initialized) {
         destroy_ht_internode(ep_group);
     }
-    // Clean up LL CFT fabric resources
-    if (ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY && ep_group->ll_cft_buffers.initialized) {
-        nccl_ep_cft_destroy(&ep_group->ll_cft_buffers, ep_group->cuda_device_id);
-    }
     // Clean up mask buffer and async error flag
     if (ep_group->mask_buffer != nullptr) {
         CUDA_CHECK(cudaFree(ep_group->mask_buffer));
@@ -2934,6 +2938,11 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) {
         NCCL_CHECK_RESULT(ncclBarrier(ep_group->comm, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaStreamDestroy(stream));
+
+        // Peers have finished using the CFT receive endpoints and buffers.
+        if (ep_group->ll_cft_buffers.initialized) {
+            nccl_ep_cft_destroy(&ep_group->ll_cft_buffers, ep_group->cuda_device_id);
+        }
 
         // Deregister single NCCL window if it was ever registered. The
         // rdma_buffer and its window are allocated lazily on the first LL
