@@ -116,6 +116,7 @@ run_suite() {
 SUITES=(
     "test_ht_dispatch_async|EP HT Async Dispatch Tests|0"
     "test_ht_chunk_config|EP HT Chunk Config Tests|0"
+    "test_ht_chunk_handle|EP HT Chunk Handle Tests|0"
     "test_output_layout|EP Output Layout Tests|1"
     "test_handle_maps|EP Handle Maps Tests|1"
     "test_lifecycle|EP Lifecycle Tests|1"

@@ -63,3 +63,53 @@ TEST(HtChunkConfig, RejectsInvalidAndRdma) {
     cfg.dispatch_tokens_per_chunk.value.ul = 32;
     EXPECT_EQ(nccl_ep_resolve_dispatch_chunk(cfg, 64, 2), 64);
 }
+
+TEST(HtChunkConfig, ActualTokenBoundary) {
+    ncclEpEnvConfig cfg;
+    for (int sms : {16, 32, 64}) {
+        for (int tokens : {0, 1, 31, 32, 33, 128, 512, 513, 768, 1024, 2048, 16384}) {
+            const int expected = tokens > 32 && tokens <= 32 * sms ? 32 : 64;
+            EXPECT_EQ(nccl_ep_select_dispatch_chunk(cfg, 64, 1, sms, tokens), expected);
+        }
+        EXPECT_EQ(nccl_ep_select_dispatch_chunk(cfg, 64, 1, sms, 32 * sms), 32);
+        EXPECT_EQ(nccl_ep_select_dispatch_chunk(cfg, 64, 1, sms, 32 * sms + 1), 64);
+    }
+}
+
+TEST(HtChunkConfig, AutomaticSelectionScope) {
+    ncclEpEnvConfig cfg;
+    for (int sms : {0, 8, 128, INT_MAX})
+        EXPECT_EQ(nccl_ep_select_dispatch_chunk(cfg, 64, 1, sms, 128), 64);
+    for (int chunk : {32, 128, 256})
+        EXPECT_EQ(nccl_ep_select_dispatch_chunk(cfg, chunk, 1, 16, 128), chunk);
+    EXPECT_EQ(nccl_ep_select_dispatch_chunk(cfg, 64, 2, 16, 128), 64);
+    cfg.dispatch_num_pipelines.is_set = true;
+    EXPECT_EQ(nccl_ep_select_dispatch_chunk(cfg, 64, 1, 16, 128), 64);
+    cfg.dispatch_num_pipelines.is_set = false;
+    cfg.dispatch_num_stages.is_set = true;
+    EXPECT_EQ(nccl_ep_select_dispatch_chunk(cfg, 64, 1, 16, 128), 64);
+}
+
+TEST(HtChunkConfig, ExplicitSelectionWins) {
+    ncclEpEnvConfig cfg;
+    cfg.dispatch_tokens_per_chunk.is_set = true;
+    for (unsigned long value : {0ul, 32ul, 48ul, 64ul, ULONG_MAX}) {
+        cfg.dispatch_tokens_per_chunk.value.ul = value;
+        const int resolved = nccl_ep_resolve_dispatch_chunk(cfg, 64, 1);
+        for (int tokens : {0, 33, 128, 1024})
+            EXPECT_EQ(nccl_ep_select_dispatch_chunk(cfg, resolved, 1, 16, tokens), resolved);
+    }
+}
+
+TEST(HtChunkConfig, ScratchCoversEverySelection) {
+    ncclEpEnvConfig cfg;
+    for (bool overridden : {false, true}) {
+        cfg.dispatch_tokens_per_chunk.is_set = overridden;
+        cfg.dispatch_tokens_per_chunk.value.ul = 64;
+        for (int sms : {8, 16, 32, 64, 128}) {
+            const int minimum = nccl_ep_select_dispatch_chunk(cfg, 64, 1, sms, 33);
+            for (int tokens = 0; tokens <= 16384; ++tokens)
+                EXPECT_GE(nccl_ep_select_dispatch_chunk(cfg, 64, 1, sms, tokens), minimum);
+        }
+    }
+}

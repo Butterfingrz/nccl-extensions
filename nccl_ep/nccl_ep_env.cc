@@ -149,6 +149,15 @@ int nccl_ep_resolve_dispatch_chunk(const ncclEpEnvConfig& cfg, int combine_chunk
     return static_cast<int>(chunk);
 }
 
+int nccl_ep_select_dispatch_chunk(const ncclEpEnvConfig& cfg, int default_chunk,
+                                 int num_lsa_teams, int dispatch_num_sms, int num_tokens) {
+    if (cfg.dispatch_tokens_per_chunk.is_set || cfg.dispatch_num_stages.is_set ||
+        cfg.dispatch_num_pipelines.is_set || num_lsa_teams != 1 || default_chunk != 64 ||
+        dispatch_num_sms < 16 || dispatch_num_sms > 64) return default_chunk;
+    // Measured on VR200/GB200: spread small batches across CTAs without a second chunk per CTA.
+    return num_tokens > 32 && num_tokens <= 32 * dispatch_num_sms ? 32 : default_chunk;
+}
+
 void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
     // Every variable, so the user can see exactly what was provided. Adding a
     // field to ncclEpEnvConfig only requires adding it to this list.

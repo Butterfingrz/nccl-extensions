@@ -125,5 +125,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg);
 
 int nccl_ep_resolve_combine_chunk(const ncclEpEnvConfig& cfg, int dispatch_num_sms, int num_lsa_teams);
 int nccl_ep_resolve_dispatch_chunk(const ncclEpEnvConfig& cfg, int combine_chunk, int num_lsa_teams);
+int nccl_ep_select_dispatch_chunk(const ncclEpEnvConfig& cfg, int default_chunk,
+                                 int num_lsa_teams, int dispatch_num_sms, int num_tokens);
 
 #endif  // NCCL_EP_ENV_H_
