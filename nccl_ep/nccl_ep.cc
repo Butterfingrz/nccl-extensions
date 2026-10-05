@@ -990,6 +990,22 @@ struct ncclEpGroup {
           num_dispatch_signals(0), clean_barrier_signal_base(0), ht_buffers{}, eager_mode(false) {}
 };
 
+static void epPrintAutoRecvBudgetDetails(ncclEpGroup_t group) {
+    const unsigned int topk = group->config.num_topk > 0 ? group->config.num_topk : 1u;
+    fprintf(
+        stderr,
+        "NCCL EP: max_recv_tokens_per_rank=NCCL_EP_AUTO resolves to "
+        "nRanks * max_dispatch_tokens_per_rank * max(num_topk, 1) = %d * %u * %u = %u "
+        "slots per rank for the base group budget, the theoretical worst case in which every "
+        "rank routes every token to this rank. Eager Expert-Major EM-permute handles may add "
+        "per-expert alignment padding later. Set max_recv_tokens_per_rank explicitly to a "
+        "realistic peak unless worst-case capacity is required.\n",
+        group->nRanks,
+        group->config.max_dispatch_tokens_per_rank,
+        topk,
+        group->config.max_recv_tokens_per_rank);
+}
+
 // The intra-LSA mega buffer is the one allocation sized directly by the resolved
 // per-rank recv budget. With max_recv_tokens_per_rank=NCCL_EP_AUTO that budget is
 // the theoretical worst case, so a failure here is usually the budget rather than
@@ -1001,16 +1017,21 @@ static void epWarnMegaBufferAllocFailed(ncclEpGroup_t group, size_t bytes) {
         "budget of %u slots per rank\n",
         static_cast<double>(bytes) / (1024.0 * 1024.0),
         group->config.max_recv_tokens_per_rank);
-    if (!group->eager_mode) return;
+    if (group->eager_mode) epPrintAutoRecvBudgetDetails(group);
+}
+
+static void epWarnAutoRecvBudget(ncclEpGroup_t group) {
+    // Emit this once per group rather than once per rank. Launchers generally
+    // collect rank 0's stderr, and repeating a multi-line warning on every rank
+    // makes the actionable part harder to spot.
+    if (group->rank != 0) return;
+
     fprintf(
         stderr,
-        "NCCL EP: that budget was derived from max_recv_tokens_per_rank=NCCL_EP_AUTO as "
-        "nRanks * max_dispatch_tokens_per_rank * max(num_topk, 1) = %d * %u * %u, the worst "
-        "case in which every rank routes every token to this rank. If your routing never "
-        "reaches that bound, set max_recv_tokens_per_rank explicitly to a measured peak.\n",
-        group->nRanks,
-        group->config.max_dispatch_tokens_per_rank,
-        group->config.num_topk > 0 ? group->config.num_topk : 1u);
+        "NCCL EP WARNING: max_recv_tokens_per_rank was not specified "
+        "(NCCL_EP_AUTO). Internal HT recv/staging buffers will use a theoretical worst-case "
+        "base group budget that may consume excessive GPU memory or fail to allocate.\n");
+    epPrintAutoRecvBudgetDetails(group);
 }
 
 // For tensors w/o external window, lazily bind the internal GIN window and offset.
@@ -2400,6 +2421,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
                              (ep_group->config.num_topk > 0 ? ep_group->config.num_topk : 1);
         EP_HOST_ASSERT(bound <= UINT_MAX && "ncclEpCreateGroup: eager recv bound overflows unsigned int");
         ep_group->config.max_recv_tokens_per_rank = static_cast<unsigned int>(bound);
+        epWarnAutoRecvBudget(ep_group);
     } else if (ep_group->config.max_recv_tokens_per_rank == 0) {
         ep_group->config.max_recv_tokens_per_rank = ep_group->nRanks * ep_group->config.max_dispatch_tokens_per_rank;
     }
