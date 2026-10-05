@@ -1594,8 +1594,11 @@ __forceinline__ __device__ void processAndSendToken(
             if (elect_one_sync()) tma_store_1d(metaBuffers, copyDstPtr, kNumMetaBytes);
         }
 
-        // Flush all stores
-        tma_store_wait<0>();
+        // Complete global writes before RDMA reads the staging buffer or a
+        // peer-ready flag is published. A read-only wait releases shared memory
+        // but does not make the destination payload ready. Every issuing lane
+        // drains its own groups; the warp barrier propagates completion to lane 0.
+        tma_store_wait_complete<0>();
         __syncwarp();
     }
 
