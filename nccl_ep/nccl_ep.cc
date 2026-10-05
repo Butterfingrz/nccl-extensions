@@ -776,6 +776,7 @@ struct ncclEpGroup {
     // a dispatch-grid-proportional size (NUM_OF_TOKENS_PER_GROUP times the dispatch
     // budget, rounded up to a multiple of 32). Either may be overridden by NCCL_EP_TOKENS_PER_CHUNK.
     int ht_tokens_per_chunk = 0;
+    int ht_dispatch_tokens_per_chunk = 0;
 
     struct {
         // Device communicator (single comm, multiple contexts)
@@ -2668,6 +2669,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             }
         }
         ep_group->ht_tokens_per_chunk = chunk;
+        ep_group->ht_dispatch_tokens_per_chunk = chunk;
         // Chunk-aligned cross-LSA-team RDMA stride; also the max-tokens template arg for
         // the dispatch/combine kernels (guarantees MAX_NUM_OF_TOKENS_PER_RANK % chunk == 0).
         ep_group->ht_aligned_max_tokens = ((ep_group->config.max_dispatch_tokens_per_rank + chunk - 1) / chunk) * chunk;
@@ -3520,8 +3522,9 @@ struct HtBlockLayout {
         // Count-mode scratch (EM-permute): sender-local per-chunk per-dest-rank counts and the
         // token bitmap, followed by the own/gathered count rows. The receiver count-landing rows
         // live in the IPC table region. Only allocated in count mode.
-        const size_t max_src_chunks = (static_cast<size_t>(max_tokens) + ep_group->ht_tokens_per_chunk - 1) /
-                                  ep_group->ht_tokens_per_chunk;
+        const size_t max_src_chunks =
+            (static_cast<size_t>(max_tokens) + ep_group->ht_dispatch_tokens_per_chunk - 1) /
+            ep_group->ht_dispatch_tokens_per_chunk;
         // token_dst_rank_bitmap is ceil(nRanks/64) u64 words per token (matches the histogram's
         // hit_words = (lsa_team_size + 63) / 64); >1 word once nRanks exceeds 64.
         const size_t cnt_hit_words = nccl_ep::ceil_div<size_t>(static_cast<size_t>(ep_group->nRanks), 64);
@@ -3779,8 +3782,8 @@ static void ht_assign_count_scratch(ncclEpHandle_t handle, ncclEpGroup_t ep_grou
     const int num_experts = ep_group->config.num_experts;
     const int num_lsa_teams = ep_group->rdma_team_size;
     const size_t max_chunks_per_rank =
-        (static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) + ep_group->ht_tokens_per_chunk - 1) /
-        ep_group->ht_tokens_per_chunk;
+        (static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) + ep_group->ht_dispatch_tokens_per_chunk - 1) /
+        ep_group->ht_dispatch_tokens_per_chunk;
     int32_t* cs = reinterpret_cast<int32_t*>(ptr + offset);
     handle->ht.dispatch_push_count.own_chunk_rank = cs;
     handle->ht.dispatch_push_count.per_src_lteam_num_tokens = handle->ht.dispatch_push_count.own_chunk_rank + max_chunks_per_rank * lsa_team_size;
@@ -4056,7 +4059,7 @@ static ncclResult_t ht_update_handle_count_mode(
     int32_t* cnt_expert_pub = cnt_rank_pub + ep_group->nRanks;
     // Per-chunk per-dest-rank counts give the dispatch MAP warp its deterministic chunk slot
     // bases.
-    const int tokens_per_chunk = ep_group->ht_tokens_per_chunk;
+    const int tokens_per_chunk = ep_group->ht_dispatch_tokens_per_chunk;
     const int padded_max_tokens = nccl_ep::align(max_tokens, 16);
     const int r2a_offset = ep_group->rdma_rank * padded_max_tokens;
     // The histogram writes its own-LSA-team outputs to per-handle scratch, so batched-ahead
@@ -5665,7 +5668,7 @@ ncclResult_t ncclEpDispatch(
                 nccl_ep::ht::call_dispatch(
                     params,
                     group->ht_aligned_max_tokens,
-                    group->ht_tokens_per_chunk,
+                    group->ht_dispatch_tokens_per_chunk,
                     group->rdma_team_size,
                     recipe,
                     pass_direction,
