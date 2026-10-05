@@ -170,6 +170,32 @@ void sparse_to_dense_prob(
     int num_experts,
     cudaStream_t stream);
 
+
+// ============================================================================
+// Compact FWD payload: original-order [K fp32 weights][K uint16 IDs],
+// padded as one byte row to 16 bytes. Every output word is written (no clear).
+// num_experts <= 65535; 65535 is reserved as the invalid-ID sentinel.
+template <typename TopkIdxT>
+void dispatch_prob_input_to_compact(
+    const TopkIdxT* topk_idx, const float* topk_weights, float* wire_prob,
+    int num_tokens, int num_topk, int num_experts, int wire_prob_floats, cudaStream_t stream);
+
+// LERM gates every payload read, including EM padding/DROP slots. FLAT and
+// em-permute return ascending selected local experts with zero/-1 tails; EM
+// dup returns one scalar per expert slot. Persist each weight's original top-k
+// position for BWD, in the same shape as recv_topk_weights. The map uses uint8
+// when topk <=255, otherwise uint16; the type's maximum value marks padding.
+// The weight output and position map are required. recv_topk_idx may be null
+// for EM or internal em-permute scratch. Count mode supplies packed LERM;
+// scan mode supplies bool LERM. num_recv_tokens_dev bounds live rows without a host readback.
+void dispatch_prob_compact_to_output(
+    const float* wire_prob, const bool* local_expert_routing_map,
+    void* wire_prob_pos,
+    float* recv_topk_weights, int64_t* recv_topk_idx, int num_recv_tokens,
+    const int32_t* num_recv_tokens_dev,
+    int topk, int experts_per_rank, int wire_prob_floats, int global_expert_offset,
+    ncclEpExpertIdKind_t recv_topk_idx_kind, bool expert_major, bool lerm_bitmap, cudaStream_t stream);
+
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob (for combine input)
 // ============================================================================
@@ -187,6 +213,18 @@ void sparse_to_dense_prob_combine(
     int experts_per_lsa_team, // = experts_per_rank * ranks_per_lsa_team
     int local_rank, // rank within lsa team
     bool lerm_bitmap, // count mode: LERM is a ceil(epr/64)-word packed bitmap per token
+    cudaStream_t stream);
+
+// Scatter gradients to source top-k columns saved by the preceding FWD decode.
+// Padding positions are skipped without reading the corresponding input weight.
+void combine_prob_input_to_compact(
+    const float* topk_weights, // [num_tokens, prob_stride] - sparse weights from combine input
+    const void* wire_prob_pos, // same shape; uint8 for num_topk<=255, otherwise uint16
+    float* compact_prob, // [num_tokens, prob_row_floats] - output (pre-zeroed)
+    int num_tokens,
+    int prob_stride, // FLAT/em-permute: num_topk; EM 1D: 1
+    int num_topk,
+    int prob_row_floats, // = round_up(num_topk, 4)
     cudaStream_t stream);
 
 // ============================================================================
@@ -666,6 +704,11 @@ struct DispatchParams {
 
     // Count-exchange payload (fused-meta-dispatch). See DispatchPushCountParams.
     DispatchPushCountParams dispatch_push_count;
+    // Automatically selected compact-prob wire format. false = dense per-LSA-
+    // team rows (fallback). true = token-scoped opaque weights+IDs rows with
+    // wire_prob_floats 32-bit words; the ID tail is copied, never reduced.
+    bool compact_prob = false;
+    int wire_prob_floats = 0;
 };
 
 // Call dispatch kernel. Recipe and pass-direction enums remain explicit until
@@ -702,7 +745,8 @@ struct CombineParams {
 
     // User output buffers
     void* attn_output_token;
-    float* attn_output_prob; // Backward only (dense format for kernel)
+    float* attn_output_prob; // Backward only: caller top-k rows for compact, dense staging otherwise
+    int output_prob_floats = 0; // Compact caller row width, without wire alignment padding
 
     // RDMA buffers (multi-LSA-team only, from ep_group)
     uint16_t* combine_gin_RED_tokens;
@@ -754,6 +798,11 @@ struct CombineParams {
     uint32_t combine_barrier_offset; // Reserved LSA barrier session index, not a byte offset
 
     ncclEpCombQuant_t combine_recipe = NCCL_EP_COMB_QUANT_NONE;
+
+    // BWD compact rows contain FP32 gradients only (round_up(top_k, 4));
+    // unlike FWD DispatchParams, these rows contain no integer IDs.
+    bool compact_prob = false;
+    int wire_prob_floats = 0;
 };
 
 // Call combine kernel with runtime template parameter resolution
@@ -781,6 +830,7 @@ void call_local_dup(
     int hidden_dim,
     int experts_per_rank,
     int ranks_per_lsa_team,
+    int prob_row_floats, // dense: epr * ranks_per_lsa_team; compact FWD: aligned weight/ID words
     bool forward_dispatch,
     int num_blocks,
     cudaStream_t stream,
@@ -799,6 +849,7 @@ void call_local_reduce(
     int hidden_dim,
     int experts_per_rank,
     int ranks_per_lsa_team,
+    int prob_dim, // dense: epr * ranks_per_lsa_team; compact: round_up(top_k, 4)
     bool backward_combine,
     int num_blocks,
     cudaStream_t stream,

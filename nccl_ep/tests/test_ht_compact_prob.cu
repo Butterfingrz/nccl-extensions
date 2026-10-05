@@ -1,0 +1,550 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Public-API E2E tests for compact weights + IDs. Independent host routing,
+ * weight and gradient expectations cover FWD dispatch and BWD combine.
+ * The runner selects count, scan, LOCAL_DUP, NVLINK_DUP or pull-push mode.
+ * The custom bootstrap avoids test_common's legacy E8/capacity32 groups.
+ */
+#include "test_common.h"
+#include "../nccl_ep_test_internal.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <tuple>
+
+namespace {
+constexpr int kTokens = 4;
+constexpr int kWidth = 16;
+constexpr int kAlignment = 8;
+
+bool enabled(const char* name) {
+    return env_flag_active(name);
+}
+
+bool fused_count_mode(bool em) {
+    return em && !enabled("NCCL_EP_HT_EM_LOCAL_DUP") && !enabled("NCCL_EP_HT_EM_NVLINK_DUP") &&
+           !enabled("NCCL_EP_HT_EM_AG_SCAN_MODE") && !enabled("NCCL_EP_HT_EM_COUNT_UNFUSED");
+}
+
+template <typename T> struct DeviceBuffer {
+    T* p = nullptr;
+    size_t size = 0;
+    ~DeviceBuffer() { if (p) cudaFree(p); }
+    void allocate(size_t n) {
+        size = n;
+        CUDA_ASSERT(cudaMalloc(&p, n * sizeof(T)));
+        CUDA_ASSERT(cudaMemset(p, 0, n * sizeof(T)));
+    }
+    void upload(const std::vector<T>& v) {
+        ASSERT_LE(v.size(), size);
+        if (!v.empty()) CUDA_ASSERT(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+    }
+    void download(std::vector<T>& v, size_t n) const {
+        ASSERT_LE(n, size);
+        v.resize(n);
+        if (n) CUDA_ASSERT(cudaMemcpy(v.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost));
+    }
+};
+
+uint32_t bits(float value) {
+    uint32_t result;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+}
+
+// Positions 0 and 3 select a same-owner pair in reversed expert order.
+// Pair-specific local IDs keep all IDs distinct even at EP4/K10, where owners wrap.
+int64_t route(int source, int token, int k, int topk, int experts, int epoch) {
+    static const int order8[8] = {1, 3, 5, 0, 2, 4, 7, 6};
+    static const int order10[10] = {1, 3, 5, 0, 2, 4, 7, 9, 6, 8};
+    // Epoch 8 keeps epoch 0's exact selected-expert set/bitmap but reverses
+    // caller top-k order, including padding. The saved position map must change.
+    if (epoch & 8) k = topk - 1 - k;
+    epoch &= 7;
+    if (token == 3 || (token == 1 && k == topk - 1)) return -1;
+    // Use only valid IDs and -1, as required by the public routing API.
+    if ((epoch & 1) && token == 0 && k == topk - 1) return -1;
+    int p = topk == 8 ? order8[k] : order10[k];
+    // E8/K8 intentionally selects the automatic dense fallback.
+    if (experts == 8) return (p + source + token + epoch) % experts;
+    int owner = (source + token + epoch + p / 2) % g_nranks;
+    return static_cast<int64_t>(owner * (experts / g_nranks) + p);
+}
+
+float source_weight(int source, int token, int k, int epoch, int repeat) {
+    return static_cast<float>(1 + source * 128 + token * 16 + k + epoch * 8192 + repeat * 65536) / 128.0f;
+}
+
+float independent_gradient(int source, int token, int expert, int epoch) {
+    return -static_cast<float>(7 + source * 2048 + token * 512 + expert + epoch * 131072) / 64.0f;
+}
+
+struct Snapshot {
+    int total = 0;
+    std::vector<nv_bfloat16> recv_x, token_gradients, combined_x;
+    std::vector<float> recv_w, gradients, combined_w;
+    std::vector<int64_t> recv_idx;
+};
+
+struct State {
+    ncclEpHandle_t handle = nullptr;
+    std::vector<ncclEpTensor_t*> tensors;
+    ncclEpTensor_t *ids = nullptr, *x = nullptr, *w = nullptr, *rx = nullptr,
+                   *rw = nullptr, *ri = nullptr, *cx = nullptr, *cw = nullptr;
+    ncclEpTensor_t *counts_tensor = nullptr, *offsets_tensor = nullptr, *total_tensor = nullptr;
+    DeviceBuffer<int32_t> ids32;
+    DeviceBuffer<int64_t> ids64, recv_ids, counts, offsets, total;
+    DeviceBuffer<nv_bfloat16> tokens, recv_tokens, combined_tokens;
+    DeviceBuffer<float> weights, recv_weights, combined_weights;
+    ncclEpLayoutInfo_t info = NCCL_EP_LAYOUT_INFO_INIT;
+    bool em = false, use_i64 = false;
+    int topk = 0, experts = 0, capacity = 0, ntokens = 0, epoch = 0;
+    Snapshot output;
+
+    ~State() {
+        if (handle) ncclEpHandleDestroy(handle);
+        for (auto* t : tensors) ncclEpTensorDestroy(t);
+    }
+
+    template <typename... Dims>
+    void tensor(ncclEpTensor_t** result, unsigned ndim, ncclDataType_t dtype, void* ptr, Dims... dims) {
+        NCCL_ASSERT(epTensorCreate(result, ndim, dtype, ptr, dims...));
+        tensors.push_back(*result);
+    }
+
+    void initialize(ncclEpGroup_t group, bool expert_major, bool int64_ids, int k, int e, int cap,
+                    int alignment = kAlignment, bool guard_buffers = false) {
+        em = expert_major; use_i64 = int64_ids; topk = k; experts = e; capacity = cap;
+        ASSERT_NO_FATAL_FAILURE(ids32.allocate(kTokens * topk));
+        ASSERT_NO_FATAL_FAILURE(ids64.allocate(kTokens * topk));
+        ASSERT_NO_FATAL_FAILURE(tokens.allocate(kTokens * kWidth));
+        ASSERT_NO_FATAL_FAILURE(weights.allocate(kTokens * topk));
+        ASSERT_NO_FATAL_FAILURE(recv_tokens.allocate(capacity * kWidth + (guard_buffers ? 16 : 0)));
+        ASSERT_NO_FATAL_FAILURE(recv_weights.allocate(capacity * (em ? 1 : topk) + (guard_buffers ? 4 : 0)));
+        ASSERT_NO_FATAL_FAILURE(recv_ids.allocate(capacity * topk));
+        ASSERT_NO_FATAL_FAILURE(combined_tokens.allocate(kTokens * kWidth));
+        ASSERT_NO_FATAL_FAILURE(combined_weights.allocate(kTokens * topk + 4));
+        ASSERT_NO_FATAL_FAILURE(counts.allocate(experts / g_nranks));
+        ASSERT_NO_FATAL_FAILURE(offsets.allocate(experts / g_nranks));
+        ASSERT_NO_FATAL_FAILURE(total.allocate(1));
+        void* ids_ptr = use_i64 ? static_cast<void*>(ids64.p) : static_cast<void*>(ids32.p);
+        ASSERT_NO_FATAL_FAILURE(tensor(&ids, 2, use_i64 ? ncclInt64 : ncclInt32, ids_ptr, kTokens, topk));
+        ASSERT_NO_FATAL_FAILURE(tensor(&x, 2, ncclBfloat16, tokens.p, kTokens, kWidth));
+        ASSERT_NO_FATAL_FAILURE(tensor(&w, 2, ncclFloat32, weights.p, kTokens, topk));
+        ASSERT_NO_FATAL_FAILURE(tensor(&rx, 2, ncclBfloat16, recv_tokens.p, capacity, kWidth));
+        if (em) {
+            ASSERT_NO_FATAL_FAILURE(tensor(&rw, 1, ncclFloat32, recv_weights.p, capacity));
+            ASSERT_NO_FATAL_FAILURE(tensor(&counts_tensor, 1, ncclInt64, counts.p, experts / g_nranks));
+            ASSERT_NO_FATAL_FAILURE(tensor(&offsets_tensor, 1, ncclInt64, offsets.p, experts / g_nranks));
+            info.expert_counters = counts_tensor;
+            info.expert_offsets = offsets_tensor;
+        } else {
+            ASSERT_NO_FATAL_FAILURE(tensor(&rw, 2, ncclFloat32, recv_weights.p, capacity, topk));
+            ASSERT_NO_FATAL_FAILURE(tensor(&ri, 2, ncclInt64, recv_ids.p, capacity, topk));
+        }
+        ASSERT_NO_FATAL_FAILURE(tensor(&cx, 2, ncclBfloat16, combined_tokens.p, kTokens, kWidth));
+        ASSERT_NO_FATAL_FAILURE(tensor(&cw, 2, ncclFloat32, combined_weights.p, kTokens, topk));
+        ASSERT_NO_FATAL_FAILURE(tensor(&total_tensor, 1, ncclInt64, total.p, 1));
+        info.recv_total_counter = total_tensor;
+        info.recv_topk_idx_kind = NCCL_EP_EXPERT_ID_LOCAL;
+        ncclEpHandleConfig_t cfg = NCCL_EP_HANDLE_CONFIG_INIT;
+        cfg.dispatch_output_per_expert_alignment = em ? alignment : 0;
+        NCCL_ASSERT(ncclEpInitHandle(&handle, group, em ? NCCL_EP_LAYOUT_EXPERT_MAJOR : NCCL_EP_LAYOUT_FLAT,
+                                   &cfg, topk, nullptr));
+        const int compact_floats = ((6 * topk + 15) & ~15) / 4;
+        const int dense_floats = (experts / g_nranks) * ncclEpHandle_test_getNRanksPerNode(handle);
+        const bool inline_wire = compact_floats < dense_floats && !enabled("NCCL_EP_HT_EM_PULL_PUSH");
+        ASSERT_EQ(ncclEpHandle_test_getCompactProbWireFloats(handle), inline_wire ? compact_floats : 0)
+            << "Compact is automatic when smaller; pull-push keeps its existing sparse-ID path";
+    }
+
+    void update(int n, int generation) {
+        ntokens = n; epoch = generation;
+        ids->sizes[0] = x->sizes[0] = w->sizes[0] = cx->sizes[0] = cw->sizes[0] = n;
+        std::vector<int64_t> host64(n * topk);
+        std::vector<int32_t> host32(n * topk);
+        for (int t = 0; t < n; ++t) for (int k = 0; k < topk; ++k) {
+            host64[t * topk + k] = route(g_rank, t, k, topk, experts, epoch);
+            host32[t * topk + k] = static_cast<int32_t>(host64[t * topk + k]);
+        }
+        if (use_i64) { ASSERT_NO_FATAL_FAILURE(ids64.upload(host64)); }
+        else { ASSERT_NO_FATAL_FAILURE(ids32.upload(host32)); }
+        info.recv_topk_idx_kind = (epoch & 1) ? NCCL_EP_EXPERT_ID_GLOBAL : NCCL_EP_EXPERT_ID_LOCAL;
+        // Passing layout info to UpdateHandle forces count provisioning there.
+        // Omit it only for a single-team fused mode, to test dispatch-time map
+        // build. Multi-team scan paths must publish their layout at UpdateHandle.
+        const bool fused = fused_count_mode(em) && ncclEpHandle_test_getNRanksPerNode(handle) == g_nranks;
+        NCCL_ASSERT(ncclEpUpdateHandle(handle, ids, fused ? nullptr : &info, g_stream));
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    }
+
+    void dispatch(int repeat) {
+        std::vector<nv_bfloat16> ht(ntokens * kWidth);
+        std::vector<float> hw(ntokens * topk);
+        for (int t = 0; t < ntokens; ++t) {
+            for (int d = 0; d < kWidth; ++d) ht[t * kWidth + d] = __float2bfloat16(g_rank * kTokens + t + 1);
+            for (int k = 0; k < topk; ++k) hw[t * topk + k] = source_weight(g_rank, t, k, epoch, repeat);
+        }
+        ASSERT_NO_FATAL_FAILURE(tokens.upload(ht));
+        ASSERT_NO_FATAL_FAILURE(weights.upload(hw));
+        CUDA_ASSERT(cudaMemset(recv_tokens.p, 0, recv_tokens.size * sizeof(nv_bfloat16)));
+        CUDA_ASSERT(cudaMemset(recv_weights.p, 0xA5, recv_weights.size * sizeof(float)));
+        CUDA_ASSERT(cudaMemset(recv_ids.p, 0xA5, recv_ids.size * sizeof(int64_t)));
+        ncclEpDispatchInputs_t input = NCCL_EP_DISPATCH_INPUTS_INIT;
+        ncclEpDispatchOutputs_t result = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+        input.tokens = x; input.topk_weights = w;
+        result.tokens = rx; result.topk_weights = rw; result.topk_idx = ri;
+        ncclEpDispatchConfig_t cfg = NCCL_EP_DISPATCH_CONFIG_INIT;
+        NCCL_ASSERT(ncclEpDispatch(handle, &input, &result, &info, &cfg, g_stream));
+        NCCL_ASSERT(ncclEpComplete(handle, nullptr, g_stream));
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+        std::vector<int64_t> host_total;
+        ASSERT_NO_FATAL_FAILURE(total.download(host_total, 1));
+        ASSERT_GE(host_total[0], 0); ASSERT_LE(host_total[0], capacity);
+        output.total = static_cast<int>(host_total[0]);
+        ASSERT_NO_FATAL_FAILURE(recv_tokens.download(output.recv_x, output.total * kWidth));
+        ASSERT_NO_FATAL_FAILURE(recv_weights.download(output.recv_w, output.total * (em ? 1 : topk)));
+        if (!em) ASSERT_NO_FATAL_FAILURE(recv_ids.download(output.recv_idx, output.total * topk));
+        ASSERT_NO_FATAL_FAILURE(check_forward_and_make_gradients(repeat));
+    }
+
+    void check_forward_and_make_gradients(int repeat) {
+        std::vector<int64_t> hc, ho;
+        int epr = experts / g_nranks;
+        if (em) {
+            ASSERT_NO_FATAL_FAILURE(counts.download(hc, epr));
+            ASSERT_NO_FATAL_FAILURE(offsets.download(ho, epr));
+        }
+        // BWD receives the full fixed-capacity tensor, not only actual rows.
+        // Leave unused capacity, EM alignment pads and FLAT tail columns
+        // nonzero so stale/uninitialized saved map entries cannot false-pass.
+        output.gradients.assign(recv_weights.size, 12345.0f);
+        std::vector<int> seen(g_nranks * kTokens * topk, 0);
+        output.token_gradients.assign(recv_tokens.size, __float2bfloat16(0));
+        for (int s = 0; s < output.total; ++s) {
+            SCOPED_TRACE(::testing::Message() << "rank=" << g_rank << " epoch=" << epoch << " recv_slot=" << s);
+            float token_id = __bfloat162float(output.recv_x[s * kWidth]);
+            if (token_id == 0) {
+                ASSERT_TRUE(em) << "FLAT has no internal padding in its active receive range";
+                for (int d = 0; d < kWidth; ++d) EXPECT_EQ(__bfloat162float(output.recv_x[s * kWidth + d]), 0.0f);
+                EXPECT_EQ(bits(output.recv_w[s]), bits(0.0f));
+                continue;
+            }
+            int identity = static_cast<int>(token_id) - 1;
+            ASSERT_EQ(token_id, static_cast<float>(identity + 1));
+            int source = identity / kTokens, token = identity % kTokens;
+            ASSERT_GE(source, 0); ASSERT_LT(source, g_nranks); ASSERT_LT(token, ntokens);
+            for (int d = 0; d < kWidth; ++d) {
+                EXPECT_EQ(__bfloat162float(output.recv_x[s * kWidth + d]), token_id);
+                output.token_gradients[s * kWidth + d] = __float2bfloat16(1);
+            }
+            std::vector<std::pair<int, int>> local;
+            for (int k = 0; k < topk; ++k) {
+                int64_t e = route(source, token, k, topk, experts, epoch);
+                if (e >= g_rank * epr && e < (g_rank + 1) * epr) local.emplace_back(static_cast<int>(e), k);
+            }
+            std::sort(local.begin(), local.end());
+            ASSERT_FALSE(local.empty());
+            if (em) {
+                int local_e = -1;
+                for (int e = 0; e < epr; ++e) if (s >= ho[e] && s < ho[e] + hc[e]) { local_e = e; break; }
+                ASSERT_GE(local_e, 0);
+                auto hit = std::find_if(local.begin(), local.end(), [&](const std::pair<int, int>& v) {
+                    return v.first == g_rank * epr + local_e;
+                });
+                ASSERT_NE(hit, local.end());
+                int k = hit->second;
+                EXPECT_EQ(bits(output.recv_w[s]), bits(source_weight(source, token, k, epoch, repeat)));
+                output.gradients[s] = independent_gradient(source, token, hit->first, epoch);
+                ++seen[(source * kTokens + token) * topk + k];
+            } else {
+                for (int j = 0; j < topk; ++j) {
+                    if (j >= static_cast<int>(local.size())) {
+                        EXPECT_EQ(output.recv_idx[s * topk + j], -1);
+                        EXPECT_EQ(bits(output.recv_w[s * topk + j]), bits(0.0f));
+                        continue;
+                    }
+                    int e = local[j].first, k = local[j].second;
+                    int expected_id = info.recv_topk_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL ? e : e - g_rank * epr;
+                    EXPECT_EQ(output.recv_idx[s * topk + j], expected_id);
+                    EXPECT_EQ(bits(output.recv_w[s * topk + j]), bits(source_weight(source, token, k, epoch, repeat)));
+                    output.gradients[s * topk + j] = independent_gradient(source, token, e, epoch);
+                    ++seen[(source * kTokens + token) * topk + k];
+                }
+            }
+        }
+        // Prove no expert contribution was silently omitted or duplicated.
+        for (int r = 0; r < g_nranks; ++r) for (int t = 0; t < ntokens; ++t) for (int k = 0; k < topk; ++k) {
+            int64_t e = route(r, t, k, topk, experts, epoch);
+            int expected = e >= g_rank * epr && e < (g_rank + 1) * epr ? 1 : 0;
+            EXPECT_EQ(seen[(r * kTokens + t) * topk + k], expected)
+                << "source=" << r << " token=" << t << " k=" << k;
+        }
+    }
+
+    void backward() {
+        ASSERT_NO_FATAL_FAILURE(recv_weights.upload(output.gradients));
+        ASSERT_NO_FATAL_FAILURE(recv_tokens.upload(output.token_gradients));
+        CUDA_ASSERT(cudaMemset(combined_weights.p, 0xA5, combined_weights.size * sizeof(float)));
+        CUDA_ASSERT(cudaMemset(combined_tokens.p, 0, combined_tokens.size * sizeof(nv_bfloat16)));
+        ncclEpCombineInputs_t input = NCCL_EP_COMBINE_INPUTS_INIT;
+        ncclEpCombineOutputs_t result = NCCL_EP_COMBINE_OUTPUTS_INIT;
+        input.tokens = rx; input.topk_weights = rw;
+        result.tokens = cx; result.topk_weights = cw;
+        ncclEpCombineConfig_t cfg = NCCL_EP_COMBINE_CONFIG_INIT;
+        cfg.pass_direction = NCCL_EP_BWD_PASS;
+        NCCL_ASSERT(ncclEpCombine(handle, &input, &result, &cfg, g_stream));
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+        ASSERT_NO_FATAL_FAILURE(combined_tokens.download(output.combined_x, ntokens * kWidth));
+        ASSERT_NO_FATAL_FAILURE(combined_weights.download(output.combined_w, ntokens * topk));
+        // The fused output store must honor K (including K10's unaligned row
+        // width) and the live token count; neither padding nor unused capacity
+        // belongs to the caller output.
+        std::vector<float> guarded_weights;
+        ASSERT_NO_FATAL_FAILURE(combined_weights.download(guarded_weights, combined_weights.size));
+        for (size_t i = static_cast<size_t>(ntokens) * topk; i < guarded_weights.size(); ++i) {
+            EXPECT_EQ(bits(guarded_weights[i]), 0xA5A5A5A5u) << "output guard column=" << i;
+        }
+        for (int t = 0; t < ntokens; ++t) for (int k = 0; k < topk; ++k) {
+            int64_t e = route(g_rank, t, k, topk, experts, epoch);
+            float expected = e >= 0 && e < experts ? independent_gradient(g_rank, t, static_cast<int>(e), epoch) : 0.0f;
+            EXPECT_EQ(bits(output.combined_w[t * topk + k]), bits(expected))
+                << "independent BWD oracle: token=" << t << " k=" << k << " expert=" << e;
+        }
+        // FLAT receives one token contribution per owning rank; EM receives
+        // one per selected expert. Ones make the BF16 reduction exact.
+        for (int t = 0; t < ntokens; ++t) {
+            std::vector<bool> owners(g_nranks, false);
+            int contributions = 0;
+            for (int k = 0; k < topk; ++k) {
+                const int64_t e = route(g_rank, t, k, topk, experts, epoch);
+                if (e < 0) continue;
+                const int owner = static_cast<int>(e) / (experts / g_nranks);
+                if (em || !owners[owner]) ++contributions;
+                owners[owner] = true;
+            }
+            for (int d = 0; d < kWidth; ++d)
+                EXPECT_EQ(__bfloat162float(output.combined_x[t * kWidth + d]), static_cast<float>(contributions));
+        }
+    }
+};
+
+class HtCompactProbTest : public ::testing::Test {
+protected:
+    ncclEpGroup_t group_ = nullptr;
+
+    void TearDown() override {
+        cudaStreamSynchronize(g_stream);
+        if (group_) ncclEpGroupDestroy(group_);
+    }
+
+    void create_group(int experts, int topk, int capacity, bool drop = false, int max_tokens = kTokens) {
+        ncclEpGroupConfig_t cfg = NCCL_EP_GROUP_CONFIG_INIT;
+        cfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+        cfg.num_experts = experts;
+        cfg.num_topk = topk;
+        cfg.max_dispatch_tokens_per_rank = max_tokens;
+        cfg.max_recv_tokens_per_rank = capacity;
+        cfg.max_token_bytes = kWidth * sizeof(nv_bfloat16);
+        cfg.rdma_buffer_size = cfg.num_qp_per_rank = cfg.num_channels = NCCL_EP_AUTO;
+        if (drop) cfg.overflow_policy = NCCL_EP_OVERFLOW_DROP;
+        NCCL_ASSERT(ncclEpCreateGroup(&group_, g_comm, &cfg));
+    }
+
+    void run(bool em, bool int64_ids, int topk, int experts = 0) {
+        if (!em) { SKIP_IF_PULL_PUSH(); }
+        if (!experts) experts = topk == 8 ? 256 : 512;
+        ASSERT_EQ(experts % g_nranks, 0);
+        const int cap = (g_nranks * kTokens * topk + (experts / g_nranks) * (kAlignment - 1) + 127) & ~63;
+        ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, cap));
+        State a, b;
+        ASSERT_NO_FATAL_FAILURE(a.initialize(group_, em, int64_ids, topk, experts, cap));
+        ASSERT_NO_FATAL_FAILURE(b.initialize(group_, em, int64_ids, topk, experts, cap));
+        ASSERT_NO_FATAL_FAILURE(a.update(4, 0));
+        ASSERT_NO_FATAL_FAILURE(b.update(4, 7));
+
+        // A's private receive outputs and saved positions survive B using
+        // the same group's staging buffers. Every BWD follows that handle's FWD.
+        ASSERT_NO_FATAL_FAILURE(a.dispatch(0));
+        ASSERT_NO_FATAL_FAILURE(b.dispatch(0));
+        ASSERT_NO_FATAL_FAILURE(b.dispatch(1));
+        ASSERT_NO_FATAL_FAILURE(a.backward());
+        ASSERT_NO_FATAL_FAILURE(b.backward());
+
+        // Reuse the handle with fewer and then more tokens; change routing
+        // and LOCAL/GLOBAL output IDs at the same time.
+        for (int epoch = 1; epoch <= 2; ++epoch) {
+            ASSERT_NO_FATAL_FAILURE(a.update(epoch == 1 ? 2 : 4, epoch));
+            ASSERT_NO_FATAL_FAILURE(a.dispatch(epoch));
+            ASSERT_NO_FATAL_FAILURE(a.backward());
+        }
+        // Reverse caller K order without changing its selected-expert bitmap.
+        // A bitmap-only/stale position map must not pass this sequence.
+        for (int generation : {0, 8}) {
+            ASSERT_NO_FATAL_FAILURE(a.update(4, generation));
+            ASSERT_NO_FATAL_FAILURE(a.dispatch(3));
+            ASSERT_NO_FATAL_FAILURE(b.dispatch(3));
+            ASSERT_NO_FATAL_FAILURE(a.backward());
+        }
+    }
+};
+
+using RoundTripCase = std::tuple<bool, bool, int>; // expert-major, int64 IDs, top-k
+class HtCompactProbRoundTrip : public HtCompactProbTest, public ::testing::WithParamInterface<RoundTripCase> {};
+
+TEST_P(HtCompactProbRoundTrip, ForwardAndBackward) {
+    const auto& param = GetParam();
+    run(std::get<0>(param), std::get<1>(param), std::get<2>(param));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    LayoutAndIds, HtCompactProbRoundTrip,
+    ::testing::Combine(::testing::Bool(), ::testing::Bool(), ::testing::Values(8, 10)),
+    [](const ::testing::TestParamInfo<RoundTripCase>& info) {
+        return std::string(std::get<0>(info.param) ? "Em" : "Flat") +
+               "K" + std::to_string(std::get<2>(info.param)) +
+               (std::get<1>(info.param) ? "Int64" : "Int32");
+    });
+
+TEST_F(HtCompactProbTest, DenseFallbackFlat) {
+    if (g_nranks > 8) GTEST_SKIP() << "E8 fallback fixture requires EP4 or EP8";
+    run(false, false, 8, 8);
+}
+
+TEST_F(HtCompactProbTest, DenseFallbackExpertMajor) {
+    if (g_nranks > 8) GTEST_SKIP() << "E8 fallback fixture requires EP4 or EP8";
+    run(true, true, 8, 8);
+}
+
+// The default runner invokes this same binary in both duplication modes.
+// A final expert zone ends midway through its alignment padding: writes past
+// capacity used to corrupt the compact rows immediately following staging.
+TEST_F(HtCompactProbTest, PartialZoneDrop) {
+    if (g_nranks != 4 && g_nranks != 8) GTEST_SKIP() << "Partial-zone fixture requires EP4 or EP8";
+    if (enabled("NCCL_EP_HT_EM_PULL_PUSH") ||
+        (!enabled("NCCL_EP_HT_EM_LOCAL_DUP") && !enabled("NCCL_EP_HT_EM_NVLINK_DUP")))
+        GTEST_SKIP() << "Partial-zone fixture exercises the two EM duplication modes";
+
+    constexpr int topk = 10, capacity = 160, alignment = 64;
+    const int experts = 128 * g_nranks, tokens = 16 / g_nranks;
+    // The fixture sends 16 tokens globally. Declare that per-rank bound so
+    // EP8 also meets the native-EM staging requirement: ranks * tokens * K.
+    ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, capacity, true, tokens));
+    State s;
+    ASSERT_NO_FATAL_FAILURE(s.initialize(group_, true, true, topk, experts, capacity, alignment, true));
+    s.ids->sizes[0] = s.x->sizes[0] = s.w->sizes[0] = s.cx->sizes[0] = s.cw->sizes[0] = tokens;
+    std::vector<int64_t> ids(tokens * topk);
+    std::vector<nv_bfloat16> x(tokens * kWidth), initial_recv(s.recv_tokens.size, __float2bfloat16(0));
+    std::vector<float> w(tokens * topk), initial_w(s.recv_weights.size, 0.0f);
+    for (int t = 0; t < tokens; ++t) {
+        for (int d = 0; d < kWidth; ++d) x[t * kWidth + d] = __float2bfloat16(1 + g_rank * tokens + t);
+        for (int k = 0; k < topk; ++k) {
+            ids[t * topk + k] = topk - 1 - k;
+            w[t * topk + k] = source_weight(g_rank, t, k, 0, 0);
+        }
+    }
+    std::fill(initial_recv.end() - 16, initial_recv.end(), __float2bfloat16(77));
+    std::fill(initial_w.end() - 4, initial_w.end(), 77.0f);
+    ASSERT_NO_FATAL_FAILURE(s.ids64.upload(ids));
+    ASSERT_NO_FATAL_FAILURE(s.tokens.upload(x));
+    ASSERT_NO_FATAL_FAILURE(s.weights.upload(w));
+    ASSERT_NO_FATAL_FAILURE(s.recv_tokens.upload(initial_recv));
+    ASSERT_NO_FATAL_FAILURE(s.recv_weights.upload(initial_w));
+
+    NCCL_ASSERT(ncclEpUpdateHandle(s.handle, s.ids, nullptr, g_stream));
+    ncclEpDispatchInputs_t di = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t dout = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    di.tokens = s.x; di.topk_weights = s.w;
+    dout.tokens = s.rx; dout.topk_weights = s.rw;
+    ncclEpDispatchConfig_t dc = NCCL_EP_DISPATCH_CONFIG_INIT;
+    NCCL_ASSERT(ncclEpDispatch(s.handle, &di, &dout, nullptr, &dc, g_stream));
+    NCCL_ASSERT(ncclEpComplete(s.handle, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    std::vector<nv_bfloat16> recv;
+    std::vector<float> recv_w;
+    ASSERT_NO_FATAL_FAILURE(s.recv_tokens.download(recv, s.recv_tokens.size));
+    ASSERT_NO_FATAL_FAILURE(s.recv_weights.download(recv_w, s.recv_weights.size));
+
+    // Sixteen rows per expert: E0 at 0..15, E1 at 64..79, E2 at 128..143.
+    // Only padding rows 144..159 fit; E3..E9 must be dropped.
+    std::vector<float> gradients(s.recv_weights.size, 12345.0f);
+    std::vector<int> seen(3 * 16, 0);
+    for (int slot = 0; slot < capacity; ++slot) {
+        const int expert = slot / alignment;
+        const bool active = g_rank == 0 && slot % alignment < 16;
+        const float token_id = __bfloat162float(recv[slot * kWidth]);
+        if (active) {
+            const int source_id = static_cast<int>(token_id) - 1;
+            ASSERT_GE(source_id, 0); ASSERT_LT(source_id, 16);
+            ASSERT_EQ(token_id, static_cast<float>(source_id + 1));
+            EXPECT_EQ(bits(recv_w[slot]), bits(source_weight(source_id / tokens, source_id % tokens,
+                                                          topk - 1 - expert, 0, 0)));
+            gradients[slot] = independent_gradient(source_id / tokens, source_id % tokens, expert, 0);
+            ++seen[expert * 16 + source_id];
+        } else {
+            if (g_rank == 0) EXPECT_EQ(token_id, 0.0f);
+            EXPECT_EQ(bits(recv_w[slot]), bits(0.0f));
+        }
+        if (g_rank == 0)
+            for (int d = 1; d < kWidth; ++d) EXPECT_EQ(__bfloat162float(recv[slot * kWidth + d]), token_id);
+    }
+    if (g_rank == 0) for (int count : seen) EXPECT_EQ(count, 1);
+    for (size_t i = capacity * kWidth; i < recv.size(); ++i) EXPECT_EQ(__bfloat162float(recv[i]), 77.0f);
+    for (size_t i = capacity; i < recv_w.size(); ++i) EXPECT_EQ(recv_w[i], 77.0f);
+
+    // Nonzero padding gradients expose stale saved positions; only E0/E1/E2
+    // may contribute. Keep the public buffer guard untouched.
+    std::fill(gradients.end() - 4, gradients.end(), 77.0f);
+    ASSERT_NO_FATAL_FAILURE(s.recv_weights.upload(gradients));
+    ncclEpCombineInputs_t ci = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t co = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    ci.tokens = s.rx; ci.topk_weights = s.rw;
+    co.tokens = s.cx; co.topk_weights = s.cw;
+    ncclEpCombineConfig_t cc = NCCL_EP_COMBINE_CONFIG_INIT;
+    cc.pass_direction = NCCL_EP_BWD_PASS;
+    NCCL_ASSERT(ncclEpCombine(s.handle, &ci, &co, &cc, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    std::vector<float> combined_w;
+    std::vector<nv_bfloat16> combined;
+    ASSERT_NO_FATAL_FAILURE(s.combined_weights.download(combined_w, tokens * topk));
+    ASSERT_NO_FATAL_FAILURE(s.combined_tokens.download(combined, tokens * kWidth));
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < topk; ++k) {
+            const int expert = static_cast<int>(ids[t * topk + k]);
+            const float expected = expert < 3 ? independent_gradient(g_rank, t, expert, 0) : 0.0f;
+            EXPECT_EQ(bits(combined_w[t * topk + k]), bits(expected));
+        }
+        for (int d = 0; d < kWidth; ++d)
+            EXPECT_EQ(__bfloat162float(combined[t * kWidth + d]), 3.0f * __bfloat162float(x[t * kWidth + d]));
+    }
+}
+
+void bootstrap() {
+    int devices = 0;
+    CUDA_ASSERT(cudaGetDeviceCount(&devices)); ASSERT_GT(devices, 0);
+    CUDA_ASSERT(cudaSetDevice(g_rank % devices));
+    ncclUniqueId uid{};
+    ASSERT_NO_FATAL_FAILURE(exchange_uid(&uid));
+    NCCL_ASSERT(ncclCommInitRank(&g_comm, g_nranks, uid, g_rank));
+    CUDA_ASSERT(cudaStreamCreate(&g_stream));
+}
+} // namespace
+
+int main(int argc, char** argv) {
+    ep_parse_args(argc, argv, "nccl_ep_ht_compact_prob_uid");
+    ::testing::InitGoogleTest(&argc, argv);
+    if (g_nranks != 4 && g_nranks != 8 && g_nranks != 16 && g_nranks != 32) {
+        fprintf(stderr, "This test requires EP4, EP8, EP16 or EP32.\n");
+        return EXIT_FAILURE;
+    }
+    bootstrap();
+    if (::testing::Test::HasFatalFailure()) return EXIT_FAILURE;
+    int result = RUN_ALL_TESTS();
+    cudaStreamDestroy(g_stream);
+    ncclCommDestroy(g_comm);
+    if (g_rank == 0) remove(g_uid_file.c_str());
+    return result;
+}

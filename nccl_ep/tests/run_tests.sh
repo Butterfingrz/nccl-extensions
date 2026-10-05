@@ -114,6 +114,7 @@ SUITES=(
     "test_elastic_buffer|EP Elastic Buffer Tests|0"
     "test_mxfp8_combine|EP MXFP8 Combine Tests|0"
     "test_mxfp8_combine_conversion|EP MXFP8 Conversion Coverage Tests|0"
+    "test_ht_compact_prob|EP HT Compact Prob Tests|1"
 )
 
 for entry in "${SUITES[@]}"; do
@@ -206,7 +207,7 @@ unset NCCL_EP_HT_EM_COUNT_UNFUSED
 # own expert-major group with no zero_copy override (the other tests in that binary force FLAT
 # layout or nvlink_dup, neither of which pull-count supports, so they're filtered out here
 # rather than run unguarded).
-PULL_PUSH_SUITES="test_output_layout test_ht_bwd test_quantization_recipe test_ht_combine_pp_interleave test_ht_dispatch_pp_interleave"
+PULL_PUSH_SUITES="test_output_layout test_ht_bwd test_quantization_recipe test_ht_combine_pp_interleave test_ht_dispatch_pp_interleave test_ht_compact_prob"
 export NCCL_EP_HT_EM_PULL_PUSH=1
 export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
 for entry in "${SUITES[@]}"; do

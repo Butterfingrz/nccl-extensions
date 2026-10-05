@@ -17,6 +17,7 @@
 #include "jit/ht_dispatch_jit.cuh"
 #include "jit/ht_lsa_sync_jit.cuh"
 #include "jit/preprocess_jit.cuh"
+#include "ht_compact_prob.h"
 
 #include <algorithm>
 #include <cassert>
@@ -444,6 +445,163 @@ void sparse_to_dense_prob(
 template void sparse_to_dense_prob<int32_t>(const int32_t*, const float*, float*, int, int, int, cudaStream_t);
 template void sparse_to_dense_prob<int64_t>(const int64_t*, const float*, float*, int, int, int, cudaStream_t);
 
+// FWD-only original-order weights with inline expert IDs.
+template <typename TopkIdxT>
+__device__ __forceinline__ uint16_t compact_valid_id(TopkIdxT id, int num_experts) {
+    // Validate in the caller's original width BEFORE narrowing. Large int64
+    // IDs must not alias real experts when truncated to uint16 or even int32.
+    const int64_t wide = static_cast<int64_t>(id);
+    return (wide >= 0 && wide < num_experts && wide < kCompactMaxExperts) ?
+        static_cast<uint16_t>(wide) : kCompactInvalidExpert;
+}
+
+// Per-token FWD wire row (K = num_topk):
+//   [K float32 weights][K uint16 global expert IDs][zero tail to 16 bytes]
+// Weights and IDs retain the caller's top-k order. Padding rounds the complete
+// row to 16 bytes; the ID field starts immediately after the K weights.
+template <typename TopkIdxT>
+__global__ void dispatch_prob_input_to_compact_kernel(
+    const TopkIdxT* __restrict__ topk_idx,
+    const float* __restrict__ topk_weights,
+    float* __restrict__ wire_prob,
+    size_t words, int num_topk, int num_experts, int wire_prob_floats) {
+    // One writer per 32-bit output word, including two packed uint16 IDs per
+    // ID word. No overlapping subword stores and no preceding memset.
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < words; i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const size_t token = i / wire_prob_floats;
+        const int col = static_cast<int>(i % wire_prob_floats);
+        const TopkIdxT* ids = topk_idx + token * num_topk;
+        if (col < num_topk) {
+            const bool valid = compact_valid_id(ids[col], num_experts) != kCompactInvalidExpert;
+            wire_prob[i] = valid ? topk_weights[token * num_topk + col] : 0.0f;
+        } else {
+            const int k = 2 * (col - num_topk);
+            // Bytes beyond K IDs are zero tail, not additional ID entries.
+            const uint32_t lo = k < num_topk ? compact_valid_id(ids[k], num_experts) : 0;
+            const uint32_t hi = k + 1 < num_topk ? compact_valid_id(ids[k + 1], num_experts) : 0;
+            wire_prob[i] = __uint_as_float(lo | (hi << 16));
+        }
+    }
+}
+
+template <typename TopkIdxT>
+void dispatch_prob_input_to_compact(
+    const TopkIdxT* topk_idx, const float* topk_weights, float* wire_prob,
+    int num_tokens, int num_topk, int num_experts, int wire_prob_floats, cudaStream_t stream) {
+    assert(num_topk > 0 && num_topk <= kCompactMaxExperts &&
+           num_experts > 0 && num_experts <= kCompactMaxExperts);
+    assert(wire_prob_floats >= dispatch_compact_prob_row_floats(num_topk));
+    if (num_tokens <= 0) return;
+    const size_t words = static_cast<size_t>(num_tokens) * wire_prob_floats;
+    constexpr int block_threads = 256;
+    // CUDA grid.x supports up to INT_MAX blocks; grid-striding covers larger rows.
+    const int grid = static_cast<int>(std::min<size_t>((words - 1) / block_threads + 1, INT_MAX));
+    dispatch_prob_input_to_compact_kernel<<<grid, block_threads, 0, stream>>>(
+        topk_idx, topk_weights, wire_prob, words, num_topk, num_experts, wire_prob_floats);
+}
+
+template void dispatch_prob_input_to_compact<int32_t>(const int32_t*, const float*, float*, int, int, int, int, cudaStream_t);
+template void dispatch_prob_input_to_compact<int64_t>(const int64_t*, const float*, float*, int, int, int, int, cudaStream_t);
+
+__device__ __forceinline__ int compact_find_pos(const float* row, int topk, int global_expert) {
+    // Called only after LERM establishes a real payload. Loading the ID word
+    // as float is bit preserving: no FP arithmetic is applied to these bytes.
+    for (int k = 0; k < topk; ++k) {
+        const uint32_t word = __float_as_uint(row[topk + k / 2]);
+        const uint16_t id = static_cast<uint16_t>(word >> (16 * (k & 1)));
+        if (id == global_expert) return k;
+    }
+    // A selected expert missing from its token IDs is a protocol mismatch,
+    // not padding: do not silently pretend its real weight was zero.
+    EP_DEVICE_ASSERT(false);
+    return -1;
+}
+
+template <typename PosT>
+__global__ void dispatch_prob_compact_to_output_kernel(
+    const float* __restrict__ wire_prob,
+    const bool* __restrict__ local_expert_routing_map,
+    PosT* __restrict__ wire_prob_pos,
+    float* __restrict__ recv_topk_weights,
+    int64_t* __restrict__ recv_topk_idx,
+    int num_recv_tokens, const int32_t* num_recv_tokens_dev,
+    int topk, int experts_per_rank, int wire_prob_floats,
+    int global_expert_offset, ncclEpExpertIdKind_t recv_topk_idx_kind, bool expert_major,
+    bool lerm_bitmap) {
+    for (size_t token = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         token < static_cast<size_t>(num_recv_tokens);
+         token += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        if (token >= static_cast<size_t>(*num_recv_tokens_dev)) break;
+        int k_out = 0;
+        const int lerm_words = nccl_ep::bit_words(experts_per_rank);
+        const uint64_t* lerm_bits = reinterpret_cast<const uint64_t*>(local_expert_routing_map);
+        // Padding has no payload: only search inline IDs after LERM establishes
+        // a real expert. The saved original-k map lives with this handle for BWD.
+        constexpr PosT invalid_pos = static_cast<PosT>(-1);
+        if (expert_major) {
+            wire_prob_pos[token] = invalid_pos;
+            recv_topk_weights[token] = 0.0f;
+        }
+        for (int e = 0; e < experts_per_rank && k_out < topk; ++e) {
+            const bool routed = lerm_bitmap ?
+                nccl_ep::test_bit(lerm_bits + token * lerm_words, e) :
+                local_expert_routing_map[token * experts_per_rank + e];
+            if (!routed) continue;
+            const int global_expert = global_expert_offset + e;
+            const float* row = wire_prob + token * wire_prob_floats;
+            const int source_k = compact_find_pos(row, topk, global_expert);
+            if (source_k < 0) continue; // assertion above diagnosed a protocol mismatch
+            if (expert_major) {
+                wire_prob_pos[token] = static_cast<PosT>(source_k);
+                recv_topk_weights[token] = row[source_k];
+                break;
+            }
+            const size_t output = token * topk + k_out++;
+            wire_prob_pos[output] = static_cast<PosT>(source_k);
+            recv_topk_weights[output] = row[source_k];
+            if (recv_topk_idx) recv_topk_idx[output] =
+                recv_topk_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL ? global_expert : e;
+        }
+        if (!expert_major) {
+            for (; k_out < topk; ++k_out) {
+                const size_t output = token * topk + k_out;
+                wire_prob_pos[output] = invalid_pos;
+                recv_topk_weights[output] = 0.0f;
+                if (recv_topk_idx) recv_topk_idx[output] = -1;
+            }
+        }
+    }
+}
+
+void dispatch_prob_compact_to_output(
+    const float* wire_prob, const bool* local_expert_routing_map,
+    void* wire_prob_pos,
+    float* recv_topk_weights, int64_t* recv_topk_idx, int num_recv_tokens,
+    const int32_t* num_recv_tokens_dev,
+    int topk, int experts_per_rank, int wire_prob_floats, int global_expert_offset,
+    ncclEpExpertIdKind_t recv_topk_idx_kind, bool expert_major, bool lerm_bitmap, cudaStream_t stream) {
+    assert(topk > 0 && topk <= kCompactMaxExperts &&
+           wire_prob_floats >= dispatch_compact_prob_row_floats(topk));
+    assert(global_expert_offset >= 0 && experts_per_rank >= 0 &&
+           static_cast<int64_t>(global_expert_offset) + experts_per_rank <= kCompactMaxExperts);
+    assert(expert_major || recv_topk_idx_kind == NCCL_EP_EXPERT_ID_LOCAL ||
+           recv_topk_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL);
+    if (num_recv_tokens <= 0) return;
+    assert(wire_prob_pos != nullptr && recv_topk_weights != nullptr);
+    constexpr int block_threads = 256;
+    const int grid = (num_recv_tokens - 1) / block_threads + 1;
+    const auto launch = [&](auto tag) {
+        using PosT = decltype(tag);
+        dispatch_prob_compact_to_output_kernel<PosT><<<grid, block_threads, 0, stream>>>(wire_prob, local_expert_routing_map,
+            static_cast<PosT*>(wire_prob_pos), recv_topk_weights, recv_topk_idx, num_recv_tokens,
+            num_recv_tokens_dev, topk, experts_per_rank, wire_prob_floats, global_expert_offset,
+            recv_topk_idx_kind, expert_major, lerm_bitmap);
+    };
+    if (compact_prob_pos_bytes(topk) == sizeof(uint8_t)) launch(uint8_t{});
+    else launch(uint16_t{});
+}
+
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob for combine input
 // ============================================================================
@@ -517,6 +675,61 @@ void sparse_to_dense_prob_combine(
         experts_per_lsa_team,
         local_rank,
         lerm_bitmap);
+}
+
+// ============================================================================
+// Kernel: Convert sparse topk_weights to compact wire rows for combine input
+// ============================================================================
+// Forward decoding saved the source's original top-k column for each returned
+// weight. Scatter independent gradients to those columns, without scanning
+// experts or reconstructing sorted positions. The caller zeroes the wire row.
+template <typename PosT>
+__global__ void combine_prob_input_to_compact_kernel(
+    const float* __restrict__ topk_weights, // [num_tokens, prob_stride]
+    const PosT* __restrict__ wire_prob_pos, // same shape as topk_weights
+    float* __restrict__ compact_prob,      // [num_tokens, prob_row_floats] (pre-zeroed)
+    size_t entries,
+    int prob_stride,
+    int num_topk,
+    int prob_row_floats) {
+    constexpr PosT invalid_pos = static_cast<PosT>(-1);
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < entries; i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const PosT source_k = wire_prob_pos[i];
+        // Do not read caller padding/DROP weights, which need not be initialized.
+        if (source_k == invalid_pos) continue;
+        EP_DEVICE_ASSERT(static_cast<int>(source_k) < num_topk);
+        if (static_cast<int>(source_k) >= num_topk) continue;
+        const size_t token = i / prob_stride;
+        compact_prob[token * prob_row_floats + source_k] = topk_weights[i];
+    }
+}
+
+void combine_prob_input_to_compact(
+    const float* topk_weights,
+    const void* wire_prob_pos,
+    float* compact_prob,
+    int num_tokens,
+    int prob_stride,
+    int num_topk,
+    int prob_row_floats,
+    cudaStream_t stream) {
+    assert(num_topk > 0 && num_topk <= kCompactMaxExperts && prob_row_floats >= num_topk);
+    assert(prob_stride == 1 || prob_stride == num_topk);
+    if (num_tokens <= 0) return;
+    assert(wire_prob_pos != nullptr);
+    const size_t entries = static_cast<size_t>(num_tokens) * prob_stride;
+    constexpr int block_threads = 256;
+    // Clamp only to CUDA's grid.x limit; the kernel grid-strides over all entries.
+    const int grid = static_cast<int>(std::min<size_t>((entries - 1) / block_threads + 1, INT_MAX));
+    const auto launch = [&](auto tag) {
+        using PosT = decltype(tag);
+        combine_prob_input_to_compact_kernel<PosT><<<grid, block_threads, 0, stream>>>(
+            topk_weights, static_cast<const PosT*>(wire_prob_pos), compact_prob,
+            entries, prob_stride, num_topk, prob_row_floats);
+    };
+    if (compact_prob_pos_bytes(num_topk) == sizeof(uint8_t)) launch(uint8_t{});
+    else launch(uint16_t{});
 }
 
 // ============================================================================
@@ -817,7 +1030,6 @@ ncclResult_t call_metadata_preprocessing(
             // Pull dispatch: inverse recv-slot map (null unless pull is enabled).
             sp.recv_slot_to_src = recv_slot_to_src;
             sp.srcpos_map = srcpos_map;
-
             jit::launch_scan_flat(
                 NUM_THREADS_PER_BLOCK,
                 NUM_OF_BLOCKS,
@@ -916,7 +1128,7 @@ ncclResult_t call_metadata_preprocessing(
         NUM_OF_WARPS_PER_BLOCK_SCAN, lsa_team_size, experts_per_rank,
         /*has_expert_counts=*/per_expert_token_counts != nullptr, /*has_em_permute=*/false));
 
-    ::ht_ep::scan_flat_kernel_param_t sp;
+    ::ht_ep::scan_flat_kernel_param_t sp{};
     sp.input_routing_map = global_routing_map;
     sp.tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(ranks_scan_tmp);
     sp.sparse_to_dense_map = sparse_to_dense_map;
@@ -1217,6 +1429,8 @@ template <typename TOKEN_DATA_TYPE>
     kp.hidden_dim = params.hidden_dim;
     kp.experts_per_rank = params.experts_per_rank;
     kp.ranks_per_lsa_team = params.lsa_team_size;
+    kp.compact_prob = params.compact_prob;
+    kp.wire_prob_floats = params.wire_prob_floats;
     // User input buffers
     kp.attn_input_token = reinterpret_cast<const TOKEN_DATA_TYPE*>(params.attn_input_token);
     kp.attn_input_prob = params.attn_input_prob;
@@ -1376,6 +1590,8 @@ ncclResult_t dispatch_impl(
         d_config.forward_dispatch = forward_dispatch;
         d_config.sf_bytes_per_token = sf_bytes_per_token;
         d_config.s2d_inner_dim = kp.s2d_inner_dim;
+        d_config.compact_prob = params.compact_prob;
+        d_config.wire_prob_floats = params.wire_prob_floats;
         if (d_config.num_of_stages <= 0 || d_config.num_pipelines <= 0) {
             std::fprintf(stderr, "[nccl_ep] invalid dispatch config: stages=%d, pipelines=%d\n",
                          d_config.num_of_stages, d_config.num_pipelines);
@@ -1569,9 +1785,12 @@ ncclResult_t call_dispatch(
     kp.hidden_dim = params.hidden_dim;
     kp.experts_per_rank = params.experts_per_rank;
     kp.ranks_per_lsa_team = params.lsa_team_size;
+    kp.compact_prob = params.compact_prob;
+    kp.wire_prob_floats = params.wire_prob_floats;
     // User output buffers
     kp.attn_output_token = reinterpret_cast<uint16_t*>(params.attn_output_token);
     kp.attn_output_prob = params.attn_output_prob;
+    kp.output_prob_floats = params.output_prob_floats;
 
     // RDMA buffers (multiple LSA teams only)
     kp.combine_gin_RED_tokens = params.combine_gin_RED_tokens;
@@ -1729,6 +1948,8 @@ ncclResult_t combine_impl(
     c_config.num_of_tokens_per_group = NCCL_EP_HT_COMBINE_TOK_PER_GROUP;
     c_config.num_of_blocks = num_blocks;
     c_config.backward_combine = BACKWARD_COMBINE;
+    c_config.compact_prob = params.compact_prob;
+    c_config.wire_prob_floats = params.wire_prob_floats;
     // Requested config (env-pinned values are honored exactly, never reduced).
     const bool g2s_from_env = env->combine_num_stages_g2s.is_set;
     const bool s2g_from_env = env->combine_num_stages_s2g.is_set;
@@ -1883,6 +2104,7 @@ void call_local_dup(
     int hidden_dim,
     int experts_per_rank,
     int ranks_per_lsa_team,
+    int prob_row_floats, // dense: epr * ranks_per_lsa_team; compact: round_up(top_k, 4)
     bool forward_dispatch,
     int num_blocks,
     cudaStream_t stream,
@@ -1900,8 +2122,7 @@ void call_local_dup(
             hidden_dim,
             kPipeDepth,
             forward_dispatch,
-            experts_per_rank,
-            ranks_per_lsa_team,
+            prob_row_floats,
             sizeof(TOKEN_DATA_TYPE),
             scale_row_bytes);
 
@@ -1916,6 +2137,7 @@ void call_local_dup(
         pp.grid_barrier_counter = grid_barrier_counter;
         pp.experts_per_rank = experts_per_rank;
         pp.ranks_per_lsa_team = ranks_per_lsa_team;
+        pp.prob_row_floats = prob_row_floats;
         pp.expert_output_scale = expert_output_scale;
         pp.scale_row_bytes = scale_row_bytes;
         jit::launch_local_dup<TOKEN_DATA_TYPE>(
@@ -1943,6 +2165,7 @@ void call_local_reduce(
     int hidden_dim,
     int experts_per_rank,
     int ranks_per_lsa_team,
+    int prob_dim, // dense: epr * ranks_per_lsa_team; compact: round_up(top_k, 4)
     bool backward_combine,
     int num_blocks,
     cudaStream_t stream,
@@ -1959,6 +2182,7 @@ void call_local_reduce(
         lp.emuf_group_stride = emuf_group_stride;
         lp.experts_per_rank = experts_per_rank;
         lp.ranks_per_lsa_team = ranks_per_lsa_team;
+        lp.prob_dim = prob_dim;
         jit::launch_local_reduce<T>(hidden_dim, backward_combine, experts_per_rank, num_blocks, lp, stream, token_dtype);
     };
     if (token_dtype == ncclFloat32) run(uint32_t{});

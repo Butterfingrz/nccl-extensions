@@ -15,6 +15,9 @@
 //   s2d[token][k] = packed(rank_id<<24 | slot), or -1.
 const int32_t* ncclEpHandle_test_getSparseToDenseMap(ncclEpHandle_t handle);
 
+// FWD inline weights + IDs: selected payload width in words, or zero on fallback.
+int ncclEpHandle_test_getCompactProbWireFloats(ncclEpHandle_t handle);
+
 // Returns num_topk stored in the handle.
 int ncclEpHandle_test_getNumTopk(ncclEpHandle_t handle);
 

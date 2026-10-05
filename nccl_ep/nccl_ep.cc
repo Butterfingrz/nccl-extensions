@@ -26,6 +26,7 @@
 #include "nccl_ep.h"
 #include "nccl_ep_cft.h"
 #include "nccl_ep_env.h"
+#include "ht_compact_prob.h"
 #include "common.hpp"
 
 // HT (High Throughput) includes
@@ -936,7 +937,7 @@ struct ncclEpGroup {
     // Pre-registered dispatch buffers (group-level, allocated during Group Create)
     // These are pre-registered with GIN to avoid ~60ms registration overhead during dispatch
         void* token_staging_buffer; // Pre-registered staging buffer for user tokens
-        float* dense_prob_buffer; // Pre-registered buffer for sparse→dense prob conversion
+        float* prob_buffer; // Pre-registered buffer for dense or compact prob rows
 
     // Group-scoped routing bitmap; shared by all handles on this group.
         uint8_t* global_routing_map = nullptr;
@@ -1749,14 +1750,14 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
             &ep_group->gin_config.dcomm,
             dcomm_bytes,
             &ep_group->gin_config.d_dcomm));
-        // No GIN mega-buffer in this topology (nothing below carves one), so dense_prob
+        // No GIN mega-buffer in this topology (nothing below carves one), so probability
         // staging gets its own small allocation here instead. Rebuilt per dispatch/
         // backward-combine, so group-scoping stays PP-safe. Freed in destroy_ht_internode.
         // kPullPush writes backward weights straight to the caller tensor and never touches
         // this buffer, so skip it there.
         if (ep_group->ht_em_mode != ncclEpGroup::HtEmMode::kPullPush) {
             CUDA_CHECK(ep_group->alloc.alloc_fn(
-                reinterpret_cast<void**>(&ep_group->ht_buffers.dense_prob_buffer),
+                reinterpret_cast<void**>(&ep_group->ht_buffers.prob_buffer),
                 static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) *
                     ep_group->config.num_experts * sizeof(float),
                 ep_group->alloc.context));
@@ -1858,7 +1859,7 @@ init_ht_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     ep_group->ht_buffers.token_staging_buffer = reinterpret_cast<void*>(ptr + offset);
     offset += token_staging_sz;
 
-    ep_group->ht_buffers.dense_prob_buffer = reinterpret_cast<float*>(ptr + offset);
+    ep_group->ht_buffers.prob_buffer = reinterpret_cast<float*>(ptr + offset);
     offset += dense_prob_sz;
 
     offset += rdma_send_staging_sz;
@@ -2023,12 +2024,12 @@ static ncclResult_t destroy_ht_internode(ncclEpGroup_t ep_group) {
         ep_group->ht_buffers.dispatch_gin_G2S_flags = nullptr;
         ep_group->ht_buffers.combine_gin_G2S_flags = nullptr;
         ep_group->ht_buffers.token_staging_buffer = nullptr;
-        ep_group->ht_buffers.dense_prob_buffer = nullptr;
-    } else if (ep_group->ht_buffers.dense_prob_buffer != nullptr) {
-        // Single-LSA-team: dense_prob_buffer was a standalone alloc (see the rdma_team_size
+        ep_group->ht_buffers.prob_buffer = nullptr;
+    } else if (ep_group->ht_buffers.prob_buffer != nullptr) {
+        // Single-LSA-team: prob_buffer was a standalone alloc (see the rdma_team_size
         // <= 1 branch above), not carved from gin_base_ptr.
-        ep_group->alloc.free_fn(ep_group->ht_buffers.dense_prob_buffer, ep_group->alloc.context);
-        ep_group->ht_buffers.dense_prob_buffer = nullptr;
+        ep_group->alloc.free_fn(ep_group->ht_buffers.prob_buffer, ep_group->alloc.context);
+        ep_group->ht_buffers.prob_buffer = nullptr;
     }
 
     ep_group->ht_buffers.internode_initialized = false;
@@ -3129,21 +3130,31 @@ struct ncclEpHandle {
             // lifetime: valid after metadata_preprocessing
             int32_t* num_tokens_for_experts;
 
+            // Original source top-k position for each delivered weight. FWD inline
+            // decoding fills this handle-owned map; BWD combine scatters each
+            // gradient back to that same source position. FWD must precede BWD.
+            // FLAT and EM-permute scratch: [max_recv_tokens, num_topk].
+            // Native EM: [max_recv_tokens], one source position per expert slot.
+            // uint8 for K <= 255, uint16 otherwise; all-ones means no expert.
+            void* wire_prob_pos;
+
             // =================================================================================
             // CONVERSION BUFFERS - Pre-allocated to avoid dispatch/combine-time malloc
             // =================================================================================
 
-            // Dense prob buffer: shared scratch for sparse↔dense conversions
-            // dtype: float
-            // layout: [max_dispatch_tokens_per_rank, num_experts]
+            // Prob buffer: shared scratch for dense or compact wire rows
+            // allocation: float[max_dispatch_tokens_per_rank, num_experts]
+            // row stride: dense num_experts or the selected compact wire width
+            // compact FWD rows also contain inline uint16 expert IDs
             // usage:
-            //   - dispatch forward: sparse→dense input topk_weights conversion
-            //   - combine backward: dense→sparse output prob conversion
-            // lifetime: allocated at handle creation, freed at handle destroy
+            //   - dispatch forward: pack input topk_weights into wire rows
+            //   - combine backward: dense output staging before gathering top-k;
+            //     compact writes caller weights directly from the final reduction
+            // lifetime: group-owned (allocated at group creation, freed at group destroy)
             // note: dispatch and combine are sequential, so one buffer suffices
             // For multi-LSA-team: points to group-level pre-registered buffer
-            // For single-LSA-team: handle-owned buffer
-            float* dense_prob_buffer;
+            // For single-LSA-team: points to group-level standalone allocation
+            float* prob_buffer;
 
             // Token staging buffer: pre-registered buffer to avoid GIN registration during dispatch
             // User tokens are copied here during dispatch, then this buffer is used for RDMA
@@ -3166,7 +3177,7 @@ struct ncclEpHandle {
             void* preprocessing_block;
             bool owns_handle_mem; // false = caller-owned (user path); destroy skips free
             size_t preprocessing_zero_region_size;
-            size_t preprocessing_s2d_size;
+            size_t preprocessing_s2d_size; // contiguous S2D + compact position map; both memset 0xFF
             void* preprocessing_scan_tmp;
 
             // Expert-major fields (alignment set in InitHandle; offsets/counts set in UpdateHandle)
@@ -3330,6 +3341,38 @@ static bool em_staging_indexed_by_em_slot(ncclEpGroup_t group) {
            group->ht_em_mode == ncclEpGroup::HtEmMode::kLocalDup;
 }
 
+// Push transport only: compact FWD rows contain original-order FP32 weights
+// and uint16 IDs; compact BWD rows contain original-top-k-order gradients without
+// IDs. Pull-push already uses original-order sparse weights and srcpos_map.
+enum class HtProbWire { kDense, kCompact };
+
+// Wire prob row width in floats. Rounded up to a multiple of 4 so rows stay
+// 16 B-aligned for TMA / float4 stores (same constraint the dense row has).
+static inline int combine_compact_prob_row_floats(int num_topk) {
+    return (num_topk + 3) & ~3;
+}
+
+// Resolve the wire format for this group + handle top-k (num_topk > 0 is
+// guaranteed by ncclEpInitHandle validation). Select compact automatically
+// when the complete weights-plus-IDs row fits the representation and is smaller
+// than the dense per-LSA-team row. This is a byte-size heuristic, not a guarantee
+// of lower latency. Group geometry and handle top-k agree across ranks.
+static HtProbWire ht_prob_wire_mode(ncclEpGroup_t group, int num_topk) {
+    // Pull-push already reads sparse weights directly using its packed top-k
+    // metadata (including MR255 count mode). It bypasses these prob buffers;
+    // do not duplicate its IDs or run a probability packing adapter.
+    if (group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush) {
+        return HtProbWire::kDense;
+    }
+    // Keep the legacy dense path when IDs cannot be represented or compact
+    // would save no wire bytes (including its IDs and alignment padding).
+    if (!nccl_ep::ht::compact_prob_fits(
+            num_topk, group->config.num_experts, group->num_local_experts * group->lsa_team_size)) {
+        return HtProbWire::kDense;
+    }
+    return HtProbWire::kCompact;
+}
+
 // Returns the total buffer size (in bytes) for a LL handle_mem block.
 // Used by ncclEpHandleMemSize (public) and ncclEpInitHandle (internal).
 static size_t ll_handle_mem_size(ncclEpGroup_t ep_group, int num_topk) {
@@ -3347,7 +3390,7 @@ static size_t ll_handle_mem_size(ncclEpGroup_t ep_group, int num_topk) {
 // Single source of truth shared by ht_handle_mem_size() and ht_init_handle().
 struct HtBlockLayout {
     // global_routing_map is group-scoped (ep_group->ht_buffers); not part of this block.
-    size_t sz_r2a, sz_a2r, sz_ler, sz_ntfe;
+    size_t sz_r2a, sz_a2r, sz_ler, sz_ntfe, sz_wire_pos;
     size_t sz_s2d, sz_rank_mask, sz_scan_tmp;
     size_t sz_topk_idx; // cached topk_idx (uint16 under pull-push, int32 expert ids elsewhere)
     size_t sz_pec_active; // EM only
@@ -3379,7 +3422,7 @@ struct HtBlockLayout {
         const bool has_expert_major = (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
         const bool em_permute = em_local_permute_enabled(ep_group, layout);
         // Pull recipe (dispatch + push combine). Adds recv_slot_to_src / srcpos_map,
-        // and drops the FLAT dense_prob / recv_topk_weights_flat scratch the push
+        // and drops the FLAT prob_buffer / recv_topk_weights_flat scratch the push
         // path needs but pull does not.
         const bool needs_pull_buffers = em_pull_enabled(ep_group, layout);
 
@@ -3404,6 +3447,16 @@ struct HtBlockLayout {
                                 nccl_ep::bit_words(experts_per_rank) * sizeof(uint64_t)) :
                        align256(ler_rows * experts_per_rank * sizeof(bool));
         L.sz_ntfe = align256(sizeof(int32_t));
+        // Match the existing receiver conversion's row capacity. Native EM has
+        // one weight per slot; FLAT and EM-permute's internal FLAT scratch need
+        // one original source position per local weight. FWD initializes every
+        // active map entry. The existing S2D 0xFF initialization also clears
+        // this map's tail, which BWD may read at full caller-buffer capacity.
+        const int wire_pos_stride = (has_expert_major && !em_permute) ? 1 : num_topk;
+        L.sz_wire_pos = (ht_prob_wire_mode(ep_group, num_topk) == HtProbWire::kCompact) ?
+                           align256(ler_rows * wire_pos_stride *
+                                    nccl_ep::ht::compact_prob_pos_bytes(num_topk)) :
+                           0;
         // S2D inner_dim: num_topk for nvlink_dup/local_dup EM (packed rank/slot); lsa_team_size
         // for FLAT and for EM-permute (unified FLAT-shape s2d — em_scan_kernel's
         // EM-shape writes are suppressed in em-permute mode).
@@ -3426,7 +3479,7 @@ struct HtBlockLayout {
                 lsa_team_size));
         // Pull-push stores a uint16 snapshot for push combine; other modes cache expert ids as
         // int32 (they fit, regardless of the caller's int32/int64 topk_idx) for the FLAT
-        // dense-prob rebuild and BWD dense-to-sparse scatter.
+        // probability rebuild and BWD dense-to-sparse scatter.
         const size_t topk_idx_elem = needs_pull_buffers ? sizeof(uint16_t) : sizeof(int32_t);
         L.sz_topk_idx = (num_topk > 0) ? align256(static_cast<size_t>(max_tokens) * num_topk * topk_idx_elem) : 0;
         L.sz_pec_active = has_expert_major ? align256(static_cast<size_t>(experts_per_rank) * sizeof(int32_t)) : 0;
@@ -3510,7 +3563,7 @@ struct HtBlockLayout {
                              L.sz_token_to_recv_slot + L.sz_count_scratch + L.sz_recv_slot_to_src +
                              L.sz_pull_count_own_row + L.sz_pull_count_cached_rows +
                              L.sz_srcpos_map;
-        L.total = L.zero_region + L.sz_s2d + L.no_memset_region;
+        L.total = L.zero_region + L.sz_s2d + L.sz_wire_pos + L.no_memset_region;
         return L;
     }
 };
@@ -3812,7 +3865,7 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
         handle->ht.owns_handle_mem = true;
     }
     handle->ht.preprocessing_zero_region_size = L.zero_region;
-    handle->ht.preprocessing_s2d_size = L.sz_s2d;
+    handle->ht.preprocessing_s2d_size = L.sz_s2d + L.sz_wire_pos;
 
     char* ptr = static_cast<char*>(handle->ht.preprocessing_block);
     size_t offset = 0;
@@ -3829,7 +3882,9 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     // --- end of zero_region (memset 0x00) ---
     handle->ht.sparse_to_dense_map = (L.sz_s2d > 0) ? reinterpret_cast<int32_t*>(ptr + offset) : nullptr;
     offset += L.sz_s2d;
-    // --- end of s2d region (memset 0xFF) ---
+    handle->ht.wire_prob_pos = (L.sz_wire_pos > 0) ? static_cast<void*>(ptr + offset) : nullptr;
+    offset += L.sz_wire_pos;
+    // --- end of S2D + source-position region (memset 0xFF) ---
     handle->ht.token_rank_mask = (L.sz_rank_mask > 0) ? ptr + offset : nullptr;
     offset += L.sz_rank_mask;
     handle->ht.preprocessing_scan_tmp = (L.sz_scan_tmp > 0) ? reinterpret_cast<void*>(ptr + offset) : nullptr;
@@ -3894,13 +3949,13 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     handle->ht.dispatch_output_per_expert_alignment = 0;
 
     if (is_internode_available(ep_group)) {
-        handle->ht.dense_prob_buffer = ep_group->ht_buffers.dense_prob_buffer;
+        handle->ht.prob_buffer = ep_group->ht_buffers.prob_buffer;
         handle->ht.token_staging_buffer = ep_group->ht_buffers.token_staging_buffer;
     } else {
-        // Single LSA team: point at the group-owned dense_prob staging (rebuilt per
+        // Single LSA team: point at the group-owned probability staging (rebuilt per
         // dispatch/combine). Pull dispatch + push combine derive prob presence locally.
         if (!em_pull_enabled(ep_group, handle->layout))
-            handle->ht.dense_prob_buffer = ep_group->ht_buffers.dense_prob_buffer;
+            handle->ht.prob_buffer = ep_group->ht_buffers.prob_buffer;
         handle->ht.token_staging_buffer = nullptr;
     }
     return ncclSuccess;
@@ -4263,7 +4318,9 @@ ncclResult_t ncclEpUpdateHandle(
     // Pull dispatch consumes the uint16 topk map (produced below) instead of the bitmap;
     // skip the bitmap convert + gather entirely when pull is enabled.
     const bool em_pull = em_pull_enabled(ep_group, handle);
-    // sparse_to_dense_map (unified S2D) uses 0xFF sentinel (not zero).
+    // S2D and the adjacent compact source-position map use all-ones sentinels.
+    // Clearing the map also covers receiver-capacity rows outside the live FWD
+    // decode range, so BWD skips their gradients and cannot reuse stale positions.
     // Pull dispatch never reads the S2D map, so skip its init under pull.
     if (!em_pull && handle->ht.preprocessing_s2d_size > 0) {
         CUDA_CHECK(cudaMemsetAsync(
@@ -5212,27 +5269,43 @@ ncclResult_t ncclEpDispatch(
             return ncclInvalidArgument;
         }
 
-        // FWD only: rebuild dense prob from cached topk_idx + caller topk_weights.
-        float* dense_prob = handle->ht.dense_prob_buffer;
+        // Prob wire format for this dispatch (must resolve identically on every rank).
+        const HtProbWire prob_wire = ht_prob_wire_mode(group, handle->num_topk);
+        const bool compact_dispatch_prob = forward_dispatch && prob_wire == HtProbWire::kCompact;
+        const int wire_prob_floats =
+            compact_dispatch_prob ? nccl_ep::ht::dispatch_compact_prob_row_floats(handle->num_topk) :
+            (prob_wire == HtProbWire::kCompact) ? combine_compact_prob_row_floats(handle->num_topk) : 0;
+        // FWD only: rebuild the wire prob rows from cached topk_idx + caller topk_weights.
+        float* prob_buffer = handle->ht.prob_buffer;
         if (forward_dispatch && !em_pull_active) {
             assert(
                 handle->ht.topk_idx != nullptr &&
                 "HT FWD dispatch: ht.topk_idx missing (ncclEpUpdateHandle not called?)");
-            size_t dense_prob_size =
-                static_cast<size_t>(handle->num_tokens) * group->config.num_experts * sizeof(float);
-            CUDA_CHECK(cudaMemsetAsync(dense_prob, 0, dense_prob_size, stream));
-
-            const auto build_dense_prob = [&](const auto* cached_topk_idx) {
-                nccl_ep::ht::sparse_to_dense_prob(
-                    cached_topk_idx,
-                    static_cast<const float*>(topk_weights->data),
-                    dense_prob,
-                    handle->num_tokens,
-                    handle->num_topk,
-                    group->config.num_experts,
-                    stream);
+            const size_t wire_row_floats = (prob_wire == HtProbWire::kCompact)
+                                               ? static_cast<size_t>(wire_prob_floats)
+                                               : static_cast<size_t>(group->config.num_experts);
+            if (!compact_dispatch_prob) {
+                CUDA_CHECK(cudaMemsetAsync(
+                    prob_buffer, 0, static_cast<size_t>(handle->num_tokens) * wire_row_floats * sizeof(float), stream));
+            }
+            const auto build_wire_prob = [&](const auto* cached_topk_idx) {
+                if (compact_dispatch_prob) {
+                    nccl_ep::ht::dispatch_prob_input_to_compact(
+                        cached_topk_idx, static_cast<const float*>(topk_weights->data), prob_buffer,
+                        handle->num_tokens, handle->num_topk, group->config.num_experts,
+                        wire_prob_floats, stream);
+                } else {
+                    nccl_ep::ht::sparse_to_dense_prob(
+                        cached_topk_idx,
+                        static_cast<const float*>(topk_weights->data),
+                        prob_buffer,
+                        handle->num_tokens,
+                        handle->num_topk,
+                        group->config.num_experts,
+                        stream);
+                }
             };
-            build_dense_prob(static_cast<const int32_t*>(handle->ht.topk_idx));
+            build_wire_prob(static_cast<const int32_t*>(handle->ht.topk_idx));
         }
 
         /* ===== Build DispatchParams ===== */
@@ -5247,7 +5320,9 @@ ncclResult_t ncclEpDispatch(
         params.experts_per_rank = group->num_local_experts;
         params.lsa_team_size = group->lsa_team_size;
         params.attn_input_token = token_ptr;
-        params.attn_input_prob = forward_dispatch ? dense_prob : nullptr;
+        params.attn_input_prob = forward_dispatch ? prob_buffer : nullptr;
+        params.compact_prob = (prob_wire == HtProbWire::kCompact);
+        params.wire_prob_floats = wire_prob_floats;
         params.attn_input_scaling_factor =
             recipe == NCCL_EP_DISP_QUANT_FWD ? static_cast<const uint8_t*>(scales_ptr) : nullptr;
         // Use HOST pointer arrays - these get copied into the kernel param struct for fast __grid_constant__ access.
@@ -5533,7 +5608,13 @@ ncclResult_t ncclEpDispatch(
         // All buffers are part of one large registered window
         // Calculate bytes_per_entry for batched staging
         size_t bytes_per_token_entry = group->config.max_token_bytes; // token data
-        size_t bytes_per_prob_entry = (group->num_local_experts * group->lsa_team_size) * sizeof(float); // prob data
+        // Compact shrinks only the FWD wire entry; BWD dispatch keeps the
+        // dense-sized stride (its prob hole is never filled). Allocation-side
+        // sizing (group create) stays conservative at the dense size, which is
+        // always >= this launch-side value.
+        size_t bytes_per_prob_entry = (forward_dispatch && prob_wire == HtProbWire::kCompact)
+                                          ? static_cast<size_t>(wire_prob_floats) * sizeof(float)
+                                          : (group->num_local_experts * group->lsa_team_size) * sizeof(float);
         size_t bytes_per_entry = bytes_per_token_entry + bytes_per_prob_entry;
 
         params.mr_info.attn_input_token_offset = 0;
@@ -5612,6 +5693,9 @@ ncclResult_t ncclEpDispatch(
                 params.hidden_dim,
                 params.experts_per_rank,
                 params.lsa_team_size,
+                /*prob_row_floats=*/
+                (prob_wire == HtProbWire::kCompact) ? wire_prob_floats
+                                                    : params.experts_per_rank * params.lsa_team_size,
                 forward_dispatch,
                 params.local_dup_num_sms,
                 stream,
@@ -5738,7 +5822,17 @@ ncclResult_t ncclEpDispatch(
 
                 // Pull relocates weights directly from the source topk_weights row, so it
                 // needs no FLAT weight staging (prob buffer is not populated under pull).
-                if (!em_pull_active)
+                if (!em_pull_active && compact_dispatch_prob) {
+                    nccl_ep::ht::dispatch_prob_compact_to_output(
+                        group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank],
+                        count_mode ? handle->ht.dispatch_push_count.lerm_landing
+                                   : handle->ht.local_expert_routing_map,
+                        handle->ht.wire_prob_pos,
+                        dsp_topk_weights, dsp_topk_idx, num_recv_tokens,
+                        handle->ht.num_tokens_for_experts, handle->num_topk,
+                        group->num_local_experts, wire_prob_floats, global_expert_offset,
+                        recv_topk_idx_kind, dsp_em, count_mode, stream);
+                } else if (!em_pull_active)
                     nccl_ep::ht::dense_to_sparse_prob(
                         group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank],
                         // Count mode reads the IPC LERM landing zone here (pre-permute); the
@@ -6534,7 +6628,18 @@ ncclResult_t ncclEpCombine(
         // (caller EM x -> FLAT staging), regardless of external-window — x->data
         // is the resolved device pointer either way.
         // Hoisted above the push/pull branch: used by the BWD scatter after call_combine.
-        float* dense_output_prob = handle->ht.dense_prob_buffer;
+        float* prob_buffer = handle->ht.prob_buffer;
+        // Prob wire format for this combine (must match dispatch and resolve
+        // identically on every rank; both derive from the same group geometry
+        // and handle->num_topk). The non-compact enum bypasses these adapters
+        // for pull-push, whose actual weight payload remains sparse-direct.
+        const HtProbWire prob_wire = ht_prob_wire_mode(group, handle->num_topk);
+        const int wire_prob_floats =
+            (prob_wire == HtProbWire::kCompact) ? combine_compact_prob_row_floats(handle->num_topk) : 0;
+        if (backward_combine && prob_wire == HtProbWire::kCompact) {
+            assert(num_topk == handle->num_topk &&
+                   "HT compact BWD combine: output width must match handle top-k");
+        }
         const bool comb_push = em_comb_push_enabled(group, handle);
         // Push combine is single-LSA-team only (kPullPush enforces this at group creation).
         // Fail loudly if a multi-team handle reaches here instead of silently running a
@@ -6673,24 +6778,25 @@ ncclResult_t ncclEpCombine(
                 // E8M0 scales ride in the packed token row, not a separate buffer.
             }
 
-            /* ===== Convert sparse topk_weights to dense prob for backward combine ===== */
-            // For backward combine, convert sparse input weights to dense format for HT kernel
+            /* ===== Convert sparse topk_weights to wire prob rows for backward combine ===== */
             if (backward_combine) {
                 int experts_per_lsa_team = group->num_local_experts * group->lsa_team_size;
-                // Dense prob staging has token_staging_slots rows and the combine kernel reads only
+                // Probability staging has token_staging_slots rows and the combine kernel reads only
                 // valid recv slots, so clamp the scatter there: flat recv capacity for FLAT and
                 // em-permute, full recv budget for the EM-slot dup modes.
                 const int conv_rows = em_permute_combine
                     ? static_cast<int>(ht_max_flat_recv_tokens(group))
                     : static_cast<int>(std::min<size_t>(
                           static_cast<size_t>(num_tokens), group->ht_buffers.token_staging_slots));
-                size_t dense_prob_size = static_cast<size_t>(conv_rows) * experts_per_lsa_team * sizeof(float);
+                const int in_prob_row_floats =
+                    (prob_wire == HtProbWire::kCompact) ? wire_prob_floats : experts_per_lsa_team;
+                size_t wire_prob_size = static_cast<size_t>(conv_rows) * in_prob_row_floats * sizeof(float);
 
-                // Zero-initialize the dense prob buffer before scattering
+                // Zero-initialize the wire prob buffer before scattering
                 CUDA_CHECK(cudaMemsetAsync(
                     group->ht_buffers.combine_expert_input_prob_buffer_ptrs[group->lsa_rank],
                     0,
-                    dense_prob_size,
+                    wire_prob_size,
                     stream));
 
                 // Scatter sparse weights into dense prob [num_recv, experts_per_lsa_team].
@@ -6703,26 +6809,45 @@ ncclResult_t ncclEpCombine(
                                               static_cast<const float*>(topk_weights->data);
                 const int prob_stride = use_flat_inputs ? num_topk : input_topk_stride;
                 const bool* lerm_for_combine = handle->ht.local_expert_routing_map;
-                // Count mode persists LERM as a packed bitmap; scan mode as one bool per expert.
                 const bool lerm_bitmap = dispatch_push_count_active(group, handle);
-                nccl_ep::ht::sparse_to_dense_prob_combine(
-                    prob_input,
-                    lerm_for_combine,
-                    group->ht_buffers.combine_expert_input_prob_buffer_ptrs[group->lsa_rank],
-                    conv_rows,
-                    prob_stride,
-                    group->num_local_experts, // experts_per_rank
-                    experts_per_lsa_team,
-                    group->lsa_rank,
-                    lerm_bitmap,
-                    stream);
+                // FWD inline decoding saved this handle's original source top-k
+                // positions. The gradient row uses that same order on all ranks.
+                if (prob_wire == HtProbWire::kCompact) {
+                    assert(
+                        handle->ht.wire_prob_pos != nullptr &&
+                        "HT compact prob: handle position map is missing");
+                    nccl_ep::ht::combine_prob_input_to_compact(
+                        prob_input,
+                        handle->ht.wire_prob_pos,
+                        group->ht_buffers.combine_expert_input_prob_buffer_ptrs[group->lsa_rank],
+                        conv_rows,
+                        prob_stride,
+                        handle->num_topk,
+                        wire_prob_floats,
+                        stream);
+                } else {
+                    nccl_ep::ht::sparse_to_dense_prob_combine(
+                        prob_input,
+                        lerm_for_combine,
+                        group->ht_buffers.combine_expert_input_prob_buffer_ptrs[group->lsa_rank],
+                        conv_rows,
+                        prob_stride,
+                        group->num_local_experts, // experts_per_rank
+                        experts_per_lsa_team,
+                        group->lsa_rank,
+                        lerm_bitmap,
+                        stream);
+                }
             }
 
-            // Use pre-allocated dense prob buffer for backward combine
-            if (backward_combine) {
-                size_t dense_output_prob_size =
-                    static_cast<size_t>(num_combined_tokens) * group->config.num_experts * sizeof(float);
-                CUDA_CHECK(cudaMemsetAsync(dense_output_prob, 0, dense_output_prob_size, stream));
+            // Dense output still needs a gather from expert-indexed staging.
+            // Compact combine writes all K caller columns directly, including
+            // zero-contribution columns, so it needs neither staging nor a clear.
+            if (backward_combine && prob_wire == HtProbWire::kDense) {
+                const size_t out_row_floats = static_cast<size_t>(group->config.num_experts);
+                size_t prob_buffer_size =
+                    static_cast<size_t>(num_combined_tokens) * out_row_floats * sizeof(float);
+                CUDA_CHECK(cudaMemsetAsync(prob_buffer, 0, prob_buffer_size, stream));
             }
 
             /* ===== Build CombineParams ===== */
@@ -6749,7 +6874,10 @@ ncclResult_t ncclEpCombine(
                 backward_combine ? group->ht_buffers.combine_expert_input_prob_buffer_ptrs : nullptr;
             params.combine_recipe = mxfp8_combine ? NCCL_EP_COMB_QUANT_MXFP8 : NCCL_EP_COMB_QUANT_NONE;
             params.attn_output_token = combined_x->data;
-            params.attn_output_prob = backward_combine ? dense_output_prob : nullptr;
+            params.attn_output_prob = backward_combine
+                ? (prob_wire == HtProbWire::kCompact ? static_cast<float*>(combined_topk_weights->data) : prob_buffer)
+                : nullptr;
+            params.output_prob_floats = backward_combine ? num_topk : 0;
             params.combine_gin_RED_tokens = is_lsa_only ? nullptr : group->ht_buffers.combine_gin_RED_tokens;
             params.combine_gin_RED_prob =
                 (!is_lsa_only && backward_combine) ? group->ht_buffers.combine_gin_RED_prob : nullptr;
@@ -6811,6 +6939,8 @@ ncclResult_t ncclEpCombine(
             params.num_real_tokens = num_combined_tokens;
             params.num_recv_tokens = num_tokens;
             params.combine_local_reduce_enabled = em_local_dup_active(group, handle->layout);
+            params.compact_prob = (prob_wire == HtProbWire::kCompact);
+            params.wire_prob_floats = wire_prob_floats;
 
             // Pre-sum secondary em_slots into primaries before combine reads them.
             if (params.combine_local_reduce_enabled) {
@@ -6828,6 +6958,9 @@ ncclResult_t ncclEpCombine(
                     params.hidden_dim,
                     params.experts_per_rank,
                     params.lsa_team_size,
+                    /*prob_dim=*/
+                    (prob_wire == HtProbWire::kCompact) ? wire_prob_floats
+                                                        : params.experts_per_rank * params.lsa_team_size,
                     backward_combine,
                     static_cast<int>(group->shuffle_sms),
                     stream,
@@ -6851,24 +6984,16 @@ ncclResult_t ncclEpCombine(
                     stream));
         } // end pull/push combine branch
 
-        // BWD combine: scatter dense output back to FWD k-slot ordering via ht.topk_idx.
-        // Push combine writes combined_topk_weights directly (sparse-direct via srcpos),
-        // so this dense->sparse step only runs on the pull path.
-        if (backward_combine && !comb_push) {
-            assert(
-                handle->ht.topk_idx != nullptr &&
-                "HT BWD combine: ht.topk_idx missing (ncclEpUpdateHandle not called?)");
-            const auto gather_sparse = [&](const auto* cached_topk_idx) {
-                nccl_ep::ht::dense_to_sparse_prob_combine(
-                    dense_output_prob,
-                    cached_topk_idx,
-                    static_cast<float*>(combined_topk_weights->data),
-                    num_combined_tokens,
-                    num_topk,
-                    group->config.num_experts,
-                    stream);
-            };
-            gather_sparse(static_cast<const int32_t*>(handle->ht.topk_idx));
+        // Compact and pull-push combine write caller weights directly. Dense
+        // fallback gathers the selected expert columns from its staging row.
+        if (backward_combine && !comb_push && prob_wire == HtProbWire::kDense) {
+            assert(handle->ht.topk_idx != nullptr &&
+                   "HT BWD combine: ht.topk_idx missing (ncclEpUpdateHandle not called?)");
+            nccl_ep::ht::dense_to_sparse_prob_combine(
+                prob_buffer,
+                static_cast<const int32_t*>(handle->ht.topk_idx),
+                static_cast<float*>(combined_topk_weights->data),
+                num_combined_tokens, num_topk, group->config.num_experts, stream);
         }
 
         handle->cached_mode = true;
@@ -7003,6 +7128,13 @@ ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) {
 
 const int32_t* ncclEpHandle_test_getSparseToDenseMap(ncclEpHandle_t handle) {
     return handle->ht.sparse_to_dense_map;
+}
+
+int ncclEpHandle_test_getCompactProbWireFloats(ncclEpHandle_t handle) {
+    if (handle == nullptr || handle->group == nullptr ||
+        handle->group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT ||
+        ht_prob_wire_mode(handle->group, handle->num_topk) != HtProbWire::kCompact) return 0;
+    return nccl_ep::ht::dispatch_compact_prob_row_floats(handle->num_topk);
 }
 
 int ncclEpHandle_test_getNumTopk(ncclEpHandle_t handle) {
