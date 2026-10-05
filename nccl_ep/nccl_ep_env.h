@@ -87,6 +87,13 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar ll_cft{"NCCL_EP_LL_CFT", ncclEpEnvType::flag};
     // Debug-only driver API floor override for testing platform rejection.
     ncclEpEnvVar ll_cft_debug_min_driver{"NCCL_EP_LL_CFT_DEBUG_MIN_DRIVER", ncclEpEnvType::ulong};
+    // Selects which LL dispatch kernel family an otherwise LSA-eligible call (nvlinkOnly,
+    // rank-major) uses: "simt" = dispatch_kernel_impl_2sided_rm_lsa, "tma" (default when unset) =
+    // dispatch_kernel_impl_2sided_rm_lsa_tma, "universal" = the general dispatch_kernel_impl in
+    // ll_ep.cuh regardless of LSA eligibility. See NcclEpDispatchLsaMode's doc comment in
+    // device/ll_ep_adapter.cuh.
+    static constexpr const char* dispatch_lsa_modes[] = {"simt", "tma", "universal", nullptr};
+    ncclEpEnvVar dispatch_lsa{"NCCL_EP_DISPATCH_LSA", ncclEpEnvType::choice, dispatch_lsa_modes};
 };
 
 // True iff a flag variable was explicitly set to an "on" value (1/on/true).

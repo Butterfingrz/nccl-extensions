@@ -14,10 +14,19 @@
 #include "nccl_device.h"
 #include "ep_enums.h"
 #include "common.hpp"
-#include "ll_ep_smem.cuh"
+#include "ll/ll_ep_smem.cuh"
 
 namespace nccl_ep {
 namespace ll {
+
+// Selects which LL dispatch kernel family an LSA-eligible call uses, driven by the
+// NCCL_EP_DISPATCH_LSA env var (see nccl_ep_env.h): "simt" -> kSimt (dispatch_kernel_impl_2sided_rm_lsa),
+// "tma" -> kTma (dispatch_kernel_impl_2sided_rm_lsa_tma, the default), "universal" -> kUniversal (forces
+// the general dispatch_kernel_impl in ll_ep.cuh even when the call would otherwise be LSA-eligible).
+// kUniversal always wins regardless of eligibility; kTma silently falls back to kSimt for calls that
+// are LSA-eligible but not TMA-eligible (e.g. DS_FP8E3M4, which the TMA kernel does not support) --
+// see ll_dispatch_select_algo in device/jit/ll_dispatch_jit.cuh.
+enum class NcclEpDispatchLsaMode { kSimt, kTma, kUniversal };
 
 // Keep shared-quantization eligibility identical in the host geometry, JIT
 // launch bounds, and device staging allocation.
@@ -318,6 +327,13 @@ struct DispatchParams {
     // Actual token wire dtype. Selects the kTokenDtype kernel specialization;
     // FP16 and BF16 share the same two-byte copy specialization.
     ncclDataType_t tokenDtype = ncclBfloat16;
+
+    // Selects which LSA-eligible LL dispatch kernel family gets JIT-compiled (NCCL_EP_DISPATCH_LSA
+    // env var; see NcclEpDispatchLsaMode's doc comment above). A build-time/JIT-variant selector,
+    // not data threaded into dispatch_kernel_args_t. When kTma is (effectively) selected, the TMA
+    // variant's stage ring (see ll/ll_ep_smem.cuh's dispatch_tma_smem namespace) is sized from
+    // maxDynamicSmem above.
+    NcclEpDispatchLsaMode lsaMode = NcclEpDispatchLsaMode::kTma;
 
     // Populated after CFT setup succeeds on every rank.
     const uint32_t* cftPeerLeIds = nullptr;

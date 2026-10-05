@@ -96,6 +96,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
 
     parse_timeout_ms(cfg->timeout_ms);
     parse_choice(cfg->dispatch_copy_mode);
+    parse_choice(cfg->dispatch_lsa);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
@@ -141,6 +142,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.combine_num_stages_s2g,
         &cfg.combine_num_pipelines,
         &cfg.ll_cft_debug_min_driver,
+        &cfg.dispatch_lsa,
     };
 
     std::fprintf(stderr, "[nccl_ep][env] NCCL EP environment configuration:\n");

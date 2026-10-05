@@ -168,6 +168,8 @@ ncclResult_t call_dispatch(
         numWarps,
         stageQuant,
         cft_smem_bytes,
+        params.lsaMode,
+        params.maxDynamicSmem,
         args,
         stream);
 }

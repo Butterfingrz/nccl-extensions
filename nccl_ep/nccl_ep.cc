@@ -4613,6 +4613,22 @@ static ncclResult_t ht_query_num_recv_tokens(ncclEpHandle_t handle, cudaStream_t
     return ncclSuccess;
 }
 
+namespace {
+
+// Maps env.dispatch_lsa (NCCL_EP_DISPATCH_LSA, choices {"simt", "tma", "universal"} indexed
+// 0/1/2) to NcclEpDispatchLsaMode; unset defaults to kTma (the TMA kernel is the default LSA
+// dispatch path -- see NcclEpDispatchLsaMode's doc comment in device/ll_ep_adapter.cuh).
+nccl_ep::ll::NcclEpDispatchLsaMode resolve_dispatch_lsa_mode(const ncclEpEnvConfig& env) {
+    if (!env.dispatch_lsa.is_set) return nccl_ep::ll::NcclEpDispatchLsaMode::kTma;
+    switch (env.dispatch_lsa.value.ul) {
+        case 0: return nccl_ep::ll::NcclEpDispatchLsaMode::kSimt;
+        case 1: return nccl_ep::ll::NcclEpDispatchLsaMode::kTma;
+        default: return nccl_ep::ll::NcclEpDispatchLsaMode::kUniversal;
+    }
+}
+
+} // namespace
+
 ncclResult_t ncclEpDispatch(
     ncclEpHandle_t handle,
     const ncclEpDispatchInputs_t* inputs,
@@ -4956,6 +4972,7 @@ ncclResult_t ncclEpDispatch(
                         static_cast<size_t>(cft_parity) * lb.cumul_slots_per_parity;
                     params.cftCumulByteExpect = lb.cumul_byte_expect_dev + cumul_off;
                 }
+                params.lsaMode = resolve_dispatch_lsa_mode(group->env);
                 // Keep recipe dispatch explicit at the kernel launch boundary. The
                 // selected branch becomes the JIT kernel's quantization variant.
                 switch (recipe) {

@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace nccl_ep::ll::combine_smem {
@@ -125,3 +126,91 @@ constexpr int kActiveRankMaskWords = (kMaxLsaCombineRanks + 31) / 32;
 constexpr int kLsaStaticSmemBytes = kActiveRankMaskWords * static_cast<int>(sizeof(std::uint32_t));
 
 } // namespace nccl_ep::ll::combine_smem
+
+// ============================================================================
+// Shared-memory budget for the TMA-pipelined LL dispatch SEND phase
+// (dispatch_kernel_impl_2sided_rm_lsa_tma, ll/ll_dispatch_lsa.cuh).
+//
+// Unlike combine_smem::dynamic_smem_bytes above, this budget is NOT divided across warps:
+// dispatch_kernel_impl_2sided_rm_lsa_tma uses exactly one warp per CTA to drive the whole
+// token-send pipeline (see that file's header comment for why), so the entire per-CTA dynamic
+// shared-memory budget is available to that single warp's stage ring.
+//
+// Compile-time vs runtime split (important): num_stages here is resolved ONCE, host-side, at
+// JIT-variant-selection time, from (hidden, dtype, max_dynamic_smem) alone -- the same inputs that
+// already key the JIT variant cache. It is NOT re-derived per dispatch call from that call's actual
+// token count, because the per-call token count (numTokens) does not participate in JIT variant
+// selection today (only hidden/layout/topk/nvlinkOnly/dtype do) -- keying the smem allocation to a
+// runtime-varying quantity would mean a new compiled kernel per distinct numTokens/numSms ratio,
+// which defeats JIT caching. Instead, num_stages here is an upper bound on allocated stages; the
+// kernel itself clamps how many stages it actually *uses* for prefetch to
+// min(kNumStages, ceil_div(numTokens, numSms)) at runtime, so a CTA with fewer tokens than stages
+// simply prefetches fewer of them -- no wasted work, same fixed allocation.
+// ============================================================================
+
+namespace nccl_ep::ll::dispatch_tma_smem {
+
+constexpr int kTmaBarrierBytes = sizeof(std::uint64_t);
+constexpr int kTmaPaddingBytes = sizeof(std::uint64_t);
+constexpr int kTmaBarrierAndPaddingBytes = kTmaBarrierBytes + kTmaPaddingBytes; // 16
+
+// Upper bound on the number of pipeline stages, independent of smem capacity -- keeps the
+// mbarrier array and ring-index arithmetic a small, compile-time-friendly size. This many
+// in-flight TMA loads is already enough to hide typical NVLink load latency behind issue-rate;
+// going deeper trades shared memory for diminishing returns.
+constexpr int kMaxStages = 8;
+
+// Per-stage layout: [payload (hiddenBytes, TMA-loaded from args.inData)]
+//                   [header (dispatch_hdr_sz bytes, assembled in-place by lanes, 16B-aligned
+//                    already by get_dispatch_hdr_sz's own alignment)]
+//                   [mbarrier + padding (kTmaBarrierAndPaddingBytes), tracks the payload load only
+//                    -- the header has no load to wait on, it's written directly by lanes and only
+//                    needs the warp's own __syncwarp() before being read back out for the store]
+__host__ __device__ __forceinline__ int per_stage_bytes(int hidden_bytes, int dispatch_hdr_sz) {
+    return hidden_bytes + dispatch_hdr_sz + kTmaBarrierAndPaddingBytes;
+}
+
+// Per-CTA (not per-stage) resolved-P2P-pointer cache, one uint64_t per destination rank. See
+// dispatchSendPhaseLsaTma's doc comment: ncclGetP2pPtr's result for a given dstRank is loop
+// invariant (depends only on currRank/dstRank/recvOff, none of which change across this CTA's
+// token range), so it's resolved once into this cache before the send loop instead of once per
+// (token, winning lane) -- removing a redundant team-membership check + window-table lookup from
+// the hot loop. Placed immediately after the stage ring in the same dynamic smem allocation.
+__host__ __device__ __forceinline__ int rank_cache_bytes(int num_ranks) {
+    return static_cast<int>(static_cast<size_t>(num_ranks) * sizeof(std::uint64_t));
+}
+
+struct DispatchTmaSmemConfig {
+    int num_stages;
+    int dynamic_smem_bytes; // stage ring + rank-pointer cache, total
+    bool feasible;
+};
+
+// Account for the kernel's static smem footprint -- separate from (and not covered by) this
+// namespace's dynamic smem budget, so the caller must reserve it out of max_dynamic_smem before
+// calling choose_config, or a boundary-sized stage ring can push static + dynamic over the
+// device's shared-memory limit and fail at launch. Current static usage:
+//  * syncAndSendCounts: __shared__ bool shIsLastCta
+// Revisit if the TMA kernel's call path gains more static __shared__ state.
+constexpr int kStaticSmemBytes = static_cast<int>(sizeof(std::uint32_t));
+
+// hidden_bytes/dispatch_hdr_sz: per the doc comment above, resolved once per JIT variant from
+// (hidden, dtype, numTopk) -- the same quantities already baked into that variant's template args.
+// max_dynamic_smem: group->max_dynamic_smem (cudaDevAttrMaxSharedMemoryPerBlockOptin), the same
+// host-cached value combine's smem config already uses.
+// num_ranks: this EP group's world size -- sizes the rank-pointer cache (see rank_cache_bytes
+// above); reserved out of the budget before sizing the stage ring, since the cache is a small,
+// fixed, per-CTA cost independent of how many stages end up allocated.
+__host__ __device__ __forceinline__ DispatchTmaSmemConfig choose_config(
+    int hidden_bytes, int dispatch_hdr_sz, int max_dynamic_smem, int num_ranks) {
+    const int stage_bytes = per_stage_bytes(hidden_bytes, dispatch_hdr_sz);
+    const int cache_bytes = rank_cache_bytes(num_ranks);
+    const int stage_budget = max_dynamic_smem - cache_bytes;
+    if (stage_bytes <= 0 || stage_budget <= 0) return DispatchTmaSmemConfig{0, 0, false};
+    int num_stages = stage_budget / stage_bytes;
+    num_stages = num_stages < kMaxStages ? num_stages : kMaxStages;
+    if (num_stages <= 0) return DispatchTmaSmemConfig{0, 0, false};
+    return DispatchTmaSmemConfig{num_stages, num_stages * stage_bytes + cache_bytes, true};
+}
+
+} // namespace nccl_ep::ll::dispatch_tma_smem

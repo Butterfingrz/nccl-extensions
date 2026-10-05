@@ -10,7 +10,7 @@
 #include "../device_primitives.cuh"
 #include "nccl_device.h"
 #include "../ll_ep_adapter.cuh"
-#include "../ll_ep_smem.cuh"
+#include "ll_ep_smem.cuh"
 #include "ll_common.cuh"
 #include "ll_lsa_primitives.cuh"
 #include "ll_mask.cuh"

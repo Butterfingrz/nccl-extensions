@@ -779,6 +779,362 @@ LOW_LATENCY_DISPATCH_LSA_RECV:
         args.outRecvTopkWeights, args.outDataBuf, args.outScalesBuf, args.recvTopkIdxKind, args.recvDataWindow);
 }
 
+// ============================================================================
+// TMA-pipelined variant of the SEND phase above (dispatch_kernel_impl_2sided_rm_lsa_tma). The
+// default LL dispatch kernel for LSA-eligible, unquantized calls (NCCL_EP_DISPATCH_LSA=tma, see
+// jit/ll_dispatch_jit.cuh and NcclEpDispatchLsaMode's doc comment in ll_ep_adapter.cuh).
+// Unquantized (NCCL_EP_DISP_QUANT_NONE) and rank-major only -- unlike
+// dispatch_kernel_impl_2sided_rm_lsa above, this kernel takes no recipe template; the RECV phase
+// below still goes through the shared, recipe-templated recordRecvTokensLsa, instantiated at
+// kRecipe = NCCL_EP_DISP_QUANT_NONE.
+//
+// Design summary:
+//   - Warp 0 alone drives an N-stage software pipeline across this CTA's token range: each stage
+//     is a whole-token shared-memory buffer (payload + header + one mbarrier), TMA-loaded from
+//     args.inData ahead of use and TMA-stored out to each destination rank once ready. N is fixed
+//     per JIT variant (dispatch_tma_smem::choose_config, keyed by hidden/dtype/smem budget only,
+//     NOT by this call's token count -- see that namespace's doc comment in ll_ep_smem.cuh for
+//     why), then clamped at runtime to this CTA's actual token count so a CTA with fewer tokens
+//     than stages never issues a needless prefetch.
+//   - Every other warp (1..numWarps-1) spends the whole SEND phase on the routing-sentinel
+//     (outRecvTopkIdx = -1) init and the next-epoch recv-count-buffer clear, running CONCURRENTLY
+//     with warp 0's entire pipeline (not just its trailing stores) -- idle warps doing this work
+//     from the start, rather than warp 0 doing it serially after its own loop, maximizes overlap.
+//     No extra barrier is needed before syncAndSendCounts: that function already opens with its
+//     own __syncthreads(), which naturally waits for both warp 0's tma_store_wait_complete<0>()
+//     and every other warp's postamble loop to finish.
+//   - Deduplication (which lane -- i.e. which topk slot -- actually owns a given destination rank
+//     for this token) is done via warpFirstTopKOccurence (ll_common.cuh), a register/shuffle-only
+//     operation -- no cross-warp barrier, no global-memory round trip, unlike the per-warp dedup in
+//     dispatchSendTokenLsa above.
+//   - Each smem stage's payload/header must stay valid until every store reading it has completed.
+//     cp.async.bulk's commit-group counters are PER-THREAD, so to make tma_store_wait<N> a
+//     deterministic "this stage is free" check, a single lane (0) issues every winning lane's
+//     (header, payload) stores -- shuffled in from the winners -- and commits ONCE per token
+//     (not once per destination), letting tma_store_wait<kNumStages - 1> below wait on lane 0 alone.
+// ============================================================================
+
+template <int kHidden, int kNumStages, typename TopkIdxT, ncclDataType_t kTokenDtype>
+__forceinline__ __device__ void dispatchSendPhaseLsaTma(
+    const dispatch_kernel_args_t& args,
+    int smId,
+    int warpId,
+    int laneId,
+    int numSms,
+    int numWarps,
+    int numTopk,
+    int numLocalExperts,
+    size_t dispatch_hdr_sz,
+    size_t hiddenBytes,
+    size_t hiddenInt4,
+    void* recvBuf,
+    size_t recvOff,
+    int* nextRecvCntBuf,
+    int* rankSentCnt,
+    uint8_t* smemBase) {
+    // Each token's whole row moves in one TMA transfer, so the only alignment requirement is
+    // numBytesPerMsg % sizeof(int4) == 0, already asserted by the caller
+    // (dispatch_kernel_impl_2sided_rm_lsa_tma).
+    EP_STATIC_ASSERT(kNumStages > 0 && kNumStages < 32, "Invalid stage count (tmaPhase is a 32-bit mask)");
+
+    const size_t hdrSectionBytes = static_cast<size_t>(args.maxTokensPerRank) * dispatch_hdr_sz;
+    const size_t srcRankRegionBytes = static_cast<size_t>(args.maxTokensPerRank) * (dispatch_hdr_sz + hiddenBytes);
+    const size_t stageBytes = hiddenBytes + dispatch_hdr_sz + dispatch_tma_smem::kTmaBarrierAndPaddingBytes;
+    // Rank-pointer cache lives right after the kNumStages-deep stage ring, in the same dynamic
+    // smem allocation (see dispatch_tma_smem::choose_config -- host sizing matches this layout).
+    uint64_t* const rankP2pCache =
+        reinterpret_cast<uint64_t*>(smemBase + static_cast<size_t>(kNumStages) * stageBytes);
+
+    if (warpId == 0) {
+        auto stagePayload = [&](int s) { return reinterpret_cast<int4*>(smemBase + static_cast<size_t>(s) * stageBytes); };
+        auto stageHeader = [&](int s) {
+            return reinterpret_cast<DispatchHdr<NCCL_EP_LAYOUT_RANK_MAJOR>*>(
+                smemBase + static_cast<size_t>(s) * stageBytes + hiddenBytes);
+        };
+        auto stageBarrier = [&](int s) {
+            return reinterpret_cast<uint64_t*>(
+                smemBase + static_cast<size_t>(s) * stageBytes + hiddenBytes + dispatch_hdr_sz);
+        };
+
+        const int numTokensThisCta = nccl_ep::ceil_div(max(args.numTokens - smId, 0), numSms);
+
+        if (numTokensThisCta > 0) {
+            // Resolve each destination rank's P2P header/payload base pointer exactly once per
+            // CTA, concurrently with the mbarrier inits below (independent smem regions, same
+            // warp). ncclGetP2pPtr's result depends only on (currRank, dstRank, recvOff) -- all
+            // loop-invariant for this whole SEND phase -- so recomputing it per (token, winning
+            // lane) below would be pure redundant work: same team-membership check + window-table
+            // lookup, same answer, every time a CTA sends to a rank it's already sent to. Computed
+            // regardless of isRankMasked (matches dispatchSendTokenLsa's ordering: the pointer is
+            // always resolved first, masking only gates whether the store using it is issued).
+            for (int r = laneId; r < args.numRanks; r += 32) {
+                const size_t srcRankOffset =
+                    static_cast<size_t>(relativeRankSlot(args.currRank, r, args.numRanks)) * srcRankRegionBytes;
+                const auto srcRankLocalPtr = reinterpret_cast<uint64_t>(recvBuf) + srcRankOffset;
+                rankP2pCache[r] = ncclGetP2pPtr(
+                    srcRankLocalPtr, recvOff + srcRankOffset, args.currRank, r, args.windows, args.devComm);
+            }
+            // Always init all kNumStages barriers, regardless of numTokensThisCta: the ring is a
+            // fixed kNumStages-deep circular buffer (stage = iter % kNumStages below), not sized
+            // down to the token count. A CTA with fewer tokens than stages simply never reuses a
+            // slot (every token gets its own, no wraparound), rather than using a smaller ring.
+            if (laneId < kNumStages) {
+                mbarrier_init(stageBarrier(laneId), 1);
+                fence_barrier_init();
+            }
+            __syncwarp();
+
+            auto issueLoad = [&](int iter, int stage) {
+                const int tokenIdx = smId + iter * numSms;
+                const auto* srcPtr = static_cast<const int4*>(args.inData) + static_cast<size_t>(tokenIdx) * hiddenInt4;
+                // Single-lane read issue
+                if (laneId == 0) {
+                    tma_load_1d(stagePayload(stage), srcPtr, stageBarrier(stage), static_cast<int>(hiddenBytes));
+                    mbarrier_arrive_and_expect_tx(stageBarrier(stage), static_cast<int>(hiddenBytes));
+                }
+                __syncwarp();
+            };
+
+            // Prefetch only the first token; the loop below issues each subsequent token's load
+            // one iteration ahead of when it's needed (see the reload step at the end of the loop
+            // body), filling the rest of the kNumStages-deep ring as it goes.
+            issueLoad(0, 0);
+
+            uint32_t tmaPhase = 0;
+            for (int iter = 0; iter < numTokensThisCta; ++iter) {
+                const int stage = iter % kNumStages;
+                const int tokenIdx = smId + iter * numSms;
+
+                // a) topk indices into lane registers (lane i <-> topk slot i).
+                const int dstExpertIdx = laneId < numTopk
+                    ? static_cast<int>(
+                          __ldg(static_cast<const TopkIdxT*>(args.inTopkIdx) + static_cast<size_t>(tokenIdx) * numTopk + laneId))
+                    : -1;
+                const int dstRank = getExpertRankIdx(dstExpertIdx, numLocalExperts);
+
+                // b) assemble the header in this stage's smem, one entry per lane.
+                auto* hdr = stageHeader(stage);
+                if (laneId == 0) hdr->token_id = tokenIdx;
+                if (laneId < numTopk) {
+                    hdr->rtr[laneId].expert_id = static_cast<uint16_t>(dstExpertIdx);
+                    hdr->rtr[laneId].topk_weight =
+                        __ldg(args.inTopkWeights + static_cast<size_t>(tokenIdx) * numTopk + laneId);
+                }
+                __syncwarp(); // header entries visible to whichever lane(s) store the whole header below
+
+                // Ensure that header updates are visible to the TMA engine
+                tma_store_fence();
+
+                // c) deduplicate target ranks
+                const bool hasValidSlot = dstExpertIdx >= 0;
+                const int firstOccurrence = warpFirstTopKOccurence(dstExpertIdx, numLocalExperts, laneId);
+                const bool isWinner = hasValidSlot && firstOccurrence >= 0;
+
+                // d) wait for the current stage's payload load to finish, then issue the store(s).
+                mbarrier_wait<true>(stageBarrier(stage), tmaPhase, stage);
+
+                // Every winning (and unmasked) lane resolves its OWN destination addresses in
+                // parallel -- this part is plain global-memory arithmetic/atomics, not a TMA
+                // operation, so it stays per-lane. Slot allocation happens even for a masked
+                // destination (matches dispatchSendTokenLsa's non-TMA ordering: slot numbering must
+                // stay consistent regardless of masking); only the actual store is skipped when
+                // masked, via doStore below.
+                uint8_t* dstHdrSlot = nullptr;
+                void* payloadDst = nullptr;
+                bool doStore = false;
+                if (isWinner) {
+                    // Locally allocate a slot in the remote range reserved for this rank
+                    const int slotIdx = atomicAdd(rankSentCnt + dstRank, 1);
+                    // Resolved once per CTA into rankP2pCache before this loop started (see the
+                    // doc comment there) instead of being recomputed here every iteration.
+                    const uint64_t dstSrcRankP2pPtr = rankP2pCache[dstRank];
+                    doStore = !isRankMasked<true>(args.rankMask, dstRank);
+                    if (doStore) {
+                        EP_DEVICE_ASSERT(dstSrcRankP2pPtr != 0);
+                        auto* dstSrcRankBase = reinterpret_cast<uint8_t*>(dstSrcRankP2pPtr);
+                        dstHdrSlot = dstSrcRankBase + static_cast<size_t>(slotIdx) * dispatch_hdr_sz;
+                        payloadDst = dstSrcRankBase + hdrSectionBytes + static_cast<size_t>(slotIdx) * hiddenBytes;
+                        if (args.recvDataWindow != ncclWindow_t{}) {
+                            const size_t recvSlot =
+                                static_cast<size_t>(args.currRank) * args.maxTokensPerRank + slotIdx;
+                            payloadDst = ncclGetPeerPointer(
+                                args.recvDataWindow, args.recvDataOffset + recvSlot * hiddenBytes, dstRank);
+                        }
+                    }
+                }
+
+                // Loop over topK lanes, picking the winning ones using mask
+                // Use warp-shuffling to deliver required information from the
+                // owning lane to the issuing lane (lane 0)
+                const uint32_t winnerStoreMask = __ballot_sync(0xffffffffu, doStore);
+                if (winnerStoreMask != 0) {
+                    for (int srcLane = 0; srcLane < numTopk; ++srcLane) {
+                        if ((winnerStoreMask >> srcLane) & 1u) {
+                            const uint64_t hdrSlotW =
+                                __shfl_sync(0xffffffffu, reinterpret_cast<uint64_t>(dstHdrSlot), srcLane);
+                            const uint64_t payloadW =
+                                __shfl_sync(0xffffffffu, reinterpret_cast<uint64_t>(payloadDst), srcLane);
+                            if (laneId == 0) {
+                                tma_store_1d_no_commit(
+                                    hdr, reinterpret_cast<void*>(hdrSlotW), static_cast<int>(dispatch_hdr_sz));
+                                tma_store_1d_no_commit(
+                                    stagePayload(stage), reinterpret_cast<void*>(payloadW),
+                                    static_cast<int>(hiddenBytes));
+                            }
+                        }
+                    }
+                }
+                // Issue commit-group on per-token basis (irrespective of actual sends)
+                // to keep the pipeline synchronization correct
+                if (laneId == 0) tma_store_commit_group();
+
+                const int nextIter = iter + 1;
+                const bool willReload = nextIter < numTokensThisCta;
+                if (willReload) {
+                    const int nextStage = nextIter % kNumStages;
+                    // nextStage's previous occupant (if any) was nextIter - kNumStages, i.e.
+                    // kNumStages iterations before nextIter -- tma_store_wait<kNumStages - 1>
+                    // always correctly bounds that, regardless of numTokensThisCta, because the
+                    // ring is always exactly kNumStages deep (see the mbarrier_init comment
+                    // above): there's no separate "active" ring size to track or get out of sync
+                    // with this compile-time wait bound.
+                    //
+                    // Lane 0 waits for all issued stores to
+                    // allocate the stage for the next load
+                    if (laneId == 0) {
+                        tma_store_wait<kNumStages - 1>();
+                    }
+                    __syncwarp();
+                    // Prefetch-issue another token if not done
+                    issueLoad(nextIter, nextStage);
+                }
+            }
+
+            // Ensure that all stores are visible at NVL-level (not just read from smem)
+            // before signalling remote peers that the data is ready
+            tma_store_wait_complete<0>();
+            __syncwarp();
+
+            if (laneId < kNumStages) {
+                mbarrier_inval(stageBarrier(laneId));
+                fence_barrier_init();
+            }
+            __syncwarp();
+        }
+    } else {
+        // Use available warps to clean the workspace for the next operation
+        const int postThreadId = (warpId - 1) * 32 + laneId;
+        const int numPostThreads = (numWarps - 1) * 32;
+        const size_t totalTopkEntries = static_cast<size_t>(args.numRanks) * args.maxTokensPerRank * numTopk;
+        const size_t totalThreads = static_cast<size_t>(numSms) * numPostThreads;
+        const size_t globalIdx = static_cast<size_t>(smId) * numPostThreads + postThreadId;
+        const int4 negOnesInt4 = make_int4(-1, -1, -1, -1);
+        // outRecvTopkIdx is a caller-owned output tensor (ncclEpDispatchOutputs_t::topk_idx);
+        // ncclEpDispatch only validates its ndim/datatype, not 16-byte alignment, so the int4
+        // vector path below is only safe when the caller's pointer happens to be aligned for it.
+        if ((reinterpret_cast<uintptr_t>(args.outRecvTopkIdx) & 0xF) == 0) {
+            int4* const outRecvTopkIdxVec4 = reinterpret_cast<int4*>(args.outRecvTopkIdx);
+            const size_t totalTopkEntriesVec4 = totalTopkEntries / 4;
+            for (size_t i = globalIdx; i < totalTopkEntriesVec4; i += totalThreads) {
+                outRecvTopkIdxVec4[i] = negOnesInt4;
+            }
+            // Scalar tail for the (totalTopkEntries % 4) elements the vectorized loop above can't reach.
+            for (size_t i = totalTopkEntriesVec4 * 4 + globalIdx; i < totalTopkEntries; i += totalThreads) {
+                args.outRecvTopkIdx[i] = -1;
+            }
+        } else {
+            for (size_t i = globalIdx; i < totalTopkEntries; i += totalThreads) {
+                args.outRecvTopkIdx[i] = -1;
+            }
+        }
+        EP_DEVICE_ASSERT(numSms > 1);
+        if (smId == 0) {
+            cleanNextRecvCntBufLsa(nextRecvCntBuf, args.nextRecvCntBufSize, postThreadId, numPostThreads);
+        }
+    }
+}
+
+template <int kHidden, int kNumTopk, int kNumStages, typename TopkIdxT, ncclDataType_t kTokenDtype>
+__device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa_tma(const dispatch_kernel_args_t& args) {
+    EP_STATIC_ASSERT(kNumTopk > 0 && kNumTopk <= 32, "LL dispatch TMA top-k must fit one warp's lanes");
+    extern __shared__ __align__(1024) uint8_t dispatchTmaSmem[];
+    static constexpr ncclEpLayout_t kLayout = NCCL_EP_LAYOUT_RANK_MAJOR;
+    constexpr int numTopk = kNumTopk;
+
+    const auto smId = static_cast<int>(blockIdx.x);
+    const auto threadId = static_cast<int>(threadIdx.x);
+    const auto warpId = threadId / 32, laneId = get_lane_id();
+    const auto numSms = static_cast<int>(gridDim.x);
+    const auto numWarps = args.numWarpGroups * args.numWarpsPerGroup;
+    const auto numLocalExperts = args.numExperts / args.numRanks;
+    const auto warpGroupId = warpId / args.numWarpsPerGroup;
+    const auto subWarpId = warpId % args.numWarpsPerGroup;
+    const auto responsibleExpertIdx = smId * args.numWarpGroups + warpGroupId;
+
+    const unsigned int epoch = selectLowLatencyEpoch(args.epochState, args.phases, smId, threadId);
+    const size_t bank = static_cast<size_t>(epoch & 1U);
+    const size_t bank_next = bank ^ 1U;
+    const size_t recvOff = args.recvOff + bank * args.payloadSlotStride;
+    const size_t recvCntOff = args.recvCntOff + bank * args.signalSlotStride;
+    char* const rdmaBase = static_cast<char*>(args.rdmaBuf);
+    void* const recvBuf = rdmaBase + recvOff;
+    int* const recvCntBuf = reinterpret_cast<int*>(rdmaBase + recvCntOff);
+    int* const nextRecvCntBuf =
+        reinterpret_cast<int*>(rdmaBase + args.recvCntOff + bank_next * args.signalSlotStride);
+
+    auto rankSentCnt = args.rankSentCnt;
+
+    const size_t hiddenBytes = static_cast<size_t>(kHidden) * size_u8<kTokenDtype>();
+    const size_t hiddenInt4 = hiddenBytes / sizeof(int4);
+
+    // Message package: header + token data (no scale payload, unquantized).
+    const size_t dispatch_hdr_sz = get_dispatch_hdr_sz<kLayout>(numTopk);
+    const size_t numBytesPerMsg = dispatch_hdr_sz + hiddenBytes;
+
+    EP_DEVICE_ASSERT(numBytesPerMsg % sizeof(int4) == 0);
+
+    // Set by syncAndSendCounts below; declared (and default-initialized) here so it's still in
+    // scope, and safely readable, at the RECV label below even for a RECV-only call that jumps
+    // straight past the SEND phase via the goto immediately below.
+    bool isLastCta = false;
+
+    // Sending phase
+    if ((args.phases & LOW_LATENCY_SEND_PHASE) == 0) {
+        goto LOW_LATENCY_DISPATCH_LSA_TMA_RECV;
+    }
+
+    dispatchSendPhaseLsaTma<kHidden, kNumStages, TopkIdxT, kTokenDtype>(
+        args, smId, warpId, laneId, numSms, numWarps, numTopk, numLocalExperts, dispatch_hdr_sz, hiddenBytes,
+        hiddenInt4, recvBuf, recvOff, nextRecvCntBuf, rankSentCnt, dispatchTmaSmem);
+
+    isLastCta = syncAndSendCounts(
+        warpId, numWarps, laneId, args.rankDone, numSms, args.numRanks, rankSentCnt, args.currRank, recvCntBuf,
+        recvCntOff, args.rankMask, args.windows, args.devComm);
+
+LOW_LATENCY_DISPATCH_LSA_TMA_RECV:
+    if ((args.phases & LOW_LATENCY_RECV_PHASE) == 0) return;
+
+    // Split invocation (SEND phase didn't run here): syncAndSendCounts never
+    // elected anyone, so nominate smId == 0 instead.
+    if ((args.phases & LOW_LATENCY_SEND_PHASE) == 0) {
+        isLastCta = (smId == 0);
+    }
+
+    // RECV-phase tail, unquantized/rank-major only. No rankSentCnt/rankDone reset here: that's
+    // already done by syncAndSendCounts's elected last CTA (see its doc comment).
+    completeFullLowLatencyEpoch(args.epochState, args.phases, isLastCta, threadId);
+
+    syncAndRecvCounts(
+        threadId, args.numRanks, args.rankMask, recvCntBuf, args.timeoutCycles, args.currRank, args.asyncErrorFlag);
+
+    recordRecvTokensLsa<NCCL_EP_DISP_QUANT_NONE>(
+        responsibleExpertIdx, args.numExperts, numLocalExperts, laneId, subWarpId, args.numWarpsPerGroup, numTopk,
+        args.numRanks, args.currRank, args.maxTokensPerRank, numBytesPerMsg, dispatch_hdr_sz, hiddenInt4, hiddenBytes,
+        /*scaleBytes=*/0, args.rankMask, recvCntBuf, recvBuf, args.outSrcInfo, args.outRecvRankCounter,
+        args.outRecvTopkIdx, args.outRecvTopkWeights, args.outDataBuf, /*outScalesBuf=*/nullptr,
+        args.recvTopkIdxKind, args.recvDataWindow);
+}
+
 } // namespace ll
 
 } // namespace nccl_ep
