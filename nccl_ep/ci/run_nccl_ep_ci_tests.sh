@@ -123,6 +123,16 @@ run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
   --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 \
   --dispatch-num-sms 21 --combine-num-sms 23 --validate
 
+# GPT-OSS uses BF16 H=2880, which ends in a partial dispatch and combine warp.
+# Rank-major exercises the optimized LSA kernel; expert-major forces the general
+# kernel so both implementations retain partial-warp support.
+for layout in rm em; do
+  run_nccl_ep_srun "$EP_BENCH" "$BENCH_TIME" \
+    --algorithm low-latency --layout "$layout" --tokens 1 --hidden 2880 --top-k 4 --experts 128 \
+    --datatype bf16 --topk-idx-int32 --validate
+done
+
+
 # Exact LL top-k specialization at the dispatch geometry boundary (31 forwarding
 # warps plus one control warp). Keep this targeted smoke test at the canonical
 # small-batch BF16 configuration rather than multiplying the full layout × batch

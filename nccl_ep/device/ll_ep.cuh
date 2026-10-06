@@ -623,7 +623,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     if (warpId < numWarps - 1) {
         // QUANT_FWD reads raw wire payloads as aligned int4 vectors.
         constexpr int kNumElemsPerRead = sizeof(int4) / size_u8<kTokenDtype>();
-        if constexpr (kRecipe != NCCL_EP_DISP_QUANT_FWD) {
+        if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
             EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
         }
         if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
@@ -1186,27 +1186,33 @@ __forceinline__ __device__ void decodeAndAccumulate(
     const float& logAmax,
     const float& logAmin,
     const bool& enableCast,
-    const float& weight) {
+    const float& weight,
+    int validUnrolls) {
     if (enableCast) {
         logfmtDecodeAccumulate<kNumRecvUnrolls>(ldBuffer, accum, logAmax, logAmin, weight);
     } else if constexpr (kTokenDtype == ncclFloat32) {
 #pragma unroll
         for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
-            accum[k] += *reinterpret_cast<float*>(ldBuffer + k) * weight;
+            if (k < validUnrolls * 4)
+                accum[k] += *reinterpret_cast<float*>(ldBuffer + k) * weight;
         }
     } else if constexpr (kTokenDtype == ncclFloat16) {
 #pragma unroll
         for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
-            auto fp16Pack = *reinterpret_cast<__half2*>(ldBuffer + k);
-            accum[k * 2 + 0] += static_cast<float>(fp16Pack.x) * weight;
-            accum[k * 2 + 1] += static_cast<float>(fp16Pack.y) * weight;
+            if (k < validUnrolls * 4) {
+                auto fp16Pack = *reinterpret_cast<__half2*>(ldBuffer + k);
+                accum[k * 2 + 0] += static_cast<float>(fp16Pack.x) * weight;
+                accum[k * 2 + 1] += static_cast<float>(fp16Pack.y) * weight;
+            }
         }
     } else {
 #pragma unroll
         for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
-            auto bf16Pack = *reinterpret_cast<__nv_bfloat162*>(ldBuffer + k);
-            accum[k * 2 + 0] += static_cast<float>(bf16Pack.x) * weight;
-            accum[k * 2 + 1] += static_cast<float>(bf16Pack.y) * weight;
+            if (k < validUnrolls * 4) {
+                auto bf16Pack = *reinterpret_cast<__nv_bfloat162*>(ldBuffer + k);
+                accum[k * 2 + 0] += static_cast<float>(bf16Pack.x) * weight;
+                accum[k * 2 + 1] += static_cast<float>(bf16Pack.y) * weight;
+            }
         }
     }
 }
@@ -1764,7 +1770,6 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
     constexpr int kNumSendUnrolls = combine_smem::send_unrolls(kHidden, kElemBytes);
     constexpr int kNumRecvUnrolls = combine_smem::kNumRecvUnrolls;
     constexpr int hiddenBf16Int4Pad = align(static_cast<int>(hiddenBf16Int4), kWarpSize * kNumSendUnrolls);
-    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4) == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
     EP_STATIC_ASSERT(hiddenBf16Int4 % kNumSendUnrolls == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
@@ -1779,7 +1784,9 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
         EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumSendUnrolls * kNumElemsPerInt4) == 0,
                          "NVFP4 combine requires whole send iterations");
     }
-    EP_STATIC_ASSERT(kHidden % kLogFmtElementsPerMeta == 0, "Invalid hidden");
+    EP_STATIC_ASSERT(
+        !kUseLogFMT || kHidden % (kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4) == 0,
+        "LogFMT combine requires whole receive warps");
     constexpr int kNumDivisions = kHidden / kLogFmtElementsPerMeta;
     // Preserve the legacy NONE packet layout, including its metadata tail.
     constexpr int kNumMetaBytes =
@@ -1788,7 +1795,9 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
         if constexpr (kRecipe == NCCL_EP_COMB_QUANT_NVFP4) {
             return Recipe::template slot_bytes<kHidden>();
         }
-        return static_cast<size_t>(kHidden * kElemBytes + kHidden / kLogFmtElementsPerMeta * sizeof(nv_bfloat162));
+        constexpr size_t bytes =
+            kHidden * kElemBytes + kHidden / kLogFmtElementsPerMeta * sizeof(nv_bfloat162);
+        return align(bytes, sizeof(int4));
     }();
     EP_STATIC_ASSERT(numBytesPerSlot % sizeof(int4) == 0, "Invalid vectorization");
 
@@ -1819,8 +1828,9 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
         constexpr int kNumPrefetch = combine_smem::kNumTmaPrefetch;
         EP_STATIC_ASSERT(kNumStages == 3 and kNumPrefetch == 1, "Invalid stages");
 
-        auto smemPtr = smemBuffer +
-            warpId * (kNumStages * (kNumTMABufferBytes + combine_smem::kTmaBarrierAndPaddingBytes) + kNumMetaBytes);
+        constexpr int kSendWarpSmemBytes = combine_smem::send_warp_smem_bytes(kHidden, kElemBytes);
+        EP_STATIC_ASSERT(kSendWarpSmemBytes % sizeof(int4) == 0, "Misaligned send-warp stride");
+        auto smemPtr = smemBuffer + warpId * kSendWarpSmemBytes;
         uint32_t tmaPhase = 0;
         auto tmaBuffers = PatternVisitor(
             [=](const int& i) {
@@ -2060,7 +2070,6 @@ LOW_LATENCY_COMBINE_RECV:
     const int numGroups = min(kMaxNumGroups, (numThreads / kWarpSize) / warpsPerRecvGroup);
     const int decodeWarpIdx = __shfl_sync(0xffffffff, warpId % warpsPerRecvGroup, 0);
     const int groupIdx = __shfl_sync(0xffffffff, warpId / warpsPerRecvGroup, 0);
-    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumElemsPerInt4) == 0, "Invalid vectorization");
     EP_DEVICE_ASSERT(numTopk <= kWarpSize);
     EP_DEVICE_ASSERT(numGroups > 0);
 
@@ -2073,12 +2082,13 @@ LOW_LATENCY_COMBINE_RECV:
             return combine_smem::recv_tma_buffer_bytes(kHidden, kElemBytes, /*nvfp4=*/false);
         }();
         constexpr int kNumBF16PerWarpBytes = kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4 * kElemBytes;
+        constexpr int kPaddedTokenBytes = hiddenBf16Int4Pad * sizeof(int4);
         constexpr int kNumLogFMTPerWarpBytes =
             kNumBF16PerWarpBytes / combine_smem::kLogFmtInputBytesPerChunk * combine_smem::kLogFmtOutputBytesPerChunk;
         constexpr int kNumDivisionBytes = kNumDivisions * sizeof(uint32_t);
         constexpr int kNumBytesPerGroup =
-            kNumStages * kNumTMABufferBytes + kHidden * kElemBytes +
-            kNumStages * kNumDivisionBytes * combine_smem::kNumRecvMetaBuffers;
+            combine_smem::recv_group_smem_bytes(kHidden, kElemBytes, kRecipe == NCCL_EP_COMB_QUANT_NVFP4);
+        EP_STATIC_ASSERT(kNumBytesPerGroup % sizeof(int4) == 0, "Misaligned receive-group stride");
 
         // Reallocate shared memory
         const auto smemGroupBuffer = smemBuffer + kNumBytesPerGroup * groupIdx;
@@ -2100,7 +2110,7 @@ LOW_LATENCY_COMBINE_RECV:
         });
 
         // Redundant when logfmt is disabled
-        const auto smemGroupPtr = smemGroupBuffer + kNumStages * kNumTMABufferBytes + kHidden * kElemBytes;
+        const auto smemGroupPtr = smemGroupBuffer + kNumStages * kNumTMABufferBytes + kPaddedTokenBytes;
         auto logAmaxBuffers = PatternVisitor(
             [=](const int& i) { return reinterpret_cast<float*>(smemGroupPtr + i * kNumDivisionBytes); });
         auto logAminBuffers = PatternVisitor([=](const int& i) {
@@ -2166,8 +2176,12 @@ LOW_LATENCY_COMBINE_RECV:
                                 const auto& info = castInfoBuffers[stageIdx][numDecodeWarps - 1];
                                 numCasted = (info >> 1) + (info & 1);
                             }
-                            numTmaBytes =
-                                numCasted * kNumLogFMTPerWarpBytes + (numDecodeWarps - numCasted) * kNumBF16PerWarpBytes;
+                            if constexpr (kUseLogFMT) {
+                                numTmaBytes = numCasted * kNumLogFMTPerWarpBytes +
+                                              (numDecodeWarps - numCasted) * kNumBF16PerWarpBytes;
+                            } else {
+                                numTmaBytes = kHidden * kElemBytes;
+                            }
                             tmaSrc += kUseLogFMT ? kNumMetaBytes : 0;
                         }
                         tma_load_1d(
@@ -2242,9 +2256,13 @@ LOW_LATENCY_COMBINE_RECV:
                             logAmaxBuffers[stageIdx][divisionIdx],
                             logAminBuffers[stageIdx][divisionIdx],
                             enableCast,
-                            topkWeight);
+                            topkWeight,
+                            kNumRecvUnrolls);
                     } else {
                         int tmaOffset = kNumBF16PerWarpBytes * decodeWarpIdx;
+                        const int firstInt4 = (decodeWarpIdx * kWarpSize + laneId) * kNumRecvUnrolls;
+                        const int validUnrolls = max(0, min(kNumRecvUnrolls,
+                                                           static_cast<int>(hiddenBf16Int4) - firstInt4));
                         decodeAndAccumulate<kNumRecvUnrolls, kTokenDtype>(
                             reinterpret_cast<uint32_t*>(
                                 tmaLdBuffers[stageIdx] + tmaOffset + kNumBF16PerWarpBytes / 32 * laneId),
@@ -2252,7 +2270,8 @@ LOW_LATENCY_COMBINE_RECV:
                             0,
                             0,
                             false,
-                            topkWeight);
+                            topkWeight,
+                            validUnrolls);
                     }
 
                     // Order generic-proxy reads before releasing the stage to the async TMA producer.
@@ -2279,10 +2298,13 @@ LOW_LATENCY_COMBINE_RECV:
                 }
                 tma_store_fence();
                 if (elect_one_sync()) {
+                    const int storeOffsetInt4 = decodeWarpIdx * kNumRecvUnrolls * kWarpSize;
+                    const int storeBytes = min(kNumBF16PerWarpBytes,
+                                               static_cast<int>((hiddenBf16Int4 - storeOffsetInt4) * sizeof(int4)));
                     tma_store_1d(
                         tmaStBuffers[decodeWarpIdx],
-                        static_cast<int4*>(outData) + tokenIdx * hiddenBf16Int4 + decodeWarpIdx * kNumRecvUnrolls * 32,
-                        kNumBF16PerWarpBytes);
+                        static_cast<int4*>(outData) + tokenIdx * hiddenBf16Int4 + storeOffsetInt4,
+                        storeBytes);
                 }
                 __syncwarp();
             }

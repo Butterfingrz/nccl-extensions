@@ -6184,7 +6184,6 @@ ncclResult_t ncclEpCombine(
             assert(x->sizes[0] == static_cast<unsigned>(num_ranks));
             assert(x->sizes[1] == static_cast<unsigned>(num_max_dispatch_tokens_per_rank));
             assert(x->sizes[2] % sizeof(int4) == 0);
-            assert(x->sizes[2] % 128 == 0);
             hidden = static_cast<int>(x->sizes[2]);
             break;
         default:
@@ -6192,7 +6191,6 @@ ncclResult_t ncclEpCombine(
             assert(x->sizes[0] == num_experts / num_ranks);
             assert(x->sizes[1] == static_cast<unsigned>(num_ranks) * num_max_dispatch_tokens_per_rank);
             assert(x->sizes[2] % sizeof(int4) == 0);
-            assert(x->sizes[2] % 128 == 0);
             hidden = static_cast<int>(x->sizes[2]);
             break;
         }

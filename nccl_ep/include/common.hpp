@@ -333,7 +333,8 @@ struct LowLatencyLayout {
 
         size_t disp_hdr_sz = ll::get_dispatch_hdr_sz(num_topk, layout);
         size_t num_bytes_per_dispatch_msg = disp_hdr_sz + max_token_bytes;
-        size_t num_bytes_per_combine_msg = scale_metadata_bytes + max_token_bytes;
+        size_t num_bytes_per_combine_msg =
+            align<size_t>(scale_metadata_bytes + max_token_bytes, sizeof(int4));
 
         // Per-op send and recv sizes.
         // Combine send buffer holds one slot per outbound message produced on

@@ -634,7 +634,9 @@ __forceinline__ __device__ void dispatchSendPhaseLsa(
     // 2. The last warp for reading `topk_idx` and count for per-expert information
     if (warpId < numWarps - 1) {
         constexpr int kNumElemsPerRead = sizeof(int4) / size_u8<kTokenDtype>();
-        EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
+        if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
+            EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
+        }
         if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
             EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kDsFp8E3M4ElementsPerScale == 0,
                              "Invalid DS_FP8E3M4 vectorization");

@@ -77,8 +77,9 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
     const uint8_t* inScales = nullptr,  // QUANT_FWD: raw scale bytes for this token
     int scaleBytes = 0) {               // QUANT_FWD: total bytes to copy
 
-    // Generated and unquantized paths retain their full-warp vector contract.
-    if constexpr (kRecipe != NCCL_EP_DISP_QUANT_FWD) {
+    // DS_FP8E3M4 derives scales with fixed half-warp groups. Plain vector
+    // copies do not require a whole warp and may finish with a partial warp.
+    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
         EP_DEVICE_ASSERT(hiddenBf16Int4 % 32 == 0);
     }
 #pragma unroll
@@ -128,4 +129,3 @@ __forceinline__ __device__ void castAndWriteToSendBuf(
 
 } // namespace ll
 } // namespace nccl_ep
-

@@ -79,6 +79,45 @@ TEST(LlCombineSmem, AcceptsExactSharedMemoryBoundary) {
     EXPECT_EQ(config.dynamic_smem_bytes, exact_limit);
 }
 
+TEST(LlCombineSmem, PadsGptOssHiddenForPartialDecodeWarp) {
+    constexpr int kHidden = 2880;
+    constexpr int kElemBytes = nccl_ep::ll::combine_smem::kTwoByteElementBytes;
+    constexpr int kPaddedHiddenInt4 = nccl_ep::ll::combine_smem::padded_hidden_int4(kHidden, kElemBytes);
+
+    EXPECT_EQ(kHidden * kElemBytes / sizeof(int4), 360);
+    EXPECT_EQ(kPaddedHiddenInt4, 384);
+    EXPECT_EQ(nccl_ep::ll::combine_smem::recv_decode_warps(kHidden, kElemBytes), 6);
+    const int send_warp_bytes = nccl_ep::ll::combine_smem::send_warp_smem_bytes(kHidden, kElemBytes);
+    EXPECT_EQ(send_warp_bytes, 3216);
+    EXPECT_EQ(send_warp_bytes % sizeof(int4), 0);
+    EXPECT_EQ((2 * send_warp_bytes) % sizeof(int4), 0);
+    const int recv_group_bytes =
+        nccl_ep::ll::combine_smem::recv_group_smem_bytes(kHidden, kElemBytes, /*nvfp4=*/false);
+    EXPECT_EQ(recv_group_bytes, 25472);
+    EXPECT_EQ(recv_group_bytes % sizeof(int4), 0);
+    EXPECT_EQ((2 * recv_group_bytes) % sizeof(int4), 0);
+
+    const auto config = nccl_ep::ll::choose_combine_smem_config(
+        kHidden,
+        ncclBfloat16,
+        NCCL_EP_COMB_QUANT_NONE,
+        /*num_warp_groups=*/1,
+        /*requested_warps_per_group=*/32,
+        /*max_dynamic_smem=*/1024 * 1024);
+    ASSERT_TRUE(config.feasible);
+    EXPECT_GT(config.num_recv_groups, 0);
+
+    const nccl_ep::LowLatencyLayout layout(
+        /*num_max_dispatch_tokens_per_rank=*/1,
+        /*max_token_bytes=*/kHidden * kElemBytes,
+        /*num_ranks=*/2,
+        /*num_experts=*/128,
+        /*num_topk=*/4,
+        NCCL_EP_LAYOUT_RANK_MAJOR);
+    EXPECT_EQ(layout.buffer.num_bytes_per_combine_msg, 5856);
+    EXPECT_EQ(layout.buffer.num_bytes_per_combine_msg % sizeof(int4), 0);
+}
+
 TEST(LlCombineSmem, RejectsConfigurationsBelowMinimumFootprint) {
     const auto config = nccl_ep::ll::choose_combine_smem_config(
         /*hidden=*/7168,

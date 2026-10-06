@@ -79,19 +79,32 @@ constexpr int nvfp4_slot_bytes(int hidden) {
         hidden / kNvfp4ElementsPerPackedByte + hidden / kNvfp4ElementsPerScale + kNvfp4GlobalScaleBytes);
 }
 
-constexpr int send_smem_bytes(int hidden, int elem_bytes, int num_warps) {
+constexpr int send_warp_smem_bytes(int hidden, int elem_bytes) {
     const int tma_bytes = kWarpSize * static_cast<int>(sizeof(int4)) * send_unrolls(hidden, elem_bytes) +
                           kTmaBarrierAndPaddingBytes;
-    return num_warps * (kNumStages * tma_bytes + meta_bytes(hidden));
+    // Each warp owns TMA buffers followed by a 4-byte-granular metadata tail.
+    // Round the complete stride so every warp's first TMA buffer remains aligned.
+    return align_to_int4(kNumStages * tma_bytes + meta_bytes(hidden));
+}
+
+constexpr int send_smem_bytes(int hidden, int elem_bytes, int num_warps) {
+    return num_warps * send_warp_smem_bytes(hidden, elem_bytes);
 }
 
 constexpr int recv_tma_buffer_bytes(int hidden, int elem_bytes, bool nvfp4) {
-    return kRecvTmaBarrierBytes + (nvfp4 ? nvfp4_slot_bytes(hidden) : kRecvTmaPaddingBytes + hidden * elem_bytes);
+    const int padded_token_bytes = padded_hidden_int4(hidden, elem_bytes) * static_cast<int>(sizeof(int4));
+    return kRecvTmaBarrierBytes + (nvfp4 ? nvfp4_slot_bytes(hidden) : kRecvTmaPaddingBytes + padded_token_bytes);
 }
 
 constexpr int recv_group_smem_bytes(int hidden, int elem_bytes, bool nvfp4) {
     const int tma_bytes = recv_tma_buffer_bytes(hidden, elem_bytes, nvfp4);
-    return kNumStages * tma_bytes + hidden * elem_bytes + kNumStages * meta_bytes(hidden) * kNumRecvMetaBuffers;
+    const int padded_token_bytes = padded_hidden_int4(hidden, elem_bytes) * static_cast<int>(sizeof(int4));
+    // Every receive group contains TMA barriers and bulk-copy buffers. Keep the
+    // group stride int4-aligned so group 1+ has the same alignment as group 0.
+    // The metadata tail is only 4-byte granular and can otherwise leave the
+    // next group 8 bytes off a TMA-compatible address (for example H=2880).
+    return align_to_int4(
+        kNumStages * tma_bytes + padded_token_bytes + kNumStages * meta_bytes(hidden) * kNumRecvMetaBuffers);
 }
 
 constexpr int dynamic_smem_bytes(int hidden, int elem_bytes, int num_warps, int num_recv_groups, bool nvfp4) {
