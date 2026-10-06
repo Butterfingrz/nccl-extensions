@@ -41,6 +41,11 @@ TEST_BINARIES := $(DST_DIR)/test_output_layout $(DST_DIR)/test_handle_maps $(DST
 .PHONY: all clean
 all: $(TEST_BINARIES)
 
+# The compact-order fixture directly probes the private decoder and saved positions.
+$(DST_DIR)/test_ht_compact_prob: NVLDFLAGS := $(NCCL_EP_LIBDIR)/libnccl_ep.a $(filter-out -lnccl_ep,$(NVLDFLAGS))
+$(DST_DIR)/test_ht_compact_prob: $(NCCL_EP_LIBDIR)/libnccl_ep.a
+$(DST_DIR)/test_ht_compact_prob.o: $(NCCL_EP_SRCDIR)/device/ht_ep_adapter.cuh $(NCCL_EP_SRCDIR)/ht_compact_prob.h
+
 # This test also probes the private TMA setup helper used by group creation.
 $(DST_DIR)/test_ht_dispatch_async: NVLDFLAGS := $(NCCL_EP_LIBDIR)/libnccl_ep.a $(filter-out -lnccl_ep,$(NVLDFLAGS))
 $(DST_DIR)/test_ht_dispatch_async: $(NCCL_EP_LIBDIR)/libnccl_ep.a

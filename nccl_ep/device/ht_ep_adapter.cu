@@ -17,6 +17,7 @@
 #include "jit/ht_dispatch_jit.cuh"
 #include "jit/ht_lsa_sync_jit.cuh"
 #include "jit/preprocess_jit.cuh"
+#include "jit/ht_compact_prob_jit.cuh"
 #include "ht_compact_prob.h"
 
 #include <algorithm>
@@ -537,83 +538,15 @@ void dispatch_prob_input_to_compact(
 template void dispatch_prob_input_to_compact<int32_t>(const int32_t*, const float*, float*, int, int, int, int, cudaStream_t);
 template void dispatch_prob_input_to_compact<int64_t>(const int64_t*, const float*, float*, int, int, int, int, cudaStream_t);
 
-__device__ __forceinline__ int compact_find_pos(const float* row, int topk, int global_expert) {
-    // Called only after LERM establishes a real payload. Loading the ID word
-    // as float is bit preserving: no FP arithmetic is applied to these bytes.
-    for (int k = 0; k < topk; ++k) {
-        const uint32_t word = __float_as_uint(row[topk + k / 2]);
-        const uint16_t id = static_cast<uint16_t>(word >> (16 * (k & 1)));
-        if (id == global_expert) return k;
-    }
-    // A selected expert missing from its token IDs is a protocol mismatch,
-    // not padding: do not silently pretend its real weight was zero.
-    EP_DEVICE_ASSERT(false);
-    return -1;
-}
-
-template <typename PosT>
-__global__ void dispatch_prob_compact_to_output_kernel(
-    const float* __restrict__ wire_prob,
-    const bool* __restrict__ local_expert_routing_map,
-    PosT* __restrict__ wire_prob_pos,
-    float* __restrict__ recv_topk_weights,
-    int64_t* __restrict__ recv_topk_idx,
-    int num_recv_tokens, const int32_t* num_recv_tokens_dev,
-    int topk, int experts_per_rank, int wire_prob_floats,
-    int global_expert_offset, ncclEpExpertIdKind_t recv_topk_idx_kind, bool expert_major,
-    bool lerm_bitmap) {
-    for (size_t token = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         token < static_cast<size_t>(num_recv_tokens);
-         token += static_cast<size_t>(gridDim.x) * blockDim.x) {
-        if (token >= static_cast<size_t>(*num_recv_tokens_dev)) break;
-        int k_out = 0;
-        const int lerm_words = nccl_ep::bit_words(experts_per_rank);
-        const uint64_t* lerm_bits = reinterpret_cast<const uint64_t*>(local_expert_routing_map);
-        // Padding has no payload: only search inline IDs after LERM establishes
-        // a real expert. The saved original-k map lives with this handle for BWD.
-        constexpr PosT invalid_pos = static_cast<PosT>(-1);
-        if (expert_major) {
-            wire_prob_pos[token] = invalid_pos;
-            recv_topk_weights[token] = 0.0f;
-        }
-        for (int e = 0; e < experts_per_rank && k_out < topk; ++e) {
-            const bool routed = lerm_bitmap ?
-                nccl_ep::test_bit(lerm_bits + token * lerm_words, e) :
-                local_expert_routing_map[token * experts_per_rank + e];
-            if (!routed) continue;
-            const int global_expert = global_expert_offset + e;
-            const float* row = wire_prob + token * wire_prob_floats;
-            const int source_k = compact_find_pos(row, topk, global_expert);
-            if (source_k < 0) continue; // assertion above diagnosed a protocol mismatch
-            if (expert_major) {
-                wire_prob_pos[token] = static_cast<PosT>(source_k);
-                recv_topk_weights[token] = row[source_k];
-                break;
-            }
-            const size_t output = token * topk + k_out++;
-            wire_prob_pos[output] = static_cast<PosT>(source_k);
-            recv_topk_weights[output] = row[source_k];
-            if (recv_topk_idx) recv_topk_idx[output] =
-                recv_topk_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL ? global_expert : e;
-        }
-        if (!expert_major) {
-            for (; k_out < topk; ++k_out) {
-                const size_t output = token * topk + k_out;
-                wire_prob_pos[output] = invalid_pos;
-                recv_topk_weights[output] = 0.0f;
-                if (recv_topk_idx) recv_topk_idx[output] = -1;
-            }
-        }
-    }
-}
-
 void dispatch_prob_compact_to_output(
     const float* wire_prob, const bool* local_expert_routing_map,
     void* wire_prob_pos,
     float* recv_topk_weights, int64_t* recv_topk_idx, int num_recv_tokens,
     const int32_t* num_recv_tokens_dev,
     int topk, int experts_per_rank, int wire_prob_floats, int global_expert_offset,
-    ncclEpExpertIdKind_t recv_topk_idx_kind, bool expert_major, bool lerm_bitmap, cudaStream_t stream) {
+    ncclEpExpertIdKind_t recv_topk_idx_kind, bool expert_major, bool lerm_bitmap,
+    const int64_t* expert_token_offsets, const int32_t* per_expert_counts_active,
+    int32_t* flat_expert_ids, bool topk_order, cudaStream_t stream) {
     assert(topk > 0 && topk <= kCompactMaxExperts &&
            wire_prob_floats >= dispatch_compact_prob_row_floats(topk));
     assert(global_expert_offset >= 0 && experts_per_rank >= 0 &&
@@ -622,17 +555,29 @@ void dispatch_prob_compact_to_output(
            recv_topk_idx_kind == NCCL_EP_EXPERT_ID_GLOBAL);
     if (num_recv_tokens <= 0) return;
     assert(wire_prob_pos != nullptr && recv_topk_weights != nullptr);
-    constexpr int block_threads = 256;
+    assert(!expert_major || (expert_token_offsets != nullptr && per_expert_counts_active != nullptr));
+    constexpr int block_threads = jit::kCompactProbOutputThreads;
     const int grid = (num_recv_tokens - 1) / block_threads + 1;
-    const auto launch = [&](auto tag) {
-        using PosT = decltype(tag);
-        dispatch_prob_compact_to_output_kernel<PosT><<<grid, block_threads, 0, stream>>>(wire_prob, local_expert_routing_map,
-            static_cast<PosT*>(wire_prob_pos), recv_topk_weights, recv_topk_idx, num_recv_tokens,
-            num_recv_tokens_dev, topk, experts_per_rank, wire_prob_floats, global_expert_offset,
-            recv_topk_idx_kind, expert_major, lerm_bitmap);
-    };
-    if (compact_prob_pos_bytes(topk) == sizeof(uint8_t)) launch(uint8_t{});
-    else launch(uint16_t{});
+    compact_prob_output_param_t p{};
+    p.wire_prob = wire_prob;
+    p.local_expert_routing_map = local_expert_routing_map;
+    p.wire_prob_pos = wire_prob_pos;
+    p.recv_topk_weights = recv_topk_weights;
+    p.recv_topk_idx = recv_topk_idx;
+    p.num_recv_tokens = num_recv_tokens;
+    p.num_recv_tokens_dev = num_recv_tokens_dev;
+    p.topk = topk;
+    p.experts_per_rank = experts_per_rank;
+    p.wire_prob_floats = wire_prob_floats;
+    p.global_expert_offset = global_expert_offset;
+    p.recv_topk_idx_kind = recv_topk_idx_kind;
+    p.expert_major = expert_major;
+    p.lerm_bitmap = lerm_bitmap;
+    p.expert_token_offsets = expert_token_offsets;
+    p.per_expert_counts_active = per_expert_counts_active;
+    p.flat_expert_ids = flat_expert_ids;
+    jit::launch_compact_prob_output(grid, compact_prob_pos_bytes(topk) == sizeof(uint16_t),
+                                   !topk_order, p, stream);
 }
 
 // ============================================================================
@@ -2422,10 +2367,12 @@ void launch_dispatch_permute(
     const bool* lerm_in,
     bool* lerm_out,
     int32_t* em_permute_cursors,
-    bool allow_overflow_drop) {
+    bool allow_overflow_drop,
+    bool flat2em_expert_ids) {
     assert(experts_per_rank > 0 && top_k <= ::ht_ep::kLocalPermuteMaxActivePerToken);
-    assert((flat2em_out == nullptr) == (lerm_in == nullptr));
-    assert((flat2em_out == nullptr) == (lerm_out == nullptr));
+    assert(flat2em_expert_ids || (flat2em_out == nullptr) == (lerm_in == nullptr));
+    assert((lerm_in == nullptr) == (lerm_out == nullptr));
+    assert(!flat2em_expert_ids || flat2em_out != nullptr);
     assert((flat2em_out == nullptr) == (em_permute_cursors == nullptr));
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
@@ -2459,7 +2406,7 @@ void launch_dispatch_permute(
     p.em_permute_cursors = em_permute_cursors;
     p.allow_overflow_drop = allow_overflow_drop;
 
-    ::nccl_ep::ht::jit::launch_local_permute_dup(static_cast<int>(grid), p, recipe, stream);
+    ::nccl_ep::ht::jit::launch_local_permute_dup(static_cast<int>(grid), p, recipe, flat2em_expert_ids, stream);
 }
 
 // Fused pull-count metadata publish, standalone ahead of the unfused head-sync kernel.

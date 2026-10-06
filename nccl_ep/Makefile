@@ -66,6 +66,8 @@ JIT_CONFIG_HEADER := $(JIT_DIR)/config.h
 # NVCC JIT support is required for HT and LL modes.
 NCCL_EP_JIT_HEADERS := \
     device/ht_ep.cuh \
+    device/ht_compact_prob.cuh \
+    ht_compact_prob.h \
     device/mxfp8_quant.cuh \
     device/quant_recipe.cuh \
     device/device_primitives.cuh \

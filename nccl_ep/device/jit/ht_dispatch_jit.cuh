@@ -454,7 +454,7 @@ inline int pick_pull_blocks_per_sm(int hidden_int4) {
 }
 
 inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec, int blocks_per_sm,
-                                                ncclEpDispQuant_t recipe) {
+                                                ncclEpDispQuant_t recipe, bool flat_expert_ids) {
     std::ostringstream src;
     src << "#include \"device/ht_ep.cuh\"\n"
         << "\n"
@@ -462,7 +462,8 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
         << "__global__ void " << kLocalPermuteDupJitEntryName << "(\n"
         << "    const __grid_constant__ ::ht_ep::local_permute_dup_param_t p) {\n"
         << "  ::ht_ep::local_permute_dup<" << hidden_int4 << ", " << hidden_vec
-        << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ">(\n"
+        << ", " << ::nccl_ep::jit::dispatch_recipe_literal(recipe)
+        << ", " << ::nccl_ep::jit::bool_literal(flat_expert_ids) << ">(\n"
         << "      reinterpret_cast<uint8_t*>(p.recv_x_em),\n"
         << "      p.recv_topk_weights_em,\n"
         << "      reinterpret_cast<const uint8_t*>(p.flat_staging),\n"
@@ -489,7 +490,7 @@ inline std::string local_permute_dup_jit_source(int hidden_int4, int hidden_vec,
 
 inline void
 launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& param,
-                         ncclEpDispQuant_t recipe, cudaStream_t stream) {
+                         ncclEpDispQuant_t recipe, bool flat_expert_ids, cudaStream_t stream) {
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
@@ -498,10 +499,11 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "local_permute_dup_h" << hidden_int4 << "_v" << hidden_vec << "_b" << blocks_per_sm
-             << (recipe != NCCL_EP_DISP_QUANT_NONE ? "_sf" : "");
+             << (recipe != NCCL_EP_DISP_QUANT_NONE ? "_sf" : "")
+             << (flat_expert_ids ? "_topk" : "_map");
         return name.str();
     }();
-    const std::string source = local_permute_dup_jit_source(hidden_int4, hidden_vec, blocks_per_sm, recipe);
+    const std::string source = local_permute_dup_jit_source(hidden_int4, hidden_vec, blocks_per_sm, recipe, flat_expert_ids);
 
     // Dynamic smem: zero-fill buffer for the pad warp's cp.async.bulk S2G.
     // Must cover both token rows and scale rows (scale_row_bytes may exceed row_bytes).
@@ -517,7 +519,8 @@ launch_local_permute_dup(int num_blocks, ::ht_ep::local_permute_dup_param_t& par
     variant.identity = &variant_identity;
     variant.runtime_key = (static_cast<std::uint64_t>(hidden_int4) << 16) |
                           (static_cast<std::uint64_t>(hidden_vec) << 8) | static_cast<std::uint64_t>(blocks_per_sm) |
-                          (static_cast<std::uint64_t>(static_cast<uint32_t>(recipe)) << 32);
+                          (static_cast<std::uint64_t>(static_cast<uint32_t>(recipe)) << 32) |
+                          (static_cast<std::uint64_t>(flat_expert_ids) << 40);
     variant.num_blocks = num_blocks * blocks_per_sm;
     variant.block_dim = ::ht_ep::kLocalPermuteThreads;
     variant.dynamic_smem_bytes = zero_smem_bytes;

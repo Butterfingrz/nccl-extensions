@@ -180,21 +180,20 @@ void dispatch_prob_input_to_compact(
     const TopkIdxT* topk_idx, const float* topk_weights, float* wire_prob,
     int num_tokens, int num_topk, int num_experts, int wire_prob_floats, cudaStream_t stream);
 
-// LERM gates every payload read, including EM padding/DROP slots. FLAT and
-// em-permute return ascending selected local experts with zero/-1 tails; EM
-// dup returns one scalar per expert slot. Persist each weight's original top-k
-// position for BWD, in the same shape as recv_topk_weights. The map uses uint8
-// when topk <=255, otherwise uint16; the type's maximum value marks padding.
-// The weight output and position map are required. recv_topk_idx may be null
-// for EM or internal em-permute scratch. Count mode supplies packed LERM;
-// scan mode supplies bool LERM. num_recv_tokens_dev bounds live rows without a host readback.
+// Decode compact rows in source top-k order, or ascending expert order when
+// topk_order=false. FLAT rows have a packed prefix; EM has one weight per slot.
+// Save each weight's source column for backward (uint8 when topk <= 255, otherwise
+// uint16; the maximum value marks padding). Optional flat_expert_ids stores local
+// IDs that EM permutation replaces with matching output slots.
 void dispatch_prob_compact_to_output(
     const float* wire_prob, const bool* local_expert_routing_map,
     void* wire_prob_pos,
     float* recv_topk_weights, int64_t* recv_topk_idx, int num_recv_tokens,
     const int32_t* num_recv_tokens_dev,
     int topk, int experts_per_rank, int wire_prob_floats, int global_expert_offset,
-    ncclEpExpertIdKind_t recv_topk_idx_kind, bool expert_major, bool lerm_bitmap, cudaStream_t stream);
+    ncclEpExpertIdKind_t recv_topk_idx_kind, bool expert_major, bool lerm_bitmap,
+    const int64_t* expert_token_offsets, const int32_t* per_expert_counts_active,
+    int32_t* flat_expert_ids, bool topk_order, cudaStream_t stream);
 
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob (for combine input)
@@ -425,14 +424,17 @@ void launch_dispatch_permute(
     void* recv_scales_em,
     const void* flat_scale_staging,
     int scale_row_bytes,
-    int32_t* flat2em_out = nullptr,
-    const bool* lerm_in = nullptr,
-    bool* lerm_out = nullptr,
-    int32_t* em_permute_cursors = nullptr,
-    // Count mode + DROP only: gates an in-kernel phantom-row correction (see
+    int32_t* flat2em_out,
+    const bool* lerm_in,
+    bool* lerm_out,
+    int32_t* em_permute_cursors,
+    // Map rebuild + DROP: gates an in-kernel phantom-row correction (see
     // local_permute_dup_param_t::allow_overflow_drop in ht_ep.cuh for why it's needed).
     // Ignored (no correction) when em_permute_cursors is null.
-    bool allow_overflow_drop = false);
+    bool allow_overflow_drop,
+    // Compact decoder stored packed local IDs in flat2em_out; convert them
+    // to EM slots in place. This also supports scan metadata, without LERM copies.
+    bool flat2em_expert_ids);
 
 // Pull EM dispatch (MNNVL): each receiver reads its source rows and topk weights
 // directly from the source ranks' input buffers over NVLink and scatters them into

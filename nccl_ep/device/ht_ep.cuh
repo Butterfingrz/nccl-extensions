@@ -6408,10 +6408,9 @@ struct local_permute_dup_param_t {
     void* recv_scales_em;
     const void* flat_scale_staging;
     int scale_row_bytes;
-    // Count mode: build the flat2em rows inline from the sender-written LERM rows,
-    // assigning em slots via per-expert atomic cursors (zero-seeded by the host).
-    // All null on the stock path (pre-built flat2em consumed as-is). lerm_out
-    // persists the LERM row into per-handle mem so combine reads a private copy.
+    // Rebuild EM slots with per-expert atomic cursors, from decoded compact IDs
+    // or (dense count mode) the sender-written LERM. Null uses the pre-built map.
+    // Count mode also persists LERM in per-handle memory for later operations.
     int32_t* flat2em_out;
     const bool* lerm_in;
     bool* lerm_out;
@@ -6431,7 +6430,7 @@ struct local_permute_dup_param_t {
 };
 
 template <int HiddenInt4, int HiddenVec,
-          ncclEpDispQuant_t kRecipe = NCCL_EP_DISP_QUANT_NONE>
+          ncclEpDispQuant_t kRecipe, bool kFlatExpertIds>
 __device__ __forceinline__ void local_permute_dup(
     uint8_t* __restrict__ recv_x_em,
     float* __restrict__ recv_topk_weights_em,
@@ -6544,21 +6543,19 @@ __device__ __forceinline__ void local_permute_dup(
         cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
         nccl_ep::fence_proxy_async();
     } else {
-        // Permute warps: warp-strided token permute; count mode builds flat2em inline
-        // below, other modes use the pre-built map.
+        // Permute warps: compact and dense count mode build flat2em inline;
+        // other modes and backward dispatch use the persisted map.
         for (int token = static_cast<int>(blockIdx.x) * kPermuteWarps + warp_id;
              token < num_recv;
              token += kPermuteWarps * static_cast<int>(gridDim.x)) {
             const bool copy_weights =
                 recv_topk_weights_em != nullptr && recv_topk_weights_flat != nullptr;
             if (flat2em_out != nullptr) {
-                // Count mode: assign em slots warp-cooperatively from the LERM row
-                // (ascending local expert, matching the FLAT weights order). The
-                // persisted row keeps dispatch and combine consistent, so any
-                // per-expert slot order is valid.
-                // LERM is a packed bitmap: ceil(epr/64) u64 words per slot.
+                // Build EM slots in the weight row's order: compact uses the decoded
+                // local IDs; dense count mode walks LERM in ascending expert order.
+                // The persisted map is shared by dispatch and backward combine.
                 const int lerm_words = nccl_ep::bit_words(experts_per_rank);
-                const uint64_t* lrow =
+                const uint64_t* lrow = lerm_in == nullptr ? nullptr :
                     reinterpret_cast<const uint64_t*>(lerm_in) + static_cast<size_t>(token) * lerm_words;
                 // Persist the LERM row into per-handle mem for combine (private per dispatch).
                 if (lerm_out != nullptr) {
@@ -6568,26 +6565,48 @@ __device__ __forceinline__ void local_permute_dup(
                 }
                 int32_t* out_row = flat2em_out + static_cast<size_t>(token) * top_k;
                 int c = 0;
-                for (int base = 0; base < experts_per_rank; base += kThreadsPerSlot) {
-                    const int e = base + lane;
-                    const bool hit = (e < experts_per_rank) && nccl_ep::test_bit(lrow, e);
-                    const uint32_t bal = __ballot_sync(0xffffffffu, hit);
-                    if (hit) {
-                        const int pos = c + __popc(bal & ((1u << lane) - 1u));
-                        // Cursor past the (DROP-clamped) per-expert count overflows the recv
-                        // buffer; mark it dropped (-1) so the copy loops and combine skip it.
-                        const int cur = atomicAdd(&em_permute_cursors[e], 1);
-                        const int32_t es = (cur < per_expert_counts_active[e])
-                                               ? static_cast<int32_t>(expert_token_offsets[e]) + cur
-                                               : -1;
-                        if (pos < kMaxActivePerToken) s_active[warp_id][pos] = es;
-                        out_row[pos] = es;
-                        if (copy_weights && es >= 0) {
-                            recv_topk_weights_em[es] =
-                                recv_topk_weights_flat[static_cast<size_t>(token) * top_k + pos];
+                if constexpr (kFlatExpertIds) {
+                    for (int base = 0; base < top_k; base += kThreadsPerSlot) {
+                        const int k = base + lane;
+                        const int e = k < top_k ? out_row[k] : -1;
+                        const bool hit = e >= 0;
+                        const uint32_t bal = __ballot_sync(0xffffffffu, hit);
+                        if (hit) {
+                            EP_DEVICE_ASSERT(e < experts_per_rank);
+                            const int cur = atomicAdd(&em_permute_cursors[e], 1);
+                            const int32_t es = cur < per_expert_counts_active[e]
+                                ? static_cast<int32_t>(expert_token_offsets[e]) + cur : -1;
+                            s_active[warp_id][k] = es;
+                            out_row[k] = es;
+                            if (copy_weights && es >= 0) {
+                                recv_topk_weights_em[es] =
+                                    recv_topk_weights_flat[static_cast<size_t>(token) * top_k + k];
+                            }
                         }
+                        c += __popc(bal);
                     }
-                    c += __popc(bal);
+                } else {
+                    for (int base = 0; base < experts_per_rank; base += kThreadsPerSlot) {
+                        const int e = base + lane;
+                        const bool hit = (e < experts_per_rank) && nccl_ep::test_bit(lrow, e);
+                        const uint32_t bal = __ballot_sync(0xffffffffu, hit);
+                        if (hit) {
+                            const int pos = c + __popc(bal & ((1u << lane) - 1u));
+                            // Cursor past the (DROP-clamped) per-expert count overflows the recv
+                            // buffer; mark it dropped (-1) so the copy loops and combine skip it.
+                            const int cur = atomicAdd(&em_permute_cursors[e], 1);
+                            const int32_t es = (cur < per_expert_counts_active[e])
+                                                   ? static_cast<int32_t>(expert_token_offsets[e]) + cur
+                                                   : -1;
+                            if (pos < kMaxActivePerToken) s_active[warp_id][pos] = es;
+                            out_row[pos] = es;
+                            if (copy_weights && es >= 0) {
+                                recv_topk_weights_em[es] =
+                                    recv_topk_weights_flat[static_cast<size_t>(token) * top_k + pos];
+                            }
+                        }
+                        c += __popc(bal);
+                    }
                 }
                 for (int k = c + lane; k < top_k; k += kThreadsPerSlot) out_row[k] = -1;
                 if (lane == 0) s_count[warp_id] = c;

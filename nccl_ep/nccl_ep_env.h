@@ -66,6 +66,10 @@ struct ncclEpEnvConfig {
     // Count mode fuses the recv layout into dispatch by default; set to force the unfused
     // AllGather + compute_layout_info path (used to compare fused vs. unfused performance).
     ncclEpEnvVar ht_em_count_unfused{"NCCL_EP_HT_EM_COUNT_UNFUSED", ncclEpEnvType::flag};
+    // Compact receive-row order: source-compact (default) keeps source top-k order
+    // without gaps; expert-ascend sorts by ascending expert ID, also without gaps.
+    static constexpr const char* ht_recv_topk_orders[] = {"source-compact", "expert-ascend", nullptr};
+    ncclEpEnvVar ht_recv_topk_order{"NCCL_EP_HT_RECV_TOPK_ORDER", ncclEpEnvType::choice, ht_recv_topk_orders};
     static constexpr const char* dispatch_copy_modes[] = {"CE", "SIMT", "TMA", nullptr};
     ncclEpEnvVar dispatch_copy_mode{"NCCL_EP_DISPATCH_COPY_MODE", ncclEpEnvType::choice, dispatch_copy_modes};
     ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};

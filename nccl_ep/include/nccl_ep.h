@@ -473,6 +473,10 @@ typedef struct {
   // Per-slot values are either the local or global expert id, selected via
   // ncclEpLayoutInfo_t::recv_topk_idx_kind (AUTO/LOCAL/GLOBAL; AUTO resolves
   // to LOCAL today). -1 marks slots not routed to this rank.
+  // HT compact push: local matches are packed at the start of each row in the
+  // source top-k order, paired with their weights; unused columns are -1/zero.
+  // Set NCCL_EP_HT_RECV_TOPK_ORDER=expert-ascend before group creation to retain ascending
+  // expert order. Dense fallback and pull-push retain their existing behavior.
 } ncclEpDispatchOutputs_t;
 
 #define NCCL_EP_DISPATCH_OUTPUTS_INIT \

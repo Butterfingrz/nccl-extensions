@@ -5368,6 +5368,9 @@ ncclResult_t ncclEpDispatch(
         // Prob wire format for this dispatch (must resolve identically on every rank).
         const HtProbWire prob_wire = ht_prob_wire_mode(group, handle->num_topk);
         const bool compact_dispatch_prob = forward_dispatch && prob_wire == HtProbWire::kCompact;
+        const auto& recv_topk_order = group->env.ht_recv_topk_order;
+        const bool compact_topk_order = compact_dispatch_prob &&
+            (!recv_topk_order.is_set || recv_topk_order.value.ul == 0);
         const int wire_prob_floats =
             compact_dispatch_prob ? nccl_ep::ht::dispatch_compact_prob_row_floats(handle->num_topk) :
             (prob_wire == HtProbWire::kCompact) ? combine_compact_prob_row_floats(handle->num_topk) : 0;
@@ -5901,14 +5904,10 @@ ncclResult_t ncclEpDispatch(
                         : NCCL_EP_EXPERT_ID_AUTO);
             const int global_expert_offset = group->rank * group->num_local_experts;
 
-            // Fused-meta-dispatch path: the sender-side table work is LERM only (weights
-            // extracted from the landed prob below, flat2em built by the permute), so the
-            // dense->sparse extraction runs as in scan mode on all topologies.
-            // em-permute path: dense_to_sparse_prob runs in FLAT shape.
-            // Weights are written to FLAT scratch (recv_topk_weights_flat) and
-            // the topk_idx write is skipped to preserve the em_slot values
-            // published by em_scan_kernel. The local permute kernel below
-            // reshuffles FLAT scratch into the caller's EM recv buffer.
+            // EM local-permute decodes into FLAT weight scratch. Source top-k order also
+            // stages packed local expert IDs in flat2em; the permute replaces
+            // them with matching EM slots. Dense retains the scan's slot map,
+            // or builds it from LERM in count mode. No public IDs are emitted for EM.
             {
                 const bool dsp_em = em && !em_permute_active;
                 float* dsp_topk_weights = em_permute_active ? group->ht_buffers.count_scratch.recv_topk_weights_flat :
@@ -5927,7 +5926,10 @@ ncclResult_t ncclEpDispatch(
                         dsp_topk_weights, dsp_topk_idx, num_recv_tokens,
                         handle->ht.num_tokens_for_experts, handle->num_topk,
                         group->num_local_experts, wire_prob_floats, global_expert_offset,
-                        recv_topk_idx_kind, dsp_em, count_mode, stream);
+                        recv_topk_idx_kind, dsp_em, count_mode,
+                        handle->ht.expert_token_offsets, handle->ht.per_expert_counts_active,
+                        em_permute_active && compact_topk_order ? handle->ht.flat2em_slot_map : nullptr,
+                        compact_topk_order, stream);
                 } else if (!em_pull_active)
                     nccl_ep::ht::dense_to_sparse_prob(
                         group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank],
@@ -6226,12 +6228,13 @@ ncclResult_t ncclEpDispatch(
                     pull_caller_out_is_int64,
                     nccl_ep_env_flag_on(group->env.nucs)));
             } else {
-                // Count mode: the permute builds the flat2em rows inline from the
-                // MAP-written LERM (FWD only; BWD reuses the rows persisted by the FWD
-                // dispatch). The em cursors are zero-seeded per dispatch.
+                // Compact decode fills flat2em with packed local IDs. The permute
+                // replaces them with EM slots in the same weight order. Dense count
+                // mode builds from LERM; backward reuses the persisted slot map.
                 const bool count_lean_build = forward_dispatch && count_mode;
+                const bool rebuild_em_map = count_lean_build || compact_topk_order;
                 int32_t* em_permute_cursors = nullptr;
-                if (count_lean_build) {
+                if (rebuild_em_map) {
                     em_permute_cursors = group->ht_buffers.count_scratch.em_permute_cursors;
                     // +1: the phantom-row fixup's grid arrival counter (trailing slot).
                     CUDA_CHECK(cudaMemsetAsync(
@@ -6258,11 +6261,12 @@ ncclResult_t ncclEpDispatch(
                     perm_recv_scales_em,
                     perm_flat_scale_staging,
                     perm_scale_row_bytes,
-                    count_lean_build ? handle->ht.flat2em_slot_map : nullptr,
+                    rebuild_em_map ? handle->ht.flat2em_slot_map : nullptr,
                     count_lean_build ? handle->ht.dispatch_push_count.lerm_landing : nullptr,
                     count_lean_build ? handle->ht.local_expert_routing_map : nullptr,
                     em_permute_cursors,
-                    count_lean_build && group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP);
+                    rebuild_em_map && group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP,
+                    compact_topk_order);
             }
         }
 
