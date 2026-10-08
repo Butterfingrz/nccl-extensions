@@ -15,7 +15,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 NCCL_HOME="${NCCL_HOME:-${REPO_ROOT}/third_party/nccl/build}"
 NCCL_EP_BUILDDIR="${NCCL_EP_BUILDDIR:-${REPO_ROOT}/build}"
-NUM_GPUS="${1:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
 
 export LD_LIBRARY_PATH="${NCCL_EP_BUILDDIR}/lib:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
 
@@ -23,6 +22,24 @@ GTEST_ARGS=()
 [[ -n "${GTEST_FILTER:-}" ]] && GTEST_ARGS=(--gtest_filter="${GTEST_FILTER}")
 TEST_SUITE="${TEST_SUITE:-}"
 OVERALL_FAIL=0
+
+# Driver compatibility checks use mocked CUDA queries and need no GPU ranks.
+if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_cft_driver_api" ]]; then
+    if ! CFT_UNDEFINED_SYMBOLS=$(nm -D --undefined-only "${NCCL_EP_BUILDDIR}/lib/libnccl_ep.so"); then
+        echo "ERROR: could not inspect libnccl_ep.so driver imports"
+        OVERALL_FAIL=1
+    elif grep -q '[[:space:]]cuLogicalEndpoint' <<<"${CFT_UNDEFINED_SYMBOLS}"; then
+        echo "ERROR: logical endpoint APIs must be loaded optionally, not imported by libnccl_ep.so"
+        grep '[[:space:]]cuLogicalEndpoint' <<<"${CFT_UNDEFINED_SYMBOLS}"
+        OVERALL_FAIL=1
+    fi
+    "${NCCL_EP_BUILDDIR}/test/nccl_ep/test_cft_driver_api" "${GTEST_ARGS[@]}" || OVERALL_FAIL=1
+fi
+if [[ "${TEST_SUITE}" == "test_cft_driver_api" ]]; then
+    exit "${OVERALL_FAIL}"
+fi
+
+NUM_GPUS="${1:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
 
 run_suite() {
     local BINARY="$1"

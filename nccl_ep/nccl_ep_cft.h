@@ -79,7 +79,7 @@ struct ncclEpCftPlatformFacts {
     uint8_t built_with_cft = 0;            // CUDA_VERSION >= 13030 at compile time
     uint8_t query_ok = 0;                  // cuDeviceGet succeeded
     uint8_t limits_ok = 0;                 // cuLogicalEndpointGetLimits(UNICAST|FABRIC|COUNTED_OPS) succeeded
-    uint8_t reserved_ = 0;
+    uint8_t driver_api_available = 0;      // all required logical endpoint entry points resolved
     int32_t query_cu_result = 0;           // CUresult of cuDeviceGet
     int32_t runtime_version = 0;           // cudaRuntimeGetVersion
     int32_t driver_version = 0;            // cuDriverGetVersion (driver API level, e.g. 13030)
@@ -118,6 +118,7 @@ enum ncclEpCftPlatformFail : uint32_t {
     NCCL_EP_CFT_FAIL_FABRIC_HANDLE = 1u << 6,  // fabric memory handles not supported
     NCCL_EP_CFT_FAIL_QUERY = 1u << 7,          // the device could not be queried at all
     NCCL_EP_CFT_FAIL_JIT_NVCC = 1u << 8,       // the JIT's nvcc is older than the floor or unavailable
+    NCCL_EP_CFT_FAIL_DRIVER_API = 1u << 9,     // a required logical endpoint entry point is unavailable
 };
 
 struct ncclEpCftPlatformVerdict {

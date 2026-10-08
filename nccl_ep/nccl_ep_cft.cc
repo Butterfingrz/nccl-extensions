@@ -14,15 +14,72 @@
 #include <vector>
 
 #include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 #include <nccl.h>
 
 #include "common.hpp"
 #include "device/jit/nvcc_compiler.hpp"
 
+#if CUDA_VERSION >= 13030
+namespace {
+
+template <typename Fn>
+bool load_cft_function(const char* symbol, Fn& function) {
+    void* address = nullptr;
+    cudaDriverEntryPointQueryResult status = cudaDriverEntryPointSymbolNotFound;
+    const cudaError_t result = cudaGetDriverEntryPointByVersion(
+        symbol, &address, 13030, cudaEnableDefault, &status);
+    if (result != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (status != cudaDriverEntryPointSuccess || address == nullptr) return false;
+    function = reinterpret_cast<Fn>(address);
+    return true;
+}
+
+// A newer build toolkit must not make CFT entry points mandatory at library load.
+struct CftDriverApi {
+    PFN_cuLogicalEndpointIdReserve_v13030 cuLogicalEndpointIdReserve = nullptr;
+    PFN_cuLogicalEndpointIdRelease_v13030 cuLogicalEndpointIdRelease = nullptr;
+    PFN_cuLogicalEndpointCreate_v13030 cuLogicalEndpointCreate = nullptr;
+    PFN_cuLogicalEndpointDestroy_v13030 cuLogicalEndpointDestroy = nullptr;
+    PFN_cuLogicalEndpointQuery_v13030 cuLogicalEndpointQuery = nullptr;
+    PFN_cuLogicalEndpointGetLimits_v13030 cuLogicalEndpointGetLimits = nullptr;
+    PFN_cuLogicalEndpointExport_v13030 cuLogicalEndpointExport = nullptr;
+    PFN_cuLogicalEndpointImport_v13030 cuLogicalEndpointImport = nullptr;
+    PFN_cuLogicalEndpointBindAddr_v13030 cuLogicalEndpointBindAddr = nullptr;
+    PFN_cuLogicalEndpointUnbind_v13030 cuLogicalEndpointUnbind = nullptr;
+    bool available = false;
+
+    CftDriverApi() {
+        available =
+            load_cft_function("cuLogicalEndpointIdReserve", cuLogicalEndpointIdReserve) &&
+            load_cft_function("cuLogicalEndpointIdRelease", cuLogicalEndpointIdRelease) &&
+            load_cft_function("cuLogicalEndpointCreate", cuLogicalEndpointCreate) &&
+            load_cft_function("cuLogicalEndpointDestroy", cuLogicalEndpointDestroy) &&
+            load_cft_function("cuLogicalEndpointQuery", cuLogicalEndpointQuery) &&
+            load_cft_function("cuLogicalEndpointGetLimits", cuLogicalEndpointGetLimits) &&
+            load_cft_function("cuLogicalEndpointExport", cuLogicalEndpointExport) &&
+            load_cft_function("cuLogicalEndpointImport", cuLogicalEndpointImport) &&
+            load_cft_function("cuLogicalEndpointBindAddr", cuLogicalEndpointBindAddr) &&
+            load_cft_function("cuLogicalEndpointUnbind", cuLogicalEndpointUnbind);
+    }
+};
+
+const CftDriverApi& cft_driver_api() {
+    static const CftDriverApi api;
+    return api;
+}
+
+}  // namespace
+#endif
+
 // Release acquired resources in reverse setup order, including partial setup.
 ncclResult_t nccl_ep_cft_destroy(ncclEpLlCftBuffers* lb, int cuda_device_id) {
 #if CUDA_VERSION >= 13030
+    const auto& api = cft_driver_api();
     if (lb->cumul_byte_expect_dev != nullptr) {
         cudaFree(lb->cumul_byte_expect_dev);
         lb->cumul_byte_expect_dev = nullptr;
@@ -33,13 +90,13 @@ ncclResult_t nccl_ep_cft_destroy(ncclEpLlCftBuffers* lb, int cuda_device_id) {
     }
     // Release both the endpoint and its ID reservation; ID 0 is valid.
     for (uint32_t peer_le : lb->imported_le_ids) {
-        cuLogicalEndpointDestroy(static_cast<CUlogicalEndpointId>(peer_le));
-        cuLogicalEndpointIdRelease(static_cast<CUlogicalEndpointId>(peer_le), 1);
+        api.cuLogicalEndpointDestroy(static_cast<CUlogicalEndpointId>(peer_le));
+        api.cuLogicalEndpointIdRelease(static_cast<CUlogicalEndpointId>(peer_le), 1);
     }
     lb->imported_le_ids.clear();
     // Each setup step needs its own cleanup, even if a later step failed.
     if (lb->local_le_bound) {
-        cuLogicalEndpointUnbind(
+        api.cuLogicalEndpointUnbind(
             static_cast<CUlogicalEndpointId>(lb->local_le),
             static_cast<CUdevice>(cuda_device_id),
             0,
@@ -47,11 +104,11 @@ ncclResult_t nccl_ep_cft_destroy(ncclEpLlCftBuffers* lb, int cuda_device_id) {
         lb->local_le_bound = false;
     }
     if (lb->local_le_valid) {
-        cuLogicalEndpointDestroy(static_cast<CUlogicalEndpointId>(lb->local_le));
+        api.cuLogicalEndpointDestroy(static_cast<CUlogicalEndpointId>(lb->local_le));
         lb->local_le_valid = false;
     }
     if (lb->local_le_reserved) {
-        cuLogicalEndpointIdRelease(static_cast<CUlogicalEndpointId>(lb->local_le), 1);
+        api.cuLogicalEndpointIdRelease(static_cast<CUlogicalEndpointId>(lb->local_le), 1);
         lb->local_le_reserved = false;
     }
     lb->local_le = 0;
@@ -80,9 +137,10 @@ ncclResult_t nccl_ep_cft_destroy(ncclEpLlCftBuffers* lb, int cuda_device_id) {
 
 #if CUDA_VERSION >= 13030
 static bool ll_cft_poll_ready(CUlogicalEndpointId le) {
+    const auto& api = cft_driver_api();
     int st = 0;
     for (int i = 0; i < 200; i++) {
-        if (cuLogicalEndpointQuery(le, 1, &st) == CUDA_SUCCESS && st != 0) return true;
+        if (api.cuLogicalEndpointQuery(le, 1, &st) == CUDA_SUCCESS && st != 0) return true;
         usleep(10 * 1000);
     }
     return false;
@@ -106,6 +164,7 @@ ncclResult_t nccl_ep_cft_init(
     cudaStream_t stream) {
     lb->initialized = false;
 #if CUDA_VERSION >= 13030
+    const auto& api = cft_driver_api();
     auto cu_ok = [&](CUresult r, const char* what) -> bool {
         if (r != CUDA_SUCCESS) {
             if (verbose) {
@@ -129,7 +188,7 @@ ncclResult_t nccl_ep_cft_init(
     };
 
     CUdevice dev = 0;
-    bool local_ok = cu_ok(cuDeviceGet(&dev, cuda_device_id), "cuDeviceGet");
+    bool local_ok = api.available && cu_ok(cuDeviceGet(&dev, cuda_device_id), "cuDeviceGet");
 
     // Query the endpoint's binding requirements.
     CUlogicalEndpointProp prop{};
@@ -139,7 +198,7 @@ ncclResult_t nccl_ep_cft_init(
         prop.unicast.device = dev;
         prop.ipcHandleTypes = CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC;
         prop.flags = CU_LOGICAL_ENDPOINT_FLAG_COUNTED_OPS;
-        local_ok = cu_ok(cuLogicalEndpointGetLimits(&bindAlign, &maxSize, &prop),
+        local_ok = cu_ok(api.cuLogicalEndpointGetLimits(&bindAlign, &maxSize, &prop),
                          "cuLogicalEndpointGetLimits");
     }
 
@@ -206,12 +265,12 @@ ncclResult_t nccl_ep_cft_init(
     // Create the UNICAST endpoint and bind the recv buffer.
     CUlogicalEndpointId le = 0;
     if (local_ok) {
-        local_ok = cu_ok(cuLogicalEndpointIdReserve(&le, 1), "cuLogicalEndpointIdReserve");
+        local_ok = cu_ok(api.cuLogicalEndpointIdReserve(&le, 1), "cuLogicalEndpointIdReserve");
         if (local_ok) {
             // Record ownership before the next operation can fail.
             lb->local_le = static_cast<uint32_t>(le);
             lb->local_le_reserved = true;
-            local_ok = cu_ok(cuLogicalEndpointCreate(le, &prop), "cuLogicalEndpointCreate");
+            local_ok = cu_ok(api.cuLogicalEndpointCreate(le, &prop), "cuLogicalEndpointCreate");
         }
         if (local_ok) {
             lb->local_le_valid = true;
@@ -226,7 +285,7 @@ ncclResult_t nccl_ep_cft_init(
         }
         if (local_ok) {
             local_ok = cu_ok(
-                cuLogicalEndpointBindAddr(le, dev, 0, reinterpret_cast<void*>(rptr), SZ, 0),
+                api.cuLogicalEndpointBindAddr(le, dev, 0, reinterpret_cast<void*>(rptr), SZ, 0),
                 "cuLogicalEndpointBindAddr");
             if (local_ok) lb->local_le_bound = true;
         }
@@ -251,7 +310,7 @@ ncclResult_t nccl_ep_cft_init(
     std::memset(handles.data(), 0, handles.size() * sizeof(CUlogicalEndpointFabricHandle));
     if (local_ok)
         local_ok = cu_ok(
-            cuLogicalEndpointExport(&handles[rank], le, CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC),
+            api.cuLogicalEndpointExport(&handles[rank], le, CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC),
             "cuLogicalEndpointExport");
 
     // All ranks participate in the allgather (avoids deadlock on partial failure).
@@ -279,13 +338,13 @@ ncclResult_t nccl_ep_cft_init(
         }
 
         CUlogicalEndpointId cand = 0;
-        if (cuLogicalEndpointIdReserve(&cand, 1) != CUDA_SUCCESS) {
+        if (api.cuLogicalEndpointIdReserve(&cand, 1) != CUDA_SUCCESS) {
             failed_peer = w;
             break;
         }
-        if (cuLogicalEndpointImport(cand, &handles[w], CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC)
+        if (api.cuLogicalEndpointImport(cand, &handles[w], CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC)
                 != CUDA_SUCCESS) {
-            cuLogicalEndpointIdRelease(cand, 1);
+            api.cuLogicalEndpointIdRelease(cand, 1);
             if (verbose)
                 fprintf(stderr, "[nccl_ep][ll_cft] rank %d: failed to import endpoint from peer=%d\n",
                         rank, w);
@@ -473,6 +532,8 @@ void nccl_ep_cft_platform_query(int cuda_device_id, ncclEpCftPlatformFacts* fact
     facts->jit_nvcc_version = jit_nvcc_release();
 #if CUDA_VERSION >= 13030
     facts->built_with_cft = 1;
+    const auto& api = cft_driver_api();
+    facts->driver_api_available = api.available;
     CUdevice dev = 0;
     const CUresult dev_res = cuDeviceGet(&dev, cuda_device_id);
     facts->query_cu_result = static_cast<int32_t>(dev_res);
@@ -486,6 +547,7 @@ void nccl_ep_cft_platform_query(int cuda_device_id, ncclEpCftPlatformFacts* fact
     read_attr(CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_MULTICAST_SUPPORTED, &facts->le_multicast_supported);
     read_attr(kAttrLeCountedOpsSupported, &facts->le_counted_ops_supported);
     read_attr(CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, &facts->fabric_handle_supported);
+    if (!api.available) return;
     // Probe the same endpoint properties used by nccl_ep_cft_init.
     CUlogicalEndpointProp prop{};
     prop.type = CU_LOGICAL_ENDPOINT_TYPE_UNICAST;
@@ -493,7 +555,7 @@ void nccl_ep_cft_platform_query(int cuda_device_id, ncclEpCftPlatformFacts* fact
     prop.ipcHandleTypes = CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC;
     prop.flags = CU_LOGICAL_ENDPOINT_FLAG_COUNTED_OPS;
     cuuint64_t bind_alignment = 0, max_size = 0;
-    const CUresult lim_res = cuLogicalEndpointGetLimits(&bind_alignment, &max_size, &prop);
+    const CUresult lim_res = api.cuLogicalEndpointGetLimits(&bind_alignment, &max_size, &prop);
     facts->limits_cu_result = static_cast<int32_t>(lim_res);
     if (lim_res == CUDA_SUCCESS) {
         facts->limits_ok = 1;
@@ -513,13 +575,15 @@ ncclEpCftPlatformVerdict nccl_ep_cft_platform_judge(
     // Validate the JIT compiler now rather than failing at the first dispatch.
     if (f.jit_nvcc_version < floors.min_jit_nvcc) v.failed |= NCCL_EP_CFT_FAIL_JIT_NVCC;
     if (f.built_with_cft) {
+        if (!f.driver_api_available) v.failed |= NCCL_EP_CFT_FAIL_DRIVER_API;
         if (!f.query_ok) {
             v.failed |= NCCL_EP_CFT_FAIL_QUERY;
         } else {
             if (f.le_unicast_supported != 1) v.failed |= NCCL_EP_CFT_FAIL_LE_UNICAST;
             // GetLimits probes counted operations when the attribute is unavailable.
             // An explicit unsupported attribute or unusable bind alignment still fails.
-            if (!f.limits_ok || f.bind_alignment == 0 || f.le_counted_ops_supported == 0)
+            if (f.driver_api_available &&
+                (!f.limits_ok || f.bind_alignment == 0 || f.le_counted_ops_supported == 0))
                 v.failed |= NCCL_EP_CFT_FAIL_COUNTED_OPS;
             if (f.fabric_handle_supported != 1) v.failed |= NCCL_EP_CFT_FAIL_FABRIC_HANDLE;
         }
@@ -560,6 +624,8 @@ std::string nccl_ep_cft_platform_reasons(
                           cuda_version_string(f.driver_version) + ") below the required " +
                           std::to_string(floors.min_driver) +
                           " -- the CFT floor is driver 610.43.02 = driver API 13030 (nvidia-smi shows the driver)");
+    if (v.failed & NCCL_EP_CFT_FAIL_DRIVER_API)
+        append_clause(&out, "CUDA driver does not provide the logical endpoint APIs required for CFT");
     if (v.failed & NCCL_EP_CFT_FAIL_CC)
         append_clause(&out,
                       "compute capability " + std::to_string(f.cc_major) + "." + std::to_string(f.cc_minor) +
@@ -607,10 +673,11 @@ std::string nccl_ep_cft_platform_summary(
     const ncclEpCftPlatformFacts& f, const ncclEpCftPlatformVerdict& v) {
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-                  "device=%d toolkit=%d built_with_cft=%d runtime=%d driver=%d cc=%d.%d le_unicast=%d "
+                  "device=%d toolkit=%d built_with_cft=%d driver_api=%d runtime=%d driver=%d cc=%d.%d le_unicast=%d "
                   "le_multicast=%d le_counted_ops=%d fabric_handle=%d limits=%s(CUresult %d) bind_align=%llu "
                   "max_size=%llu jit_nvcc=%d failed=0x%x support_level=%d nccl_gpu_cft_support=%d",
-                  f.cuda_device_id, f.toolkit_version, f.built_with_cft, f.runtime_version, f.driver_version,
+                  f.cuda_device_id, f.toolkit_version, f.built_with_cft, f.driver_api_available,
+                  f.runtime_version, f.driver_version,
                   f.cc_major, f.cc_minor, f.le_unicast_supported, f.le_multicast_supported,
                   f.le_counted_ops_supported, f.fabric_handle_supported, f.limits_ok ? "ok" : "failed",
                   f.limits_cu_result, static_cast<unsigned long long>(f.bind_alignment),
