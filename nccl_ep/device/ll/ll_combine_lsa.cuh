@@ -184,31 +184,25 @@ template <int kNumRecvUnrolls, ncclDataType_t kTokenDtype>
 __forceinline__ __device__ void decodeAndAccumulateLsa(
     uint32_t* ldBuffer,
     float* accum,
-    const float& weight,
-    int validUnrolls) {
+    const float& weight) {
     if constexpr (kTokenDtype == ncclFloat32) {
 #pragma unroll
         for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
-            if (k < validUnrolls * 4)
-                accum[k] += *reinterpret_cast<float*>(ldBuffer + k) * weight;
+            accum[k] += *reinterpret_cast<float*>(ldBuffer + k) * weight;
         }
     } else if constexpr (kTokenDtype == ncclFloat16) {
 #pragma unroll
         for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
-            if (k < validUnrolls * 4) {
-                auto fp16Pack = *reinterpret_cast<__half2*>(ldBuffer + k);
-                accum[k * 2 + 0] += static_cast<float>(fp16Pack.x) * weight;
-                accum[k * 2 + 1] += static_cast<float>(fp16Pack.y) * weight;
-            }
+            auto fp16Pack = *reinterpret_cast<__half2*>(ldBuffer + k);
+            accum[k * 2 + 0] += static_cast<float>(fp16Pack.x) * weight;
+            accum[k * 2 + 1] += static_cast<float>(fp16Pack.y) * weight;
         }
     } else {
 #pragma unroll
         for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
-            if (k < validUnrolls * 4) {
-                auto bf16Pack = *reinterpret_cast<__nv_bfloat162*>(ldBuffer + k);
-                accum[k * 2 + 0] += static_cast<float>(bf16Pack.x) * weight;
-                accum[k * 2 + 1] += static_cast<float>(bf16Pack.y) * weight;
-            }
+            auto bf16Pack = *reinterpret_cast<__nv_bfloat162*>(ldBuffer + k);
+            accum[k * 2 + 0] += static_cast<float>(bf16Pack.x) * weight;
+            accum[k * 2 + 1] += static_cast<float>(bf16Pack.y) * weight;
         }
     }
 }
@@ -225,42 +219,40 @@ template <
     int kNumPrefetch,
     typename TmaBuffersT,
     typename FullBarriersT,
-    typename TmaLoadAndArriveT,
-    typename GetNumTmaBytesT>
+    typename TmaLoadAndArriveT>
 __forceinline__ __device__ void processAndSendTokenLsa(
     const int4* srcDataInt4Ptr,
     int4* sendBufInt4Ptr,
     uint64_t dstP2pPtr,
     int hiddenBf16Int4,
-    int hiddenBf16Int4Pad,
     bool zeroCopy,
     TmaBuffersT tmaBuffers,
     FullBarriersT fullBarriers,
     uint32_t& tmaPhase,
     TmaLoadAndArriveT& tmaLoadAndArrive,
-    GetNumTmaBytesT& getNumTmaBytes,
     int laneId) {
     EP_DEVICE_ASSERT(dstP2pPtr != 0);
-    const int kNumIters = hiddenBf16Int4Pad / (32 * kNumSendUnrolls);
+    const int kNumIters = hiddenBf16Int4 / (32 * kNumSendUnrolls);
+    constexpr int kNumTmaBytes = 32 * kNumSendUnrolls * sizeof(int4);
 
     const auto copySrcPtr = zeroCopy ? sendBufInt4Ptr : srcDataInt4Ptr;
     const auto copyDstPtr = reinterpret_cast<int4*>(dstP2pPtr);
 
     // Prefetch
     if (elect_one_sync()) {
-        tmaLoadAndArrive(0, copySrcPtr, getNumTmaBytes(0));
+        tmaLoadAndArrive(0, copySrcPtr, kNumTmaBytes);
     }
     __syncwarp();
 
 #pragma unroll
-    for (int i = laneId * kNumSendUnrolls, iterIdx = 0; i < hiddenBf16Int4Pad; i += 32 * kNumSendUnrolls, ++iterIdx) {
+    for (int i = laneId * kNumSendUnrolls, iterIdx = 0; i < hiddenBf16Int4; i += 32 * kNumSendUnrolls, ++iterIdx) {
         // Load the next iteration
         const int& stageIdx = iterIdx % kNumStages;
         const int& nextStageIdx = (iterIdx + 1) % kNumStages;
         if (iterIdx + 1 < kNumIters and elect_one_sync()) {
             tma_store_wait<kNumStages - kNumPrefetch - 1>();
             const auto offsetInt4 = i + 32 * kNumSendUnrolls;
-            tmaLoadAndArrive(nextStageIdx, copySrcPtr + offsetInt4, getNumTmaBytes(offsetInt4));
+            tmaLoadAndArrive(nextStageIdx, copySrcPtr + offsetInt4, kNumTmaBytes);
         }
         __syncwarp();
 
@@ -270,7 +262,7 @@ __forceinline__ __device__ void processAndSendTokenLsa(
 
         // BF16-family original values, unquantized, no LogFMT packing.
         if (elect_one_sync()) {
-            tma_store_1d(tmaBuffers[stageIdx], copyDstPtr + i, getNumTmaBytes(i));
+            tma_store_1d(tmaBuffers[stageIdx], copyDstPtr + i, kNumTmaBytes);
         }
         __syncwarp();
     }
@@ -316,15 +308,11 @@ __forceinline__ __device__ void combineReduceTokenLsa(
 
         mbarrier_wait<true>(fullBarriers[stageIdx], tmaPhase, stageIdx);
         int tmaOffset = kNumBF16PerWarpBytes * decodeWarpIdx;
-        const int firstInt4 = (decodeWarpIdx * 32 + laneId) * kNumRecvUnrolls;
-        const int validUnrolls = max(0, min(kNumRecvUnrolls,
-                                           static_cast<int>(hiddenBf16Int4) - firstInt4));
         decodeAndAccumulateLsa<kNumRecvUnrolls, kTokenDtype>(
             reinterpret_cast<uint32_t*>(
                 tmaLdBuffers[stageIdx] + tmaOffset + kNumBF16PerWarpBytes / 32 * laneId),
             combinedData,
-            topkWeight,
-            validUnrolls);
+            topkWeight);
 
         // Order generic-proxy reads before releasing the stage to the async TMA producer.
         fence_view_async_shared();
@@ -351,12 +339,10 @@ __forceinline__ __device__ void combineReduceTokenLsa(
     tma_store_fence();
     if (elect_one_sync()) {
         const int storeOffsetInt4 = decodeWarpIdx * kNumRecvUnrolls * 32;
-        const int storeBytes = min(kNumBF16PerWarpBytes,
-                                   static_cast<int>((hiddenBf16Int4 - storeOffsetInt4) * sizeof(int4)));
         tma_store_1d(
             tmaStBuffers[decodeWarpIdx],
             static_cast<int4*>(outData) + tokenIdx * hiddenBf16Int4 + storeOffsetInt4,
-            storeBytes);
+            kNumBF16PerWarpBytes);
     }
     __syncwarp();
 }
@@ -514,7 +500,8 @@ __device__ __forceinline__ void combine_kernel_impl_2sided_rm_lsa( // INPUT
     // Use different unroll factors for send and recv phases
     constexpr int kNumSendUnrolls = combine_smem::send_unrolls(kHidden, kElemBytes);
     constexpr int kNumRecvUnrolls = combine_smem::kNumRecvUnrolls;
-    constexpr int hiddenBf16Int4Pad = align(static_cast<int>(hiddenBf16Int4), kWarpSize * kNumSendUnrolls);
+    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4) == 0,
+                     "Partial tiles require universal combine");
     EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
     EP_STATIC_ASSERT(hiddenBf16Int4 % kNumSendUnrolls == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
@@ -593,9 +580,6 @@ __device__ __forceinline__ void combine_kernel_impl_2sided_rm_lsa( // INPUT
             tma_load_1d(tmaBuffers[stageIdx], gmemPtr, fullBarriers[stageIdx], numBytes);
             mbarrier_arrive_and_expect_tx(fullBarriers[stageIdx], numBytes);
         };
-        auto getNumTmaBytes = [&](const int& offsetInt4) {
-            return min(kNumTMABufferBytes, static_cast<int>((hiddenBf16Int4 - offsetInt4) * sizeof(int4)));
-        };
 
         // Issue sends for each token from the responsible dstRank. Rank-major:
         // one send per received slot. srcInfo[0] = linear slot into inData;
@@ -632,13 +616,11 @@ __device__ __forceinline__ void combine_kernel_impl_2sided_rm_lsa( // INPUT
                     sendBufPtr,
                     dstP2pPtr,
                     hiddenBf16Int4,
-                    hiddenBf16Int4Pad,
                     zeroCopy,
                     tmaBuffers,
                     fullBarriers,
                     tmaPhase,
                     tmaLoadAndArrive,
-                    getNumTmaBytes,
                     laneId);
             }
         }
@@ -693,7 +675,7 @@ LOW_LATENCY_COMBINE_LSA_RECV:
 
     // Reassign warp groups; FP32 doubles SMEM per group, drop to 1 group to stay within limits
     constexpr int kMaxNumGroups = combine_smem::max_recv_groups(kElemBytes);
-    const int numDecodeWarps = hiddenBf16Int4Pad / (kNumRecvUnrolls * kWarpSize);
+    const int numDecodeWarps = hiddenBf16Int4 / (kNumRecvUnrolls * kWarpSize);
     const int warpsPerRecvGroup = numDecodeWarps + combine_smem::kNumRecvTmaWarps;
     const int numGroups = min(kMaxNumGroups, (numThreads / kWarpSize) / warpsPerRecvGroup);
     const int decodeWarpIdx = __shfl_sync(0xffffffff, warpId % warpsPerRecvGroup, 0);
@@ -705,10 +687,10 @@ LOW_LATENCY_COMBINE_LSA_RECV:
         constexpr int kNumStages = combine_smem::kNumStages;
         constexpr int kNumTMABufferBytes = combine_smem::recv_tma_buffer_bytes(kHidden, kElemBytes, /*nvfp4=*/false);
         constexpr int kNumBF16PerWarpBytes = kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4 * kElemBytes;
-        constexpr int kPaddedTokenBytes = hiddenBf16Int4Pad * sizeof(int4);
+        constexpr int kTokenBytes = kHidden * kElemBytes;
         // No LogFMT metadata region (logAmax/logAmin/castInfo) -- nothing
         // populates or consumes it once LogFMT is gone.
-        constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kPaddedTokenBytes;
+        constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kTokenBytes;
 
         // Reallocate shared memory
         const auto smemGroupBuffer = smemBuffer + kNumBytesPerGroup * groupIdx;

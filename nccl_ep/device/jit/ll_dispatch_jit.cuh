@@ -51,7 +51,7 @@ enum class LlDispatchAlgo { kDefault, k2SidedRmLsa, k2SidedRmLsaTma };
 // (lsaMode, see NcclEpDispatchLsaMode's doc comment in device/ll_ep_adapter.cuh).
 inline LlDispatchAlgo ll_dispatch_select_algo(
     bool nvlinkOnly, ncclEpDispQuant_t recipe, ncclEpLayout_t layout, bool cftEnabled,
-    NcclEpDispatchLsaMode lsaMode) {
+    NcclEpDispatchLsaMode lsaMode, int hidden, ncclDataType_t tokenDtype) {
     // Explicit override: NCCL_EP_DISPATCH_LSA=universal always forces the general kernel,
     // regardless of eligibility.
     if (lsaMode == NcclEpDispatchLsaMode::kUniversal) {
@@ -60,7 +60,10 @@ inline LlDispatchAlgo ll_dispatch_select_algo(
 
     const bool lsaRecipe =
         recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
-    const bool lsaEligible =
+    // Both specialized paths require complete warp-sized input vector tiles.
+    // Partial tiles use the universal kernel, including explicit SIMT/TMA modes.
+    const int elemsPerWarp = 32 * static_cast<int>(sizeof(int4)) / (tokenDtype == ncclFloat32 ? 4 : 2);
+    const bool lsaEligible = hidden > 0 && hidden % elemsPerWarp == 0 &&
         !cftEnabled && nvlinkOnly && lsaRecipe && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
     const bool tmaEligible = recipe == NCCL_EP_DISP_QUANT_NONE;
 
@@ -164,7 +167,7 @@ inline ncclResult_t launch_ll_dispatch(
     const dispatch_kernel_args_t& args,
     cudaStream_t stream) {
     const bool cftEnabled = cft_smem_bytes != 0;
-    const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout, cftEnabled, lsaMode);
+    const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout, cftEnabled, lsaMode, hidden, tokenDtype);
     const bool twoSidedRmLsa = algo == LlDispatchAlgo::k2SidedRmLsa;
     const bool twoSidedRmLsaTma = algo == LlDispatchAlgo::k2SidedRmLsaTma;
     // Keep the compact thread limit with a one-block launch bound: repeated

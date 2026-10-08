@@ -25,7 +25,8 @@ namespace ll {
 // the general dispatch_kernel_impl in ll_ep.cuh even when the call would otherwise be LSA-eligible).
 // kUniversal always wins regardless of eligibility; kTma silently falls back to kSimt for calls that
 // are LSA-eligible but not TMA-eligible (e.g. DS_FP8E3M4, which the TMA kernel does not support) --
-// see ll_dispatch_select_algo in device/jit/ll_dispatch_jit.cuh.
+// Partial input warp tiles use the universal kernel in both modes; see
+// ll_dispatch_select_algo in device/jit/ll_dispatch_jit.cuh.
 enum class NcclEpDispatchLsaMode { kSimt, kTma, kUniversal };
 
 // Keep shared-quantization eligibility identical in the host geometry, JIT

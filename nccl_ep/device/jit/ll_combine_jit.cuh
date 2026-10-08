@@ -37,16 +37,21 @@ constexpr int kLlCombineMaxUnrolls = 4;
 //                 LSA-only kernel below.
 //   k2SidedRmLsa: LSA-only rank-major kernel that stages payload through
 //                 RDMA buffers on both send and receive. Selected for every
-//                 LSA-only, NONE-recipe, rank-major call with CFT disabled.
+//                 LSA-only, NONE-recipe, rank-major call with CFT disabled
+//                 and a hidden size divisible by the receive tile.
 enum class LlCombineAlgo { kDefault, k2SidedRmLsa };
 
 // Picks the most performant kernel based on the configuration
 inline LlCombineAlgo ll_combine_select_algo(
     bool nvlinkOnly, ncclEpCombQuant_t qrecipe, bool useLogFmt, ncclEpLayout_t layout,
-    bool cftEnabled = false) {
+    bool cftEnabled, int hidden, ncclDataType_t tokenDtype) {
     // CFT dispatch skips the next-bank wipe. Pair it with the general combine
     // kernel, which clears consumed flags; the LSA kernel leaves them set.
-    const bool lsaEligible = !cftEnabled && nvlinkOnly && qrecipe == NCCL_EP_COMB_QUANT_NONE && !useLogFmt &&
+    const int elemBytes = tokenDtype == ncclFloat32 ? 4 : 2;
+    const int elemsPerTile = combine_smem::kWarpSize * combine_smem::kNumRecvUnrolls *
+        combine_smem::elements_per_int4(elemBytes);
+    const bool lsaEligible = hidden > 0 && hidden % elemsPerTile == 0 &&
+        !cftEnabled && nvlinkOnly && qrecipe == NCCL_EP_COMB_QUANT_NONE && !useLogFmt &&
         layout == NCCL_EP_LAYOUT_RANK_MAJOR;
     return lsaEligible ? LlCombineAlgo::k2SidedRmLsa : LlCombineAlgo::kDefault;
 }
@@ -133,7 +138,7 @@ inline ncclResult_t launch_ll_combine(
     int dynamic_smem_bytes,
     const combine_kernel_args_t& args,
     cudaStream_t stream) {
-    const LlCombineAlgo algo = ll_combine_select_algo(nvlinkOnly, qrecipe, useLogFmt, layout, cftEnabled);
+    const LlCombineAlgo algo = ll_combine_select_algo(nvlinkOnly, qrecipe, useLogFmt, layout, cftEnabled, hidden, tokenDtype);
     const bool twoSidedRmLsa = algo == LlCombineAlgo::k2SidedRmLsa;
 
     const char* recipe_literal = twoSidedRmLsa ? "" : ::nccl_ep::jit::combine_recipe_literal(qrecipe);

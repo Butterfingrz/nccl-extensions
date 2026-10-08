@@ -212,7 +212,8 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream) {
     // this call is actually eligible for it.
     const bool lsaCombineEligible =
         jit::ll_combine_select_algo(
-            params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout, params.cftEnabled) ==
+            params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout, params.cftEnabled,
+            params.hidden, params.tokenDtype) ==
         jit::LlCombineAlgo::k2SidedRmLsa;
     const int max_dynamic_smem_for_combine =
         params.maxDynamicSmem - (lsaCombineEligible ? combine_smem::kLsaStaticSmemBytes : 0);

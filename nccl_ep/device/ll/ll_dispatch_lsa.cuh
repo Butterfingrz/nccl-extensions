@@ -634,9 +634,7 @@ __forceinline__ __device__ void dispatchSendPhaseLsa(
     // 2. The last warp for reading `topk_idx` and count for per-expert information
     if (warpId < numWarps - 1) {
         constexpr int kNumElemsPerRead = sizeof(int4) / size_u8<kTokenDtype>();
-        if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
-            EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
-        }
+        EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Partial tiles require universal dispatch");
         if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
             EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kDsFp8E3M4ElementsPerScale == 0,
                              "Invalid DS_FP8E3M4 vectorization");
@@ -1058,6 +1056,8 @@ template <int kHidden, int kNumTopk, int kNumStages, typename TopkIdxT, ncclData
 __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa_tma(const dispatch_kernel_args_t& args) {
     EP_STATIC_ASSERT(kNumTopk > 0 && kNumTopk <= 32, "LL dispatch TMA top-k must fit one warp's lanes");
     extern __shared__ __align__(1024) uint8_t dispatchTmaSmem[];
+    EP_STATIC_ASSERT(kHidden % (32 * sizeof(int4) / size_u8<kTokenDtype>()) == 0,
+                     "Partial tiles require universal dispatch");
     static constexpr ncclEpLayout_t kLayout = NCCL_EP_LAYOUT_RANK_MAJOR;
     constexpr int numTopk = kNumTopk;
 
