@@ -73,7 +73,7 @@ __forceinline__ __device__ void sendTokenLsa(
     size_t hiddenInt4,
     int maxTokensPerRank,
     int dstRank,
-    int currRank,
+    size_t recvSlot,
     // Zero-copy output: direct NVLink writes may target the peer's output window.
     ncclWindow_t recvDataWindow,
     size_t recvDataOffset,
@@ -81,10 +81,8 @@ __forceinline__ __device__ void sendTokenLsa(
     void* payloadDst = sendTokenHeaderLsa(
         dstSrcRankP2pPtr, sendDataInt4, slotIdx, numBytesPerMsg,
         dispatch_hdr_sz, maxTokensPerRank, laneId);
-    if (recvDataWindow != ncclWindow_t{}) {
-        const size_t recvSlot = static_cast<size_t>(currRank) * maxTokensPerRank + slotIdx;
-        payloadDst = ncclGetPeerPointer(recvDataWindow, recvDataOffset + recvSlot * hiddenBytes, dstRank);
-    }
+    payloadDst = resolveLsaRecvPointer(
+        payloadDst, recvDataWindow, recvDataOffset, recvSlot, hiddenBytes, dstRank);
     auto* dstDataVec = reinterpret_cast<int4*>(payloadDst);
 
     // Unquantized copy: plain per-lane vector store, no recipe branching.
@@ -109,15 +107,23 @@ __forceinline__ __device__ void sendTokenDsFp8Lsa(
     bool roundScale,
     int laneId,
     const int2* quantized,
-    const float* quantizedScales) {
+    const float* quantizedScales,
+    const dispatch_kernel_args_t& args,
+    int dstRank,
+    size_t recvSlot) {
     auto* dstPayloadSlot = sendTokenHeaderLsa(
         dstSrcRankP2pPtr, sendDataInt4, slotIdx, numBytesPerMsg,
         dispatch_hdr_sz, maxTokensPerRank, laneId);
     constexpr int kElementsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
     EP_STATIC_ASSERT(kElementsPerRead * 32 / kDsFp8E3M4ElementsPerScale == 2,
                      "Invalid DS_FP8E3M4 vectorization");
-    auto* dstDataVec = reinterpret_cast<int2*>(dstPayloadSlot);
+    void* payloadDst = dstPayloadSlot;
     auto* dstScales = reinterpret_cast<float*>(dstPayloadSlot + hiddenBytes);
+    payloadDst = resolveLsaRecvPointer(
+        payloadDst, args.recvDataWindow, args.recvDataOffset, recvSlot, hiddenBytes, dstRank);
+    dstScales = resolveLsaRecvPointer(
+        dstScales, args.rcvScalesWin, args.rcvScalesOffs, recvSlot, scaleBytes, dstRank);
+    auto* dstDataVec = reinterpret_cast<int2*>(payloadDst);
     EP_DEVICE_ASSERT(scaleBytes ==
                      static_cast<int>(inputHiddenInt4 * kElementsPerRead /
                                       kDsFp8E3M4ElementsPerScale * sizeof(float)));
@@ -125,7 +131,7 @@ __forceinline__ __device__ void sendTokenDsFp8Lsa(
     if (quantized != nullptr) {
         // Payload slots and shared staging are 16-byte aligned. Copy two
         // quantization vectors at a time without changing the wire layout.
-        auto* dstDataInt4 = reinterpret_cast<int4*>(dstPayloadSlot);
+        auto* dstDataInt4 = reinterpret_cast<int4*>(payloadDst);
         const auto* quantizedInt4 = reinterpret_cast<const int4*>(quantized);
         for (int i = laneId; i < static_cast<int>(hiddenBytes / sizeof(int4)); i += 32) {
             dstDataInt4[i] = quantizedInt4[i];
@@ -140,34 +146,31 @@ __forceinline__ __device__ void sendTokenDsFp8Lsa(
     }
 }
 
-// Copies a received token and, for DS_FP8E3M4, its generated FP32 scales.
-template <ncclEpDispQuant_t kRecipe>
+// Copy a received token's staged payload into its output slot.
 __forceinline__ __device__ void copyRecvTokenDataLsa(
-    const uint8_t* recvBufUint8,
-    int recvIdx,
+    const uint8_t* recvPayloadPtr,
     int tokenIdx,
     int4* outDataInt4,
-    void* outScales,
     int hiddenInt4,
-    int hiddenBytes,
-    int scaleBytes,
-    int numBytesPerMsg,
-    int dispatch_hdr_sz,
-    int maxTokensPerRank,
     int laneId) {
-    const int payloadBytes = numBytesPerMsg - dispatch_hdr_sz;
-    const uint8_t* recvPayloadPtr = recvBufUint8 + maxTokensPerRank * dispatch_hdr_sz + recvIdx * payloadBytes;
     const auto recvDataInt4 = reinterpret_cast<const int4*>(recvPayloadPtr);
     const auto outDataInt4Ptr = outDataInt4 + tokenIdx * hiddenInt4;
     UNROLLED_WARP_COPY(7, laneId, hiddenInt4, outDataInt4Ptr, recvDataInt4, ld_nc_global, st_na_global);
+}
 
-    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
-        const int numScales = scaleBytes / sizeof(float);
-        const auto* recvScales = reinterpret_cast<const float*>(recvPayloadPtr + hiddenBytes);
-        auto* outScalesTyped = static_cast<float*>(outScales) + tokenIdx * numScales;
-        for (int scaleIdx = laneId; scaleIdx < numScales; scaleIdx += 32) {
-            outScalesTyped[scaleIdx] = ld_nc_global(recvScales + scaleIdx);
-        }
+// Copy a DS-FP8 token's staged FP32 scales into its output slot.
+__forceinline__ __device__ void copyRecvTokenScalesLsa(
+    const uint8_t* recvPayloadPtr,
+    int tokenIdx,
+    void* outScales,
+    int hiddenBytes,
+    int scaleBytes,
+    int laneId) {
+    const int numScales = scaleBytes / sizeof(float);
+    const auto* recvScales = reinterpret_cast<const float*>(recvPayloadPtr + hiddenBytes);
+    auto* outScalesTyped = static_cast<float*>(outScales) + tokenIdx * numScales;
+    for (int scaleIdx = laneId; scaleIdx < numScales; scaleIdx += 32) {
+        outScalesTyped[scaleIdx] = ld_nc_global(recvScales + scaleIdx);
     }
 }
 
@@ -421,7 +424,8 @@ __forceinline__ __device__ void recordRecvTokensLsa(
     void* outDataBuf,
     void* outScalesBuf,
     ncclEpExpertIdKind_t recvTopkIdxKind,
-    ncclWindow_t recvDataWindow) {
+    ncclWindow_t recvDataWindow,
+    ncclWindow_t recvScalesWindow) {
     if (responsibleExpertIdx >= numExperts) return;
 
     const auto srcRank = responsibleExpertIdx / numLocalExperts;
@@ -480,13 +484,22 @@ __forceinline__ __device__ void recordRecvTokensLsa(
             outRecvTopkWeights[slot * numTopk + laneId] = rtr[laneId].topk_weight;
         }
 
-        auto* outDataInt4 = static_cast<int4*>(outDataBuf);
-        const bool zeroCopy = kRecipe == NCCL_EP_DISP_QUANT_NONE && recvDataWindow != ncclWindow_t{};
-        if (!zeroCopy) {
-            copyRecvTokenDataLsa<kRecipe>(
-                recvBufUint8, i, slot, outDataInt4, outScalesBuf, static_cast<int>(hiddenInt4),
-                static_cast<int>(hiddenBytes), scaleBytes,
-                static_cast<int>(numBytesPerMsg), static_cast<int>(dispatch_hdr_sz), maxTokensPerRank, laneId);
+        const bool copyData = recvDataWindow == ncclWindow_t{};
+        const bool copyScales = kRecipe != NCCL_EP_DISP_QUANT_NONE && recvScalesWindow == ncclWindow_t{};
+        if (copyData || copyScales) {
+            const int payloadBytes = static_cast<int>(numBytesPerMsg) - static_cast<int>(dispatch_hdr_sz);
+            const uint8_t* recvPayloadPtr =
+                recvBufUint8 + maxTokensPerRank * static_cast<int>(dispatch_hdr_sz) + i * payloadBytes;
+            if (copyData) {
+                copyRecvTokenDataLsa(
+                    recvPayloadPtr, slot, static_cast<int4*>(outDataBuf), static_cast<int>(hiddenInt4), laneId);
+            }
+            if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
+                if (copyScales) {
+                    copyRecvTokenScalesLsa(
+                        recvPayloadPtr, slot, outScalesBuf, static_cast<int>(hiddenBytes), scaleBytes, laneId);
+                }
+            }
         }
     }
 }
@@ -570,6 +583,7 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
         if (minTopkIdx == warpId) {
             slotIdx = laneId == 0 ? atomicAdd(rankSentCnt + dstRank, 1) : 0;
             slotIdx = __shfl_sync(0xffffffff, slotIdx, 0);
+            const size_t recvSlot = getLsaRecvSlot(args.currRank, args.maxTokensPerRank, slotIdx);
 
             const size_t srcRankOffset = static_cast<size_t>(relativeRankSlot(args.currRank, dstRank, args.numRanks)) *
                 srcRankRegionBytes;
@@ -584,7 +598,7 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
                     sendTokenLsa(
                         dstSrcRankP2pPtr, sendBufInt4, srcDataInt4, slotIdx,
                         numBytesPerMsg, dispatch_hdr_sz, hiddenBytes, inputHiddenInt4,
-                        args.maxTokensPerRank, dstRank, args.currRank,
+                        args.maxTokensPerRank, dstRank, recvSlot,
                         args.recvDataWindow, args.recvDataOffset, laneId);
                 } else {
                     sendTokenDsFp8Lsa(
@@ -592,7 +606,7 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
                         numBytesPerMsg, dispatch_hdr_sz, hiddenBytes, inputHiddenInt4,
                         scaleBytes, args.maxTokensPerRank, args.roundScale, laneId,
                         kStageQuant ? quantized : nullptr,
-                        kStageQuant ? quantizedScales : nullptr);
+                        kStageQuant ? quantizedScales : nullptr, args, dstRank, recvSlot);
                 }
             }
         }
@@ -774,7 +788,7 @@ LOW_LATENCY_DISPATCH_LSA_RECV:
         args.numRanks, args.currRank, args.maxTokensPerRank, numBytesPerMsg, dispatch_hdr_sz, hiddenInt4, hiddenBytes,
         scaleBytes,
         args.rankMask, recvCntBuf, recvBuf, args.outSrcInfo, args.outRecvRankCounter, args.outRecvTopkIdx,
-        args.outRecvTopkWeights, args.outDataBuf, args.outScalesBuf, args.recvTopkIdxKind, args.recvDataWindow);
+        args.outRecvTopkWeights, args.outDataBuf, args.outScalesBuf, args.recvTopkIdxKind, args.recvDataWindow, args.rcvScalesWin);
 }
 
 // ============================================================================
@@ -952,12 +966,9 @@ __forceinline__ __device__ void dispatchSendPhaseLsaTma(
                         auto* dstSrcRankBase = reinterpret_cast<uint8_t*>(dstSrcRankP2pPtr);
                         dstHdrSlot = dstSrcRankBase + static_cast<size_t>(slotIdx) * dispatch_hdr_sz;
                         payloadDst = dstSrcRankBase + hdrSectionBytes + static_cast<size_t>(slotIdx) * hiddenBytes;
-                        if (args.recvDataWindow != ncclWindow_t{}) {
-                            const size_t recvSlot =
-                                static_cast<size_t>(args.currRank) * args.maxTokensPerRank + slotIdx;
-                            payloadDst = ncclGetPeerPointer(
-                                args.recvDataWindow, args.recvDataOffset + recvSlot * hiddenBytes, dstRank);
-                        }
+                        const size_t recvSlot = getLsaRecvSlot(args.currRank, args.maxTokensPerRank, slotIdx);
+                        payloadDst = resolveLsaRecvPointer(
+                            payloadDst, args.recvDataWindow, args.recvDataOffset, recvSlot, hiddenBytes, dstRank);
                     }
                 }
 
@@ -1132,7 +1143,7 @@ LOW_LATENCY_DISPATCH_LSA_TMA_RECV:
         args.numRanks, args.currRank, args.maxTokensPerRank, numBytesPerMsg, dispatch_hdr_sz, hiddenInt4, hiddenBytes,
         /*scaleBytes=*/0, args.rankMask, recvCntBuf, recvBuf, args.outSrcInfo, args.outRecvRankCounter,
         args.outRecvTopkIdx, args.outRecvTopkWeights, args.outDataBuf, /*outScalesBuf=*/nullptr,
-        args.recvTopkIdxKind, args.recvDataWindow);
+        args.recvTopkIdxKind, args.recvDataWindow, /*recvScalesWindow=*/ncclWindow_t{});
 }
 
 } // namespace ll

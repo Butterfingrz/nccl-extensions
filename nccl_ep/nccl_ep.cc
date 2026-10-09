@@ -4861,7 +4861,8 @@ ncclResult_t ncclEpDispatch(
         // LL rank-major zero-copy writes each available peer payload window directly.
         const bool nvlink_only = (group->lsa_team_size == group->nRanks);
         const bool recipe_zcopy_ok =
-            recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_FWD;
+            recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_FWD ||
+            recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
         // Disable zero-copy group-wide under CFT: output-window availability
         // can differ by rank, but the kernel's transport choice must agree.
         const bool cft_active = group->ll_cft_buffers.initialized;
@@ -4872,7 +4873,7 @@ ncclResult_t ncclEpDispatch(
             !cft_active;
         const bool zcopy_rcv_x = zcopy_ok && recv_x->win_hdl != ncclWindow_t{};
         const bool zcopy_rcv_scales =
-            zcopy_ok && recipe == NCCL_EP_DISP_QUANT_FWD &&
+            zcopy_ok && recipe != NCCL_EP_DISP_QUANT_NONE &&
             scales != nullptr && scales->win_hdl != ncclWindow_t{};
         const bool zcopy_any = zcopy_rcv_x || zcopy_rcv_scales;
         const char* zcopy_reason =

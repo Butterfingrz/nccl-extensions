@@ -398,6 +398,155 @@ TEST_F(QuantizationRecipeTest, DsFp8OneTokenCapacityFallbackMatchesStaging) {
     }
 }
 
+static void run_dsfp8_window_offsets(bool strict, int tokenCount = 1) {
+    constexpr int hidden = 7168;
+    constexpr int scales = hidden / 128;
+    ncclEpGroupConfig_t gc = NCCL_EP_GROUP_CONFIG_INIT;
+    gc.algorithm = NCCL_EP_ALGO_LOW_LATENCY;
+    gc.zero_copy = strict ? NCCL_EP_ZERO_COPY_ON : NCCL_EP_ZERO_COPY_AUTO;
+    gc.num_experts = kNumExperts;
+    gc.max_dispatch_tokens_per_rank = tokenCount;
+    gc.max_recv_tokens_per_rank = tokenCount;
+    gc.max_token_bytes = hidden * sizeof(nv_bfloat16);
+    gc.rdma_buffer_size = NCCL_EP_AUTO;
+    gc.num_qp_per_rank = kNumExperts / g_nranks;
+    gc.num_channels = NCCL_EP_AUTO;
+    ncclEpGroup_t group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &gc));
+    std::vector<ncclEpTensor_t*> tensors;
+    auto alloc = [&](ncclDataType_t dtype, size_t bytes, std::vector<size_t> dims) {
+        ncclEpTensor_t* t = nullptr;
+        EXPECT_EQ(ncclEpTensorAlloc(&t, dims.size(), dtype, dims.data(), nullptr), ncclSuccess);
+        EXPECT_EQ(cudaMalloc(&t->data, bytes), cudaSuccess);
+        tensors.push_back(t);
+        return t;
+    };
+    auto* idx = alloc(ncclInt64, tokenCount * sizeof(int64_t), {size_t(tokenCount), 1});
+    auto* tokens = alloc(ncclBfloat16, tokenCount * hidden * sizeof(nv_bfloat16), {size_t(tokenCount), hidden});
+    auto* weights = alloc(ncclFloat32, tokenCount * sizeof(float), {size_t(tokenCount), 1});
+    auto* recv = alloc(ncclFloat8e4m3, g_nranks * tokenCount * hidden, {size_t(g_nranks), size_t(tokenCount), hidden});
+    auto* recv_scales = alloc(ncclFloat32, g_nranks * tokenCount * scales * sizeof(float), {size_t(g_nranks), size_t(tokenCount), scales});
+    auto* recv_idx = alloc(ncclInt32, g_nranks * tokenCount * sizeof(int), {size_t(g_nranks), size_t(tokenCount), 1});
+    auto* recv_weights = alloc(ncclFloat32, g_nranks * tokenCount * sizeof(float), {size_t(g_nranks), size_t(tokenCount), 1});
+    auto* counts = alloc(ncclInt32, g_nranks * sizeof(int), {size_t(g_nranks)});
+    // Register padded receive allocations; nonzero offsets must participate in
+    // peer addressing for both independently windowed tensors.
+    constexpr size_t offset = 128;
+    void* tokenStorage = nullptr;
+    void* scaleStorage = nullptr;
+    CUDA_ASSERT(cudaFree(recv->data));
+    CUDA_ASSERT(cudaFree(recv_scales->data));
+    NCCL_ASSERT(ncclMemAlloc(&tokenStorage, offset + g_nranks * tokenCount * hidden));
+    NCCL_ASSERT(ncclMemAlloc(&scaleStorage, offset + g_nranks * tokenCount * scales * sizeof(float)));
+    recv->data = static_cast<uint8_t*>(tokenStorage) + offset;
+    recv_scales->data = static_cast<uint8_t*>(scaleStorage) + offset;
+    ncclWindow_t tokenWindow{}, scaleWindow{};
+    NCCL_ASSERT(ncclCommWindowRegister(g_comm, tokenStorage, offset + g_nranks * tokenCount * hidden,
+                                     &tokenWindow, NCCL_WIN_COLL_SYMMETRIC));
+    NCCL_ASSERT(ncclCommWindowRegister(g_comm, scaleStorage, offset + g_nranks * tokenCount * scales * sizeof(float),
+                                     &scaleWindow, NCCL_WIN_COLL_SYMMETRIC));
+    CUDA_ASSERT(cudaMemset(tokenStorage, 0x5a, offset));
+    CUDA_ASSERT(cudaMemset(scaleStorage, 0x5a, offset));
+    // One incoming source per rank; larger tokenCount exercises repeated shared-buffer reuse.
+    const int64_t expert = ((g_rank + 1) % g_nranks) * (kNumExperts / g_nranks);
+    std::vector<int64_t> experts(tokenCount, expert);
+    std::vector<float> weightsHost(tokenCount, 1.0f);
+    std::vector<nv_bfloat16> input(tokenCount * hidden);
+    for (int i = 0; i < tokenCount * hidden; ++i) {
+        input[i] = __float2bfloat16(float(((i % hidden) % 127) - 63 + g_rank));
+    }
+    CUDA_ASSERT(cudaMemcpy(idx->data, experts.data(), tokenCount * sizeof(expert), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(tokens->data, input.data(), tokenCount * hidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
+    CUDA_ASSERT(cudaMemcpy(weights->data, weightsHost.data(), tokenCount * sizeof(float), cudaMemcpyHostToDevice));
+    ncclEpHandle_t handle = nullptr;
+    NCCL_ASSERT(ncclEpCreateHandle(&handle, group, NCCL_EP_LAYOUT_RANK_MAJOR, idx, nullptr, nullptr, g_stream));
+    ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpLayoutInfo_t layout = NCCL_EP_LAYOUT_INFO_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    inputs.tokens = tokens;
+    inputs.topk_weights = weights;
+    outputs.tokens = recv;
+    outputs.scales = recv_scales;
+    outputs.topk_idx = recv_idx;
+    outputs.topk_weights = recv_weights;
+    layout.src_rank_counters = counts;
+    config.quant_recipe = NCCL_EP_DISP_QUANT_DS_FP8E3M4;
+    std::vector<uint8_t> reference(tokenCount * hidden), actual(tokenCount * hidden);
+    std::vector<float> reference_scales(tokenCount * scales), actual_scales(tokenCount * scales);
+    const int source = (g_rank + g_nranks - 1) % g_nranks;
+    // Exercise staged, both windows, token-only, scale-only, and repeated epochs.
+    for (bool rounded : {false, true}) {
+        config.round_scales = rounded;
+        std::fill(reference_scales.begin(), reference_scales.end(), 0.0f);
+        for (int windows : {0, 3, 1, 2, 3, 0}) {
+            if (strict && windows == 0) {
+                continue;
+            }
+            recv->win_hdl = windows & 1 ? tokenWindow : ncclWindow_t{};
+            recv->win_offset = windows & 1 ? offset : 0;
+            recv_scales->win_hdl = windows & 2 ? scaleWindow : ncclWindow_t{};
+            recv_scales->win_offset = windows & 2 ? offset : 0;
+            CUDA_ASSERT(cudaMemset(recv->data, 0, g_nranks * tokenCount * hidden));
+            CUDA_ASSERT(cudaMemset(recv_scales->data, 0, g_nranks * tokenCount * scales * sizeof(float)));
+            // All ranks must finish clearing before a peer can write a direct output.
+            CUDA_ASSERT(cudaMemsetAsync(counts->data, 0, sizeof(int), g_stream));
+            NCCL_ASSERT(ncclAllReduce(counts->data, counts->data, 1, ncclInt32,
+                                     ncclSum, g_comm, g_stream));
+            SCOPED_TRACE(::testing::Message() << "rank=" << g_rank << " windows=" << windows);
+            NCCL_ASSERT(ncclEpDispatch(handle, &inputs, &outputs, &layout, &config, g_stream));
+            NCCL_ASSERT(ncclEpComplete(handle, nullptr, g_stream));
+            CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+            std::vector<int> received(g_nranks);
+            CUDA_ASSERT(cudaMemcpy(received.data(), counts->data, g_nranks * sizeof(int), cudaMemcpyDeviceToHost));
+            for (int r = 0; r < g_nranks; ++r) {
+                EXPECT_EQ(received[r], r == source ? tokenCount : 0);
+            }
+            CUDA_ASSERT(cudaMemcpy(actual.data(), static_cast<uint8_t*>(recv->data) + source * tokenCount * hidden,
+                                   tokenCount * hidden, cudaMemcpyDeviceToHost));
+            CUDA_ASSERT(cudaMemcpy(actual_scales.data(), static_cast<float*>(recv_scales->data) + source * tokenCount * scales,
+                                   tokenCount * scales * sizeof(float), cudaMemcpyDeviceToHost));
+            if (reference_scales[0] == 0) {
+                reference = actual;
+                reference_scales = actual_scales;
+                EXPECT_TRUE(has_nonzero_scales(reference_scales));
+            } else {
+                EXPECT_EQ(actual, reference);
+                EXPECT_EQ(actual_scales, reference_scales);
+            }
+        }
+    }
+    std::vector<uint8_t> guard(offset);
+    CUDA_ASSERT(cudaMemcpy(guard.data(), tokenStorage, offset, cudaMemcpyDeviceToHost));
+    EXPECT_TRUE(std::all_of(guard.begin(), guard.end(), [](uint8_t x) { return x == 0x5a; }));
+    CUDA_ASSERT(cudaMemcpy(guard.data(), scaleStorage, offset, cudaMemcpyDeviceToHost));
+    EXPECT_TRUE(std::all_of(guard.begin(), guard.end(), [](uint8_t x) { return x == 0x5a; }));
+    NCCL_ASSERT(ncclEpHandleDestroy(handle));
+    NCCL_ASSERT(ncclEpGroupDestroy(group));
+    NCCL_ASSERT(ncclCommWindowDeregister(g_comm, tokenWindow));
+    NCCL_ASSERT(ncclCommWindowDeregister(g_comm, scaleWindow));
+    NCCL_ASSERT(ncclMemFree(tokenStorage));
+    NCCL_ASSERT(ncclMemFree(scaleStorage));
+    for (auto* t : tensors) {
+        if (t != recv && t != recv_scales) {
+            CUDA_ASSERT(cudaFree(t->data));
+        }
+        NCCL_ASSERT(ncclEpTensorDestroy(t));
+    }
+}
+
+TEST_F(QuantizationRecipeTest, DsFp8RankMajorWindowOffsetsAndPartialWindowsMatchStaging) {
+    run_dsfp8_window_offsets(false);
+}
+
+TEST_F(QuantizationRecipeTest, DsFp8RankMajorStrictZeroCopyWindowOffsets) {
+    run_dsfp8_window_offsets(true);
+}
+
+TEST_F(QuantizationRecipeTest, DsFp8RankMajorMultiTokenWindowOffsets) {
+    run_dsfp8_window_offsets(false, 33);
+}
+
 TEST_F(QuantizationRecipeTest, DsFp8E3M4DispatchCompletes) {
     constexpr int kDsHidden = 512;
     constexpr int kDsScalesPerToken = kDsHidden / 128;

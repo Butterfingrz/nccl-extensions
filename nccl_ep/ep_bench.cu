@@ -6243,7 +6243,8 @@ int main(int argc, char* argv[]) {
         ll_dispatch_out_opts =
             (zcopy && layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
              (dispatch_quantization == NCCL_EP_DISP_QUANT_NONE ||
-              dispatch_quantization == NCCL_EP_DISP_QUANT_FWD)) ? &ll_zc_opts : nullptr;
+              dispatch_quantization == NCCL_EP_DISP_QUANT_FWD ||
+              dispatch_quantization == NCCL_EP_DISP_QUANT_DS_FP8E3M4)) ? &ll_zc_opts : nullptr;
         setupLowLatencyTensors(
             dispatch_inputs,
             dispatch_outputs,
@@ -6259,7 +6260,7 @@ int main(int argc, char* argv[]) {
             config.max_dispatch_tokens_per_rank,
             nRanks,
             layout,
-            ll_dispatch_out_opts,
+            dispatch_input_dtype == dispatch_output_dtype ? ll_dispatch_out_opts : nullptr,
             dispatch_input_dtype);
         if (dispatch_input_dtype != dispatch_output_dtype) {
             const size_t output_sizes[3] = {
@@ -6269,7 +6270,8 @@ int main(int argc, char* argv[]) {
             };
             epFreeTensor(&dispatch_outputs.tokens, &alloc.external_data_ptrs, &alloc.tensor_data_ptrs);
             NCCLCHECK(epMakeTensor(&dispatch_outputs.tokens, 3, dispatch_output_dtype,
-                                   output_sizes[0], output_sizes[1], output_sizes[2]));
+                                   output_sizes[0], output_sizes[1], output_sizes[2], 1, 1,
+                                   ll_dispatch_out_opts));
         }
     } else {
         setupHighThroughputTensors(
@@ -7220,61 +7222,68 @@ int main(int argc, char* argv[]) {
             CUDACHECK(cudaFree(mask_status_d));
         }
 
-        // --- Phase 2: Combine with rank 3 failing ---
-        // Copy dispatch output to combine input (passthrough)
-        if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
-            void* eo_data;
-            void* output0_data;
-            NCCLCHECK(epGetTensorData(alloc, combine_inputs.tokens, &eo_data));
-            NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &output0_data));
-            const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
-            size_t data_size = out0_sizes[0] * out0_sizes[1] * out0_sizes[2] * tokenElemBytes(token_dtype);
-            CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
-        }
+        // Dispatch-only recipes have no combine contract (and their FP8 output
+        // cannot be copied as a BF16 combine input).
+        if (!dispatch_only) {
+            // --- Phase 2: Combine with rank 3 failing ---
+            // Copy dispatch output to combine input (passthrough)
+            if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
+                void* eo_data;
+                void* output0_data;
+                NCCLCHECK(epGetTensorData(alloc, combine_inputs.tokens, &eo_data));
+                NCCLCHECK(epGetTensorData(alloc, dispatch_outputs.tokens, &output0_data));
+                const size_t* out0_sizes = dispatch_outputs.tokens->sizes;
+                size_t data_size = out0_sizes[0] * out0_sizes[1] * out0_sizes[2] * tokenElemBytes(token_dtype);
+                CUDACHECK(cudaMemcpy(eo_data, output0_data, data_size, cudaMemcpyDeviceToDevice));
+            }
 
-        if (myRank == dispatch_fail_rank || myRank == combine_fail_rank) {
-            printf("Rank %d: simulating failure (skipping combine)\n", myRank);
-            fflush(stdout);
-        } else {
-            combine_fn();
-            CUDACHECK(cudaStreamSynchronize(stream));
-        }
+            if (myRank == dispatch_fail_rank || myRank == combine_fail_rank) {
+                printf("Rank %d: simulating failure (skipping combine)\n", myRank);
+                fflush(stdout);
+            } else {
+                combine_fn();
+                CUDACHECK(cudaStreamSynchronize(stream));
+            }
 
-        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+            MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
 
-        // Poll async error first, then query mask for details
-        if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
-            int async_err = 0;
-            NCCLCHECK(ncclEpGetAsyncError(ep_group, &async_err));
-            printf("Rank %d: async error after combine: %d (%s)\n", myRank, async_err, async_err ? "PASSED" : "FAILED");
-            fflush(stdout);
+            // Poll async error first, then query mask for details
+            if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
+                int async_err = 0;
+                NCCLCHECK(ncclEpGetAsyncError(ep_group, &async_err));
+                printf("Rank %d: async error after combine: %d (%s)\n", myRank, async_err, async_err ? "PASSED" : "FAILED");
+                fflush(stdout);
 
-            // Error detected -- query mask to find which ranks failed
-            int* mask_status_d;
-            CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&mask_status_d), nRanks * sizeof(int)));
-            NCCLCHECK(ncclEpMaskQuery(ep_group, mask_status_d, stream));
-            CUDACHECK(cudaStreamSynchronize(stream));
+                // Error detected -- query mask to find which ranks failed
+                int* mask_status_d;
+                CUDACHECK(cudaMalloc(reinterpret_cast<void**>(&mask_status_d), nRanks * sizeof(int)));
+                NCCLCHECK(ncclEpMaskQuery(ep_group, mask_status_d, stream));
+                CUDACHECK(cudaStreamSynchronize(stream));
 
-            int* mask_status_h = new int[nRanks];
-            CUDACHECK(cudaMemcpy(mask_status_h, mask_status_d, nRanks * sizeof(int), cudaMemcpyDeviceToHost));
+                int* mask_status_h = new int[nRanks];
+                CUDACHECK(cudaMemcpy(mask_status_h, mask_status_d, nRanks * sizeof(int), cudaMemcpyDeviceToHost));
 
-            printf("Rank %d: mask after combine = [", myRank);
-            for (int r = 0; r < nRanks; r++) printf("%d%s", mask_status_h[r], r < nRanks - 1 ? "," : "");
-            printf("]\n");
+                printf("Rank %d: mask after combine = [", myRank);
+                for (int r = 0; r < nRanks; r++) {
+                    printf("%d%s", mask_status_h[r], r < nRanks - 1 ? "," : "");
+                }
+                printf("]\n");
 
-            // 0 = masked/failed, 1 = active
-            bool combine_mask_ok = (mask_status_h[dispatch_fail_rank] == 0) && (mask_status_h[combine_fail_rank] == 0);
-            printf("Rank %d: combine mask check: %s (rank %d=%d, rank %d=%d)\n", myRank,
-                   combine_mask_ok ? "PASSED" : "FAILED", dispatch_fail_rank, mask_status_h[dispatch_fail_rank],
-                   combine_fail_rank, mask_status_h[combine_fail_rank]);
-            fflush(stdout);
+                // 0 = masked/failed, 1 = active
+                bool combine_mask_ok = (mask_status_h[dispatch_fail_rank] == 0) && (mask_status_h[combine_fail_rank] == 0);
+                printf("Rank %d: combine mask check: %s (rank %d=%d, rank %d=%d)\n", myRank,
+                       combine_mask_ok ? "PASSED" : "FAILED", dispatch_fail_rank, mask_status_h[dispatch_fail_rank],
+                       combine_fail_rank, mask_status_h[combine_fail_rank]);
+                fflush(stdout);
 
-            delete[] mask_status_h;
-            CUDACHECK(cudaFree(mask_status_d));
-        }
+                delete[] mask_status_h;
+                CUDACHECK(cudaFree(mask_status_d));
+            }
+
+        } // !dispatch_only
 
         // --- Phase 3: Clean mask buffer and verify ---
-        if (myRank != dispatch_fail_rank && myRank != combine_fail_rank) {
+        if (myRank != dispatch_fail_rank && (dispatch_only || myRank != combine_fail_rank)) {
             NCCLCHECK(ncclEpMaskClean(ep_group, stream));
             NCCLCHECK(ncclEpErrorClear(ep_group));
             CUDACHECK(cudaStreamSynchronize(stream));

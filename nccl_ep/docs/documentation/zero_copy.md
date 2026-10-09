@@ -77,10 +77,15 @@ LL dispatch takes the direct path only when all of these hold:
 
 - **NVLink-only topology** — `lsa_team_size == nRanks`, i.e. no RDMA leg;
 - **`NCCL_EP_LAYOUT_RANK_MAJOR`**;
-- recipe is `NCCL_EP_DISP_QUANT_NONE` or `NCCL_EP_DISP_QUANT_FWD`.
+- recipe is `NCCL_EP_DISP_QUANT_NONE`, `NCCL_EP_DISP_QUANT_FWD`, or
+  `NCCL_EP_DISP_QUANT_DS_FP8E3M4`.
 
-Then `outputs->tokens` is written directly when windowed, and under `QUANT_FWD`
-`outputs->scales` independently as well — either, both, or neither.
+Then `outputs->tokens` is written directly when windowed. Under `QUANT_FWD`
+and fused `DS_FP8E3M4`, `outputs->scales` is independently written directly
+when windowed — either, both, or neither. DSFP8 accepts BF16 input and generates
+FP8 tokens and FP32 inverse scales inside dispatch. Universal and LSA SIMT
+dispatch support this fused zero-copy path. The default TMA selector falls back
+to SIMT for DSFP8; the TMA kernel remains unquantized.
 
 ## The group-wide `zero_copy` flag
 

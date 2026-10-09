@@ -142,7 +142,8 @@ inline std::string ll_dispatch_jit_source(
             << "      " << topk_type << ",\n"
             << "      " << token_dtype_literal << ",\n"
             << "      " << kernel_spec.scale_type_literal << ",\n"
-            << "      " << ::nccl_ep::jit::bool_literal(cftEnabled) << ">(p);\n";
+            << "      " << ::nccl_ep::jit::bool_literal(cftEnabled) << ", "
+            << ::nccl_ep::jit::bool_literal(stageQuant) << ">(p);\n";
         break;
     }
     src << "}\n";
