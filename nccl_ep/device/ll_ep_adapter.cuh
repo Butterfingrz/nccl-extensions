@@ -28,6 +28,22 @@ namespace ll {
 // See ll_dispatch_select_algo in device/jit/ll_dispatch_jit.cuh.
 enum class NcclEpDispatchLsaMode { kSimt, kTma, kUniversal };
 
+// Both the NCCL_EP_COMBINE_LSA request for one ncclEpCombine call (see nccl_ep_env.h) and the
+// concrete LL combine kernel ll_combine_select_kernel (jit/ll_combine_jit.cuh) resolves it to --
+// one enum, since every enforceable request already names a concrete kernel 1:1. Not every value
+// is meaningful in both roles:
+//   kNone:        valid only as a request -- "2sided"/"1sided"/"universal" unset; defer to
+//                 eligibility (ll_combine_select_kernel's kNone case). Never a resolved kernel.
+//   kDefault:     the general kernel. Valid as a request ("universal", always honorable) and as
+//                 the resolved kernel (ineligible for any LSA-only kernel).
+//   k2SidedRmLsa / k1SidedRmLsa: valid as a request ("2sided"/"1sided") and as the resolved
+//                 kernel for that request.
+//   kAutoRmLsa:   the on-device 1-sided-vs-2-sided auto-pick kernel. Only ever a resolved
+//                 kernel (for an unenforced, eligible call) -- nothing can request it directly.
+//   kInvalid:     an enforced request eligibility can't honor. Only ever a resolved kernel;
+//                 callers must check for it and fail, never launch a kernel.
+enum class LlCombineKernel { kNone, kDefault, k2SidedRmLsa, k1SidedRmLsa, kAutoRmLsa, kInvalid };
+
 // Keep shared-quantization eligibility identical in the host geometry, JIT
 // launch bounds, and device staging allocation.
 // Tuning-derived cutoff: shared staging was validated through H=16384 on
@@ -141,6 +157,14 @@ struct dispatch_kernel_args_t {
     void* outDataBuf;
     void* outScalesBuf;
     int* outSrcInfo;
+    // Sender-side (dstRank, slotIdx) info for combine_kernel_impl_1sided_rm_lsa, written
+    // ADDITIONALLY to outSrcInfo above (see kRecordDstInfo in ll/ll_dispatch_lsa.cuh).
+    int* outDstInfo;
+    // Handle-owned want-1-sided output for NCCL_EP_COMBINE_LSA auto mode -- dispatch itself compares
+    // every active peer's published count against combineLsaThreshold below and publishes the
+    // combined 0/1 answer (see computeAndPublishWant1SidedLsa in ll/ll_dispatch_lsa.cuh); same gate
+    // as outDstInfo above.
+    int* outWant1Sided;
     int* outRecvRankCounter;
     int64_t* outLayout;
     int* outCnt;
@@ -151,10 +175,21 @@ struct dispatch_kernel_args_t {
     size_t sendOff;
     size_t recvOff;
     size_t recvCntOff;
+    // Per-peer "total tokens I'm dispatching this round" publish region (see
+    // LowLatencyBuffer::dispatch_rdma_total_token_buffer_offset's doc comment): buffer-relative
+    // offset, banked by epoch parity using signalSlotStride below (shared by every signaling kind
+    // -- see its doc comment in common.hpp). Only read/written under the same kRecordDstInfo gate
+    // as outDstInfo.
+    size_t totalTokenOff;
     int* rankSentCnt;
     int* rankArrivedCnt;
     int* rankDone;
-    int nextRecvCntBufSize;
+    // Ints to clear covering this bank's signal + read-done span (never total-token); see
+    // LowLatencyBuffer::lsa_signaling_clean_int_count's doc comment. Shared by every dispatch
+    // kernel's next-bank wipe, LSA and general alike -- the general kernel used to wipe only its
+    // own narrower signal-only span (a separate, now-removed nextRecvCntBufSize field), which left
+    // read-done stale for a bank a later LSA round reused.
+    int lsaSignalingCleanCount;
     int* recvStats;
     int64_t* waitStats;
     LowLatencyEpochState* epochState;
@@ -171,6 +206,9 @@ struct dispatch_kernel_args_t {
     int numWarpGroups;
     int numWarpsPerGroup;
     bool roundScale;
+    // NCCL_EP_COMBINE_LSA_1SIDED_THRESH; only read when outWant1Sided above is non-null. See
+    // computeAndPublishWant1SidedLsa in ll/ll_dispatch_lsa.cuh.
+    int combineLsaThreshold;
     // recv_topk_idx numbering (LOCAL/GLOBAL); resolved on the host (never AUTO).
     ncclEpExpertIdKind_t recvTopkIdxKind;
     int phases;
@@ -192,6 +230,14 @@ struct combine_kernel_args_t {
     const void* inData;
     const float* inGlobalScales;
     const int* srcInfo;
+    // Sender-side (dstRank, slotIdx) info read by combine_kernel_impl_1sided_rm_lsa; non-null
+    // only when that kernel is selected (see ncclEpCombine's combine_1sided gating).
+    const int* dstInfo;
+    // inData's own window registration + base offset, resolved by ncclEpCombine for the
+    // 1-sided pull path (combine_kernel_impl_1sided_rm_lsa reads other ranks' inData directly
+    // via ncclGetPeerPointer(inDataWindow, ...)). ncclWindow_t{} when unused (2-sided path).
+    ncclWindow_t inDataWindow;
+    size_t inDataWindowOffset;
     const int64_t* layoutRange;
     const void* inTopkIdx;        // cast to const TopkIdxT* by the JIT entry
     const float* topkWeights;
@@ -204,8 +250,25 @@ struct combine_kernel_args_t {
     size_t sendOff;
     size_t recvOff;
     size_t recvFlagOff;
+    // combine_kernel_impl_1sided_rm_lsa's read-done signaling region (see
+    // LowLatencyBuffer::combine_rdma_read_done_buffer_offset's doc comment); banked using
+    // signalSlotStride below, shared by every signaling kind (see its doc comment in common.hpp).
+    // Unused by the 2-sided kernel.
+    size_t readDoneOffBase;
+    // NCCL_EP_COMBINE_SYNC_COUNT-element array of grid-wide election counters; see ctaSync's doc
+    // comment in ll_combine_lsa.cuh.
     int* combineSync;
-    int nextRecvCntBufSize;
+    // NCCL_EP_COMBINE_LSA auto mode's want-1-sided input: dispatch has already compared every
+    // active peer's count against combineLsaThreshold and published the combined 0/1 answer (see
+    // dispatch_kernel_args_t::outWant1Sided / computeAndPublishWant1SidedLsa). A plain read -- no
+    // reset needed, dispatch overwrites it fresh each round.
+    int* want1SidedBuf;
+    // Ints to clear covering this bank's signal + read-done span (never total-token, which combine
+    // never touches anyway); see LowLatencyBuffer::lsa_signaling_clean_int_count's doc comment.
+    // Shared by every combine kernel's next-bank wipe, LSA and general alike -- see
+    // dispatch_kernel_args_t::lsaSignalingCleanCount's doc comment for why the general kernel can't
+    // use a narrower, signal-only count of its own.
+    int lsaSignalingCleanCount;
     int64_t* waitStats;
     LowLatencyEpochState* epochState;
     size_t payloadSlotStride;
@@ -265,6 +328,8 @@ struct DispatchParams {
     void* outDataBuf;
     void* outScalesBuf;
     int* outSrcInfo;
+    int* outDstInfo = nullptr; // non-null only when 1-sided combine could be selected
+    int* outWant1Sided = nullptr; // non-null only when 1-sided combine could be selected
     int* outRecvRankCounter;       // rank-major only; nullptr otherwise
     int64_t* outLayout;
     int* outCnt;
@@ -276,7 +341,8 @@ struct DispatchParams {
     size_t sendOff;
     size_t recvOff;
     size_t recvCntOff;
-    int nextRecvCntBufSize;
+    size_t totalTokenOff = 0;      // see dispatch_kernel_args_t::totalTokenOff
+    int lsaSignalingCleanCount = 0; // see dispatch_kernel_args_t::lsaSignalingCleanCount
     int* recvStats;
     int64_t* waitStats;
 
@@ -337,6 +403,19 @@ struct DispatchParams {
     // JIT specialization only; does not change launch geometry or shared memory.
     int tmaQuantWarps = dispatch_tma_smem::kMinQuantWarps;
 
+    // True whenever 1-sided combine could be selected for this call
+    bool recordDstInfo = false;
+    // NCCL_EP_COMBINE_LSA_1SIDED_THRESH; only read when recordDstInfo above is true. See
+    // dispatch_kernel_args_t::combineLsaThreshold.
+    int combineLsaThreshold = 0;
+    // INPUT/OUTPUT: the caller seeds *dstInfoDisqualifiedOut with its own already-known
+    // disqualifying reasons (true if it never wants 1-sided enabled this call, regardless of
+    // dispatch's kernel selection), and call_dispatch ORs in whether THIS call's actual kernel
+    // selection ALSO disqualifies 1-sided combine (see launch_ll_dispatch's dstInfoDisqualifiedOut
+    // doc comment) -- the single source of truth ncclEpHandle::ll.dispatch_1sided_disqualified
+    // must be set from, instead of re-deriving it from lsaMode alone.
+    bool* dstInfoDisqualifiedOut = nullptr;
+
     // Populated after CFT setup succeeds on every rank.
     const uint32_t* cftPeerLeIds = nullptr;
     void*           cftRecvBase = nullptr;
@@ -352,6 +431,9 @@ struct CombineParams {
     const void* inData;
     const float* inGlobalScales = nullptr;
     const int* srcInfo;
+    const int* dstInfo = nullptr;      // 1-sided only; see combine_kernel_args_t
+    ncclWindow_t inDataWindow = ncclWindow_t{};
+    size_t inDataWindowOffset = 0;
     const int64_t* layoutRange;
     const void* inTopkIdx;        // int32_t* or int64_t*; see topkIdxIsInt64
     bool topkIdxIsInt64 = true;   // selects the TopkIdxT kernel specialization
@@ -365,7 +447,8 @@ struct CombineParams {
     size_t sendOff;
     size_t recvOff;
     size_t recvFlagOff;
-    int nextRecvCntBufSize;
+    size_t readDoneOffBase = 0;    // 1-sided only; see combine_kernel_args_t
+    int lsaSignalingCleanCount = 0; // see combine_kernel_args_t::lsaSignalingCleanCount
     int64_t* waitStats;
 
     LowLatencyEpochState* epochState = nullptr;
@@ -389,7 +472,8 @@ struct CombineParams {
 
     // Runtime workspace + error tracking. Each pointer is a dedicated,
     // non-overlapping region computed once at group-creation time.
-    int* combineSync;
+    int* combineSync; // NCCL_EP_COMBINE_SYNC_COUNT ints; see combine_kernel_args_t
+    int* want1SidedBuf = nullptr; // auto mode only; see combine_kernel_args_t
     int numDeviceSms;
     unsigned int deviceSm;
     int maxDynamicSmem;
@@ -414,9 +498,18 @@ struct CombineParams {
     ncclEpCombQuant_t quantizationRecipe = NCCL_EP_COMB_QUANT_NONE;
 
     // True when every destination is NVLink-reachable (the whole world fits in
-    // one LSA team). One of the inputs ll_combine_select_algo uses to pick an
-    // LSA-only kernel; ignored by the general (kDefault) JIT path.
+    // one LSA team). One of the inputs call_combine passes to ll_combine_lsa_eligible;
+    // ignored by the general (kDefault) JIT path.
     bool nvlinkOnly = false;
+
+    // NCCL_EP_COMBINE_LSA request for this call, as a kernel (see LlCombineKernel's doc comment
+    // above) -- kNone unless "2sided"/"1sided"/"universal" was set.
+    LlCombineKernel enforced = LlCombineKernel::kNone;
+
+    // The two extra inputs call_combine needs, beyond the fields above, to compute 1-sided
+    // eligibility itself (see ll_combine_lsa_eligible/ll_combine_select_kernel's doc comments).
+    bool groupZeroCopyOn = false;
+    bool dispatch1SidedDisqualified = false;
 };
 
 struct CleanLowLatencyBufferParams {

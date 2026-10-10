@@ -107,6 +107,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_choice(cfg->dispatch_copy_mode);
     parse_choice(cfg->dispatch_lsa);
     parse_ulong(cfg->ll_tma_quant_warps, true);
+    parse_choice(cfg->combine_lsa);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
@@ -123,6 +124,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_ulong(cfg->combine_num_stages_s2g);
     parse_ulong(cfg->combine_num_pipelines);
     parse_ulong(cfg->ll_cft_debug_min_driver);
+    parse_ulong(cfg->combine_lsa_threshold);
 }
 
 int nccl_ep_resolve_combine_chunk(const ncclEpEnvConfig& cfg, int dispatch_num_sms, int num_lsa_teams) {
@@ -199,6 +201,8 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.ll_cft_debug_min_driver,
         &cfg.dispatch_lsa,
         &cfg.ll_tma_quant_warps,
+        &cfg.combine_lsa,
+        &cfg.combine_lsa_threshold,
     };
 
     std::fprintf(stderr, "[nccl_ep][env] NCCL EP environment configuration:\n");

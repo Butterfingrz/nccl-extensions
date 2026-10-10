@@ -82,6 +82,17 @@ __device__ __forceinline__ void syncSmGroup(int groupIdx, int nThreads) {
     }
 }
 
+// Zeroes the next epoch's receive-count/flag buffer bank. Shared by every LL dispatch/combine
+// variant (general and LSA); callers differ only in which/how many threads participate, hence
+// the explicit offset/stride instead of a hardcoded warp.
+__device__ __forceinline__ void cleanNextRecvCntBufStrided(
+    int* nextRecvCntBuf, int nextRecvCntBufSize, int offset, int stride) {
+#pragma unroll
+    for (int i = offset; i < nextRecvCntBufSize; i += stride) {
+        nextRecvCntBuf[i] = 0;
+    }
+}
+
 // Warp-cooperative: all 32 lanes must call together.
 // Each lane inspects its own topk index and matches it with others via __match_any_sync.
 // If this lane is not the first occurrence of its source rank, topkIdxByLane is dropped to -1.

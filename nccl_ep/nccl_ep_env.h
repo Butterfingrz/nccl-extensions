@@ -105,6 +105,19 @@ struct ncclEpEnvConfig {
     // Default is two workers. Invalid settings are rejected when launching
     // DSFP8 TMA dispatch rather than silently restoring the default.
     ncclEpEnvVar ll_tma_quant_warps{"NCCL_EP_LL_TMA_QUANT_WARPS", ncclEpEnvType::ulong};
+    // Selects the LL combine protocol: "2sided" always uses combine_kernel_impl_2sided_rm_lsa and
+    // "1sided" always uses combine_kernel_impl_1sided_rm_lsa, both requiring LSA eligibility
+    // (errors otherwise); "universal" always uses the general kDefault kernel regardless of LSA
+    // eligibility, mirroring dispatch_lsa's "universal"; UNSET (default) is "auto" -- the pick is
+    // made by dispatch (not combine), on-device, from whether any active peer's published count
+    // exceeds combine_lsa_threshold below, and consumed as-is by combine at kernel entry. See
+    // combine_lsa handling in nccl_ep.cc and LlCombineKernel in jit/ll_combine_jit.cuh.
+    static constexpr const char* combine_lsa_modes[] = {"2sided", "1sided", "universal", nullptr};
+    ncclEpEnvVar combine_lsa{"NCCL_EP_COMBINE_LSA", ncclEpEnvType::choice, combine_lsa_modes};
+    // Threshold above which combine_lsa's auto mode picks 1-sided over 2-sided -- read and applied
+    // by dispatch (dispatch_kernel_args_t::combineLsaThreshold), not combine. Unset defaults to 512
+    // at the read site (nccl_ep.cc), not here.
+    ncclEpEnvVar combine_lsa_threshold{"NCCL_EP_COMBINE_LSA_1SIDED_THRESH", ncclEpEnvType::ulong};
 };
 
 // True iff a flag variable was explicitly set to an "on" value (1/on/true).

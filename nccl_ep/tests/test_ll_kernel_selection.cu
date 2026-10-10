@@ -56,22 +56,68 @@ TEST(LlKernelSelection, DispatchPreservesOtherFallbacks) {
     }
 }
 
+// Enforcing k2SidedRmLsa only reads lsaEligible, never oneSidedEligible -- pass false for the
+// latter throughout, since these cases never exercise the 1-sided/auto paths. NCCL_EP_COMBINE_LSA
+// only governs the pick within the LSA domain, so a call that isn't LSA-eligible at all falls back
+// to kDefault silently rather than erroring -- see ll_combine_select_kernel's doc comment.
 TEST(LlKernelSelection, CombineRequiresFullReceiveTiles) {
     for (auto dtype : {ncclBfloat16, ncclFloat16, ncclFloat32}) {
         const int tile = dtype == ncclFloat32 ? 256 : 512;
         for (int hidden : {2880, tile / 2, tile - 16, tile + 16}) {
-            EXPECT_EQ(ll_combine_select_algo(true, NCCL_EP_COMB_QUANT_NONE, false,
-                NCCL_EP_LAYOUT_RANK_MAJOR, false, hidden, dtype), LlCombineAlgo::kDefault);
+            const bool eligible = ll_combine_lsa_eligible(
+                true, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, false, hidden, dtype);
+            EXPECT_EQ(
+                ll_combine_select_kernel(LlCombineKernel::k2SidedRmLsa, eligible, false),
+                LlCombineKernel::kDefault);
         }
         for (int hidden : {tile, 3072, 7168}) {
-            EXPECT_EQ(ll_combine_select_algo(true, NCCL_EP_COMB_QUANT_NONE, false,
-                NCCL_EP_LAYOUT_RANK_MAJOR, false, hidden, dtype), LlCombineAlgo::k2SidedRmLsa);
+            const bool eligible = ll_combine_lsa_eligible(
+                true, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, false, hidden, dtype);
+            EXPECT_EQ(
+                ll_combine_select_kernel(LlCombineKernel::k2SidedRmLsa, eligible, false),
+                LlCombineKernel::k2SidedRmLsa);
         }
     }
-    EXPECT_EQ(ll_combine_select_algo(true, NCCL_EP_COMB_QUANT_NONE, true,
-        NCCL_EP_LAYOUT_RANK_MAJOR, false, 7168, ncclBfloat16), LlCombineAlgo::kDefault);
-    EXPECT_EQ(ll_combine_select_algo(true, NCCL_EP_COMB_QUANT_NONE, false,
-        NCCL_EP_LAYOUT_RANK_MAJOR, true, 7168, ncclBfloat16), LlCombineAlgo::kDefault);
-    EXPECT_EQ(ll_combine_select_algo(false, NCCL_EP_COMB_QUANT_NONE, false,
-        NCCL_EP_LAYOUT_RANK_MAJOR, false, 7168, ncclBfloat16), LlCombineAlgo::kDefault);
+    EXPECT_EQ(
+        ll_combine_select_kernel(
+            LlCombineKernel::k2SidedRmLsa,
+            ll_combine_lsa_eligible(
+                true, NCCL_EP_COMB_QUANT_NONE, true, NCCL_EP_LAYOUT_RANK_MAJOR, false, 7168, ncclBfloat16),
+            false),
+        LlCombineKernel::kDefault);
+    EXPECT_EQ(
+        ll_combine_select_kernel(
+            LlCombineKernel::k2SidedRmLsa,
+            ll_combine_lsa_eligible(
+                true, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, true, 7168, ncclBfloat16),
+            false),
+        LlCombineKernel::kDefault);
+    EXPECT_EQ(
+        ll_combine_select_kernel(
+            LlCombineKernel::k2SidedRmLsa,
+            ll_combine_lsa_eligible(
+                false, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, false, 7168, ncclBfloat16),
+            false),
+        LlCombineKernel::kDefault);
+}
+
+// k1SidedRmLsa, unlike k2SidedRmLsa, still errors when the call IS LSA-eligible but 1-sided
+// specifically isn't (oneSidedEligible=false) -- that's an in-domain request the enforcement can't
+// honor, not an out-of-domain no-op. Falls back to kDefault only when not even LSA-eligible.
+TEST(LlKernelSelection, OneSidedRequiresInDomainEligibility) {
+    const bool lsa_eligible = ll_combine_lsa_eligible(
+        true, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, false, 7168, ncclBfloat16);
+    ASSERT_TRUE(lsa_eligible);
+    EXPECT_EQ(
+        ll_combine_select_kernel(LlCombineKernel::k1SidedRmLsa, lsa_eligible, false),
+        LlCombineKernel::kInvalid);
+    EXPECT_EQ(
+        ll_combine_select_kernel(LlCombineKernel::k1SidedRmLsa, lsa_eligible, true),
+        LlCombineKernel::k1SidedRmLsa);
+    const bool not_lsa_eligible = ll_combine_lsa_eligible(
+        false, NCCL_EP_COMB_QUANT_NONE, false, NCCL_EP_LAYOUT_RANK_MAJOR, false, 7168, ncclBfloat16);
+    ASSERT_FALSE(not_lsa_eligible);
+    EXPECT_EQ(
+        ll_combine_select_kernel(LlCombineKernel::k1SidedRmLsa, not_lsa_eligible, false),
+        LlCombineKernel::kDefault);
 }

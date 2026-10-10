@@ -83,7 +83,8 @@ inline std::string ll_dispatch_jit_source(
     bool stageQuant,
     bool cftEnabled,
     int numTmaStages,
-    int numTmaQuantWarps) {
+    int numTmaQuantWarps,
+    bool recordDstInfo) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     const char* topk_type = topkIdxIsInt64 ? "int64_t" : "int32_t";
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(tokenDtype);
@@ -111,7 +112,8 @@ inline std::string ll_dispatch_jit_source(
             << "      " << numTmaStages << ",\n"
             << "      " << topk_type << ",\n"
             << "      " << token_dtype_literal << ",\n"
-            << "      " << numTmaQuantWarps << ">(p);\n";
+            << "      " << numTmaQuantWarps << ",\n"
+            << "      " << ::nccl_ep::jit::bool_literal(recordDstInfo) << ">(p);\n";
         break;
     case LlDispatchAlgo::k2SidedRmLsa:
         // dispatch_kernel_impl_2sided_rm_lsa hardcodes NCCL_EP_LAYOUT_RANK_MAJOR
@@ -123,7 +125,8 @@ inline std::string ll_dispatch_jit_source(
             << "      " << hidden << ",\n"
             << "      " << num_topk << ",\n"
             << "      " << topk_type << ",\n"
-            << "      " << token_dtype_literal << ", " << (stageQuant ? "true" : "false") << ">(p);\n";
+            << "      " << token_dtype_literal << ", " << (stageQuant ? "true" : "false") << ",\n"
+            << "      " << ::nccl_ep::jit::bool_literal(recordDstInfo) << ">(p);\n";
         break;
     case LlDispatchAlgo::kDefault:
         src << "  nccl_ep::ll::dispatch_kernel_impl<\n"
@@ -159,11 +162,22 @@ inline ncclResult_t launch_ll_dispatch(
     NcclEpDispatchLsaMode lsaMode,
     int tmaQuantWarps,
     int maxDynamicSmem,
+    bool recordDstInfo,
     const dispatch_kernel_args_t& args,
     cudaStream_t stream,
-    bool nucs) {
+    bool nucs,
+    bool* dstInfoDisqualifiedOut) {
     const bool cftEnabled = cft_smem_bytes != 0;
     const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout, cftEnabled, lsaMode, hidden, tokenDtype);
+    // The single source of truth for whether this call's kernel selection writes
+    // dstInfo/maxTotalTokens at all (only the two LSA algos do) -- callers must not
+    // re-derive this from lsaMode alone, since kDefault can also be chosen for reasons
+    // other than NCCL_EP_DISPATCH_LSA=universal (see ll_dispatch_select_algo above).
+    // *dstInfoDisqualifiedOut is also an INPUT: a caller that already knows 1-sided must never be
+    // enabled this call (e.g. it's statically unreachable regardless of which kernel runs) seeds it
+    // true beforehand, and that sticks -- this only ever ADDS a disqualifying reason, never clears
+    // one the caller already set.
+    *dstInfoDisqualifiedOut = *dstInfoDisqualifiedOut || algo == LlDispatchAlgo::kDefault;
     const bool twoSidedRmLsa = algo == LlDispatchAlgo::k2SidedRmLsa;
     const bool twoSidedRmLsaTma = algo == LlDispatchAlgo::k2SidedRmLsaTma;
     const bool tmaQuant = twoSidedRmLsaTma && recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
@@ -256,6 +270,7 @@ inline ncclResult_t launch_ll_dispatch(
     if (tmaQuant) {
         key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(numTmaQuantWarps));
     }
+    key = ::nccl_ep::jit::runtime_key_mix(key, recordDstInfo ? 1u : 0u);
     variant.runtime_key = key;
     variant.num_blocks = numSms;
     variant.block_dim = numWarps * 32;
@@ -296,11 +311,12 @@ inline ncclResult_t launch_ll_dispatch(
              << (compactQuant ? "_compact" : "")
              << (stageQuant ? "_staged" : "")
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
-             << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype);
+             << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype)
+             << (recordDstInfo ? "_dstinfo1s" : "");
         variant_name = name.str();
         const std::string source = ll_dispatch_jit_source(
             kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype, algo,
-            compactQuant, stageQuant, cftEnabled, numTmaStages, numTmaQuantWarps);
+            compactQuant, stageQuant, cftEnabled, numTmaStages, numTmaQuantWarps, recordDstInfo);
         variant.variant_name = variant_name;
         variant.source = source;
         status = ::nccl_ep::jit::launch_jit_kernel(

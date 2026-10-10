@@ -72,17 +72,6 @@ namespace ll {
 // combine_smem (ll_ep_smem.cuh) so this file and choose_combine_smem_config
 // (ll_ep_adapter.cuh) share one definition.
 
-// Clean next receive count buffer. Pure local buffer zeroing, no P2P/GIN
-// dependency, no atomic touch -- this kernel's completion signaling is
-// syncAndSendFinishLsa's own CTA-election counter (ctaDone), not this
-// buffer, so there's nothing to notify here.
-__forceinline__ __device__ void cleanNextRecvCntBufAndNotifyLsa(int* nextRecvCntBuf, int nextRecvCntBufSize, int laneId) {
-#pragma unroll
-    for (int i = laneId; i < nextRecvCntBufSize; i += 32) {
-        nextRecvCntBuf[i] = 0;
-    }
-}
-
 // Rank-scoped finish-flag publish, used by combine_kernel_impl_2sided_rm_lsa's
 // single-shot send completion: writes into `dstRank`'s recvFlagBuf at index
 // `currRank` (the sender's own identity) -- mirrors sendPeerTokenCountLsa in
@@ -451,7 +440,7 @@ __device__ __forceinline__ void combine_kernel_impl_2sided_rm_lsa( // INPUT
     size_t recvOffBase,
     size_t recvFlagOffBase,
     int* ctaDone,
-    int nextRecvCntBufSize,
+    int lsaSignalingCleanCount,
     int64_t* waitStats,
     LowLatencyEpochState* epochState,
     size_t payloadSlotStride,
@@ -539,10 +528,14 @@ __device__ __forceinline__ void combine_kernel_impl_2sided_rm_lsa( // INPUT
         goto LOW_LATENCY_COMBINE_LSA_RECV;
     }
 
-    // Clean up next buffer. ctaDone (syncAndSendFinishLsa's own CTA-arrival
-    // counter, below) is untouched here -- nothing to notify.
-    if (smId == 0 and warpGroupId == 0 and subWarpId == 0) {
-        cleanNextRecvCntBufAndNotifyLsa(nextRecvCntBuf, nextRecvCntBufSize, laneId);
+    // Clean up next buffer: signal + read-done span in one pass, even though 2-sided itself never
+    // touches read-done -- it's prepping the bank for whichever op lands there next (see
+    // LowLatencyBuffer::lsa_signaling_clean_int_count). ctaDone (syncAndSendFinishLsa's own
+    // CTA-arrival counter, below) is untouched here -- nothing to notify. Every thread of this CTA
+    // participates (not just one warp): all are still idle here, ahead of their own token-sending
+    // work below, and each writes a distinct index, so no synchronization is needed between them.
+    if (smId == 0) {
+        cleanNextRecvCntBufStrided(nextRecvCntBuf, lsaSignalingCleanCount, threadId, numThreads);
     }
 
     // Issue tokens sending
@@ -780,6 +773,332 @@ LOW_LATENCY_COMBINE_LSA_RECV:
                     });
             }
         }
+    }
+}
+
+} // namespace ll
+
+} // namespace nccl_ep
+
+namespace nccl_ep {
+
+namespace ll {
+
+// "Every peer that could have pulled from me has confirmed it's done reading my inData" wait,
+// used only by combine_kernel_impl_1sided_rm_lsa right before it returns. Unlike
+// waitForAllRanksFinishLsa above (every CTA redundantly re-checks all of numRanks, because each
+// CTA's own subsequent pulling depends on it), nothing within this kernel invocation gates on a
+// *specific* CTA having observed a given peer's done-flag -- it only needs to be true, grid-wide,
+// by the time this kernel retires, which is what the caller relies on via CUDA's stream ordering
+// before it may safely let the next round's expert-compute step overwrite this rank's inData. So
+// this distributes [0, numRanks) once across the whole grid (every (CTA, thread) pair a disjoint
+// slice) instead of covering it numSms times over. No closing __syncthreads()/memory_fence() to
+// propagate visibility within the CTA: this is the last thing the kernel does.
+__forceinline__ __device__ void waitForAllReadDoneDistributedLsa(
+    int smId,
+    int numSms,
+    int threadId,
+    int numThreads,
+    int numRanks,
+    int* rankMask,
+    const int* readDoneBuf,
+    uint64_t timeoutCycles,
+    int currRank,
+    int* asyncErrorFlag) {
+    const auto startTime = clock64();
+    for (int peer = smId * numThreads + threadId; peer < numRanks; peer += numSms * numThreads) {
+        if (isRankMasked(rankMask, peer)) continue;
+        uint64_t waitCost = 0;
+        while (ld_relaxed_sys_global(reinterpret_cast<const uint32_t*>(readDoneBuf + peer)) == 0 &&
+               (waitCost = clock64() - startTime) <= timeoutCycles);
+        if (waitCost > timeoutCycles) {
+            printf("Warning: NCCL EP timeout for combine read-done ack, rank %d, peer %d\n", currRank, peer);
+            if (rankMask == nullptr) trap();
+            atomicExch(rankMask + peer, 0);
+            if (asyncErrorFlag != nullptr) atomicExch_system(asyncErrorFlag, 1);
+        }
+    }
+}
+
+// LSA-only, unquantized (NONE recipe), rank-major-only, BF16-only LL combine entry point for the
+// dispatch-push/combine-pull ("1-sided") mode -- pairs with any 2-sided dispatch kernel that was
+// run with kRecordDstInfo=true (ll/ll_dispatch_lsa.cuh), which additionally records each token's
+// (dstRank, slotIdx) into dstInfo. This kernel never sends anything itself: it pulls each
+// token's already-computed result directly out of the owning rank's inData window (resolved via
+// ncclGetPeerPointer(inDataWindow, ...)), decoding with a -1 dstRank sentinel for
+// duplicate-rank/invalid topk slots (written unconditionally by dispatch -- see its own doc
+// comment). SEND phase is reduced to a single-shot readiness broadcast (telling every peer "my
+// inData is ready to be pulled from"); RECV phase additionally must wait, before retiring, for
+// every peer that could have pulled from THIS rank's inData to confirm it's done -- the caller's
+// own inData buffer must not be overwritten by the next round's expert compute until then, which
+// is what the trailing waitForAllReadDoneDistributedLsa call guarantees (see its own doc
+// comment).
+template <int kHidden, int kNumTopk, int kNumMaxUnrolls, ncclDataType_t kTokenDtype>
+__device__ __forceinline__ void combine_kernel_impl_1sided_rm_lsa( // INPUT
+    const void* inData,
+    ncclWindow_t inDataWindow,
+    size_t inDataWindowOffset,
+    const int* dstInfo, // (dstRank, slotIdx) pairs written by dispatch's kRecordDstInfo path
+    int* rankMask,
+    int* asyncErrorFlag,
+    // OUTPUT
+    void* outData,
+    // INTERMEDIATE
+    void* commBuf,
+    size_t recvFlagOffBase,
+    // NCCL_EP_COMBINE_SYNC_COUNT-element array of grid-wide election counters. ctaSync[1] (never
+    // ctaSync[0] again) backs the SECOND (RECV-phase read-done) election below: the two elections
+    // are separated only by a per-CTA __syncthreads(), not a grid-wide barrier, so reusing
+    // ctaSync[0] races (see its doc comment in ll_ep_adapter.cuh).
+    int* ctaSync,
+    int lsaSignalingCleanCount,
+    int64_t* waitStats,
+    LowLatencyEpochState* epochState,
+    size_t payloadSlotStride,
+    size_t signalSlotStride,
+    size_t readDoneOffBase,
+    // CONFIG
+    int numCombinedTokens,
+    int maxTokensPerRank,
+    int numExperts,
+    int currRank,
+    int numRanks,
+    int numWarpGroups,
+    int numWarpsPerGroup,
+    int phases,
+    ncclDevComm* devComm,
+    const ncclWindow_t* windows,
+    uint64_t timeoutCycles) {
+    constexpr int numTopk = kNumTopk;
+    EP_STATIC_ASSERT(numTopk > 0, "numTopk must be positive");
+    constexpr int kElemBytes = (kTokenDtype == ncclFloat32) ? 4 : 2;
+
+    const auto smId = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
+    const auto numSms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
+    const auto threadId = static_cast<int>(threadIdx.x);
+    const auto numThreads = __shfl_sync(0xffffffff, static_cast<int>(blockDim.x), 0);
+    const auto warpId = __shfl_sync(0xffffffff, threadId / 32, 0), laneId = get_lane_id();
+    // Unlike the 2-sided kernel, dstRank/numLocalExperts routing is never re-derived here (it
+    // comes straight from dstInfo); numWarpGroups/numWarpsPerGroup/numExperts are kept in the
+    // signature only for call-site symmetry with the 2-sided launch path.
+    (void)numExperts;
+    (void)numWarpGroups;
+    (void)numWarpsPerGroup;
+    (void)payloadSlotStride;
+
+    const unsigned int epoch = selectLowLatencyEpoch(epochState, phases, smId, threadId);
+    const size_t bank = static_cast<size_t>(epoch & 1U);
+    const size_t bank_next = bank ^ 1U;
+    const size_t recvFlagOff = recvFlagOffBase + bank * signalSlotStride;
+    const size_t readDoneOff = readDoneOffBase + bank * signalSlotStride;
+    char* const commBase = static_cast<char*>(commBuf);
+    int* const recvFlagBuf = reinterpret_cast<int*>(commBase + recvFlagOff);
+    int* const nextRecvCntBuf = reinterpret_cast<int*>(commBase + recvFlagOffBase + bank_next * signalSlotStride);
+    int* const readDoneBuf = reinterpret_cast<int*>(commBase + readDoneOff);
+
+    extern __shared__ __align__(1024) uint8_t smemBuffer[];
+
+    constexpr int kNumElemsPerInt4 = combine_smem::elements_per_int4(kElemBytes);
+    constexpr int kWarpSize = combine_smem::kWarpSize;
+    constexpr int64_t hiddenBf16Int4 = kHidden / kNumElemsPerInt4;
+
+    constexpr int kNumRecvUnrolls = combine_smem::kNumRecvUnrolls;
+    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4) == 0,
+                     "Partial tiles require universal combine");
+    EP_STATIC_ASSERT(kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
+
+    bool isLastCta = false;
+    __shared__ uint32_t activeRankMaskShared[combine_smem::kActiveRankMaskWords];
+
+    if ((phases & LOW_LATENCY_SEND_PHASE) == 0) {
+        goto LOW_LATENCY_COMBINE_LSA_RECV_1SIDED;
+    }
+
+    // Single-shot readiness: the caller already fully wrote this rank's inData (every token this
+    // rank is responsible for) before launching this kernel's SEND phase -- there is no payload
+    // left to send, only the "ready to be pulled from" broadcast.
+    if (smId == 0) {
+        cleanNextRecvCntBufStrided(nextRecvCntBuf, lsaSignalingCleanCount, threadId, numThreads);
+        __syncthreads();
+
+        if (warpId == 0) {
+            memory_fence_release_sys();
+            for (int peer = laneId; peer < numRanks; peer += 32) {
+                sendRankFinishFlagLsa(peer, currRank, recvFlagBuf, recvFlagOff, rankMask, windows, devComm);
+            }
+        }
+    }
+
+    // Elect the CTA allowed to bump epochState->epoch, same release/acquire election pattern as
+    // syncAndSendFinishLsa above, using ctaSync[0].
+    __syncthreads();
+    __shared__ bool shIsLastCta;
+    if (threadId == 0) {
+        const int prevDone = atomic_add_release_global(&ctaSync[0], 1);
+        shIsLastCta = (prevDone + 1 == numSms);
+        if (shIsLastCta) {
+            memory_fence_gpu();
+            ctaSync[0] = 0;
+        }
+    }
+    __syncthreads();
+    isLastCta = shIsLastCta;
+
+LOW_LATENCY_COMBINE_LSA_RECV_1SIDED:
+    if ((phases & LOW_LATENCY_RECV_PHASE) == 0) {
+        return;
+    }
+    if ((phases & LOW_LATENCY_SEND_PHASE) == 0) {
+        isLastCta = (smId == 0);
+    }
+
+    waitForAllRanksFinishLsa(
+        threadId, numRanks, rankMask, activeRankMaskShared, recvFlagBuf, timeoutCycles, currRank, asyncErrorFlag,
+        waitStats);
+    completeFullLowLatencyEpoch(epochState, phases, isLastCta, threadId);
+
+    constexpr int kMaxNumGroups = combine_smem::max_recv_groups(kElemBytes);
+    const int numDecodeWarps = hiddenBf16Int4 / (kNumRecvUnrolls * kWarpSize);
+    const int warpsPerRecvGroup = numDecodeWarps + combine_smem::kNumRecvTmaWarps;
+    const int numGroups = min(kMaxNumGroups, (numThreads / kWarpSize) / warpsPerRecvGroup);
+    const int decodeWarpIdx = __shfl_sync(0xffffffff, warpId % warpsPerRecvGroup, 0);
+    const int groupIdx = __shfl_sync(0xffffffff, warpId / warpsPerRecvGroup, 0);
+    EP_DEVICE_ASSERT(numTopk <= kWarpSize);
+    EP_DEVICE_ASSERT(numGroups > 0);
+
+    if (groupIdx < numGroups) {
+        constexpr int kNumStages = combine_smem::kNumStages;
+        constexpr int kNumTMABufferBytes = combine_smem::recv_tma_buffer_bytes(kHidden, kElemBytes, /*nvfp4=*/false);
+        constexpr int kNumBF16PerWarpBytes = kWarpSize * kNumRecvUnrolls * kNumElemsPerInt4 * kElemBytes;
+        constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kHidden * kElemBytes;
+
+        const auto smemGroupBuffer = smemBuffer + kNumBytesPerGroup * groupIdx;
+        auto fullBarriers = PatternVisitor(
+            [=](const int& i) { return reinterpret_cast<uint64_t*>(smemGroupBuffer + i * kNumTMABufferBytes); });
+        auto emptyBarriers = PatternVisitor([=](const int& i) {
+            return reinterpret_cast<uint64_t*>(
+                smemGroupBuffer + i * kNumTMABufferBytes + combine_smem::kRecvTmaEmptyBarrierOffsetBytes);
+        });
+        auto tmaLdBuffers = PatternVisitor([=](const int& i) {
+            return reinterpret_cast<uint8_t*>(
+                smemGroupBuffer + i * kNumTMABufferBytes + combine_smem::kRecvTmaPayloadOffsetBytes);
+        });
+        auto tmaStBuffers = PatternVisitor([=](const int& i) {
+            return reinterpret_cast<uint32_t*>(
+                smemGroupBuffer + kNumStages * kNumTMABufferBytes + i * kNumBF16PerWarpBytes);
+        });
+
+        uint32_t tmaPhase = 0;
+        EP_STATIC_ASSERT(kNumStages < kWarpSize, "Too many stages");
+        if (decodeWarpIdx == numDecodeWarps) tmaPhase = (1 << kNumStages) - 1;
+
+        if (decodeWarpIdx == numDecodeWarps and laneId < kNumStages) {
+            mbarrier_init(fullBarriers[laneId], 1);
+            mbarrier_init(emptyBarriers[laneId], numDecodeWarps);
+        }
+        syncSmGroup(groupIdx + 1, warpsPerRecvGroup * kWarpSize);
+
+        int stageIdx = 0;
+        EP_STATIC_ASSERT(kNumTopk <= kWarpSize, "numTopk must not exceed warp size");
+
+        if (decodeWarpIdx == numDecodeWarps) {
+            // TMA load warp: pulls each topk slot's contribution directly out of the owning
+            // rank's inData window, using dstInfo's (dstRank, slotIdx) -- no re-derivation
+            // from topk indices needed, and no local recvBuf staging to read from.
+            for (int tokenIdx = smId + numSms * groupIdx; tokenIdx < numCombinedTokens;
+                 tokenIdx += numSms * numGroups) {
+                for (int i = 0; i < numTopk; ++i) {
+                    const size_t infoIdx = (static_cast<size_t>(tokenIdx) * numTopk + i) * 2;
+                    const int dstRank = __ldg(dstInfo + infoIdx + 0);
+                    if (dstRank < 0 or not isRankActiveLocal(activeRankMaskShared, dstRank)) continue;
+                    const int slotIdx = __ldg(dstInfo + infoIdx + 1);
+
+                    mbarrier_wait<true>(emptyBarriers[stageIdx], tmaPhase, stageIdx);
+                    const size_t remoteSlot = static_cast<size_t>(currRank) * maxTokensPerRank + slotIdx;
+                    const size_t remoteOffset = inDataWindowOffset + remoteSlot * hiddenBf16Int4 * sizeof(int4);
+                    auto recvBufData =
+                        static_cast<const uint8_t*>(ncclGetPeerPointer(inDataWindow, remoteOffset, dstRank));
+
+                    if (elect_one_sync()) {
+                        const int numTmaBytes = numDecodeWarps * kNumBF16PerWarpBytes;
+                        tma_load_1d(tmaLdBuffers[stageIdx], recvBufData, fullBarriers[stageIdx], numTmaBytes);
+                        mbarrier_arrive_and_expect_tx(fullBarriers[stageIdx], numTmaBytes);
+                    }
+                    __syncwarp();
+                    stageIdx = (stageIdx + 1) % kNumStages;
+                }
+            }
+        } else {
+            for (int tokenIdx = smId + numSms * groupIdx; tokenIdx < numCombinedTokens;
+                 tokenIdx += numSms * numGroups) {
+                combineReduceTokenLsa<kNumStages, kNumElemsPerInt4, kNumRecvUnrolls, kTokenDtype>(
+                    tokenIdx, numTopk, laneId, decodeWarpIdx, kNumBF16PerWarpBytes, hiddenBf16Int4,
+                    activeRankMaskShared, fullBarriers, emptyBarriers, tmaLdBuffers, tmaStBuffers, tmaPhase, stageIdx,
+                    outData,
+                    [&](int i) {
+                        const size_t infoIdx = (static_cast<size_t>(tokenIdx) * numTopk + i) * 2;
+                        return __ldg(dstInfo + infoIdx + 0);
+                    });
+            }
+        }
+    }
+
+    // Every CTA that pulled from any peer has now finished decoding into outData. Elect the
+    // last-finishing CTA, via ctaSync[1] (its OWN dedicated counter, never ctaSync[0]) to
+    // broadcast "I'm done reading your inData" to every peer -- see ctaSync's doc comment above.
+    // A relaxed add is enough: unlike a store, a load can't be "posted" -- this CTA's reads are
+    // already fully retired the moment their values were consumed (into outData above), so there's
+    // nothing to release/acquire here, only arrivals to count (see the flag send below for why no
+    // fence is needed there either).
+    __syncthreads();
+    __shared__ bool shIsLastCtaRecv;
+    if (threadId == 0) {
+        const int prevDone = atomicAdd(&ctaSync[1], 1);
+        shIsLastCtaRecv = (prevDone + 1 == numSms);
+        if (shIsLastCtaRecv) {
+            ctaSync[1] = 0;
+        }
+    }
+    __syncthreads();
+    if (shIsLastCtaRecv and warpId == 0) {
+        // No fence needed: unlike the payload-then-flag stores elsewhere in this file, this flag
+        // has no prior write to order against -- our reads from the peer's inData already
+        // self-completed (see the comment above), and outData is irrelevant to the peer.
+        for (int peer = laneId; peer < numRanks; peer += 32) {
+            sendRankFinishFlagLsa(peer, currRank, readDoneBuf, readDoneOff, rankMask, windows, devComm);
+        }
+    }
+
+    waitForAllReadDoneDistributedLsa(
+        smId, numSms, threadId, numThreads, numRanks, rankMask, readDoneBuf, timeoutCycles, currRank,
+        asyncErrorFlag);
+}
+
+// NCCL_EP_COMBINE_LSA auto mode (LlCombineKernel::kAutoRmLsa): picks 1-sided vs 2-sided on-device
+// from dispatch's already-decided p.want1SidedBuf (dispatch itself compared every active peer's
+// published count against combineLsaThreshold -- see computeAndPublishWant1SidedLsa in
+// ll/ll_dispatch_lsa.cuh), then calls straight into the same impls above -- no JIT-generated
+// string logic, this is a real compiled function. p.want1SidedBuf is a plain read: dispatch
+// overwrites it fresh each round, so no reset is needed here.
+template <int kHidden, int kNumTopk, int kNumMaxUnrolls, typename TopkIdxT, ncclDataType_t kTokenDtype>
+__device__ __forceinline__ void combine_kernel_impl_auto_rm_lsa(const combine_kernel_args_t& p) {
+    const bool want1Sided = *p.want1SidedBuf != 0;
+    if (want1Sided) {
+        combine_kernel_impl_1sided_rm_lsa<kHidden, kNumTopk, kNumMaxUnrolls, kTokenDtype>(
+            p.inData, p.inDataWindow, p.inDataWindowOffset, p.dstInfo, p.rankMask, p.asyncErrorFlag,
+            p.outData, p.rdmaBuf, p.recvFlagOff, p.combineSync, p.lsaSignalingCleanCount, p.waitStats,
+            p.epochState, p.payloadSlotStride, p.signalSlotStride, p.readDoneOffBase,
+            p.numCombinedTokens, p.maxTokensPerRank, p.numExperts, p.currRank,
+            p.numRanks, p.numWarpGroups, p.numWarpsPerGroup, p.phases, p.devComm, p.windows,
+            p.timeoutCycles);
+    } else {
+        combine_kernel_impl_2sided_rm_lsa<kHidden, kNumTopk, kNumMaxUnrolls, TopkIdxT, kTokenDtype>(
+            p.inData, p.srcInfo, static_cast<const TopkIdxT*>(p.inTopkIdx), p.rankMask, p.asyncErrorFlag,
+            p.outData, p.rdmaBuf, p.sendOff, p.recvOff, p.recvFlagOff, p.combineSync,
+            p.lsaSignalingCleanCount, p.waitStats, p.epochState, p.payloadSlotStride, p.signalSlotStride,
+            p.numCombinedTokens, p.maxTokensPerRank, p.numExperts, p.currRank, p.numRanks,
+            p.numWarpGroups, p.numWarpsPerGroup, p.phases, p.zeroCopy, p.devComm, p.windows,
+            p.timeoutCycles);
     }
 }
 

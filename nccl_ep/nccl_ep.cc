@@ -34,6 +34,8 @@
 #include "device/ht_ep_configs.cuh"
 #include "device/ll_ep_adapter.cuh"
 
+namespace ll = nccl_ep::ll;
+
 // NCCLCHECK macro for public API error checking
 // Undef any existing definition from internal NCCL headers to avoid using ncclDebugLog
 #ifdef NCCLCHECK
@@ -736,11 +738,12 @@ struct ncclEpGroup {
     void* ep_workspace;       // Device workspace for EP operations
     // Dedicated, non-overlapping regions carved out of ep_workspace once at
     // group-creation time (see ncclEpCreateGroup) -- 3 for LL dispatch's
-    // per-round counters, 1 for LL combine's completion-signaling counter.
+    // per-round counters, NCCL_EP_COMBINE_SYNC_COUNT for LL combine's completion-signaling
+    // counters (see ctaDone's doc comment in ll_ep_adapter.cuh).
     int* ws_dispatch_rankSentCnt;    // numRanks ints
     int* ws_dispatch_rankArrivedCnt; // numRanks ints
     int* ws_dispatch_rankDone;       // numExperts ints
-    int* ws_combine_sync; // 1 int
+    int* ws_combine_sync; // NCCL_EP_COMBINE_SYNC_COUNT ints
     int cuda_device_id;       // CUDA device ID
     int lsa_team_size;        // LSA team size: ncclTeamLsa(comm).nRanks
     int lsa_rank;             // Rank within LSA team: ncclTeamLsa(comm).rank
@@ -2612,7 +2615,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     // (no scan) and their FLAT handles pass a null gscratch, so they only need the small counter
     // region; everyone else keeps the full scan workspace.
     const size_t counter_region_bytes =
-        (static_cast<size_t>(2) * ep_group->nRanks + ep_group->config.num_experts + 1) * sizeof(int);
+        (static_cast<size_t>(2) * ep_group->nRanks + ep_group->config.num_experts +
+         NCCL_EP_COMBINE_SYNC_COUNT) *
+        sizeof(int);
     const bool ht_count_only =
         ht_mode && dispatch_push_count_capable(ep_group, NCCL_EP_LAYOUT_EXPERT_MAJOR);
     const size_t workspace_bytes = ht_count_only
@@ -2630,7 +2635,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         ep_group->ws_dispatch_rankArrivedCnt = ep_group->ws_dispatch_rankSentCnt + numRanks;
         ep_group->ws_dispatch_rankDone = ep_group->ws_dispatch_rankArrivedCnt + numRanks;
         ep_group->ws_combine_sync = ep_group->ws_dispatch_rankDone + numExperts;
-        const size_t total_ints = static_cast<size_t>(2) * numRanks + numExperts + 1;
+        const size_t total_ints =
+            static_cast<size_t>(2) * numRanks + numExperts + NCCL_EP_COMBINE_SYNC_COUNT;
         EP_HOST_ASSERT(total_ints * sizeof(int) <= workspace_bytes);
     }
 
@@ -3036,6 +3042,27 @@ struct ncclEpHandle {
             ncclEpTensor_t expert_recv_source_indices;
             ncclEpTensor_t expert_dispatch_layout;
 
+            // Sender-side (dstRank, slotIdx) info for combine_kernel_impl_1sided_rm_lsa; see
+            // dispatchSendTokenLsa's kRecordDstInfo in ll/ll_dispatch_lsa.cuh.
+            int* dispatch_dst_info;
+
+            // NCCL_EP_COMBINE_LSA auto mode's want-1-sided decision, already made by dispatch; see
+            // dispatch_kernel_args_t::outWant1Sided's doc comment.
+            int* dispatch_want_1sided;
+
+            // True when 1-sided can't be used for the most recent ncclEpDispatch call -- either
+            // because max_dispatch_tokens_per_rank can never clear combine_lsa_threshold (seeded as
+            // this call's starting value, see its doc comment at the dispatch call site) or because
+            // dispatch ran the general kernel, which never writes dispatch_dst_info/
+            // dispatch_want_1sided above, for any reason ll_dispatch_select_algo fell back to it
+            // (NCCL_EP_DISPATCH_LSA=universal, unsupported recipe/layout, CFT, hidden-size
+            // misalignment, !nvlinkOnly, ...). Re-seeded fresh at the start of every call (see
+            // DispatchParams::dstInfoDisqualifiedOut's doc comment for the within-call seed-then-OR
+            // contract), so a later round that's disqualified for neither reason clears it again.
+            // ncclEpCombine must disqualify 1-sided whenever this is true, regardless of its own
+            // NCCL_EP_COMBINE_LSA setting.
+            bool dispatch_1sided_disqualified;
+
             // Persistent backing storage for the per-tensor `sizes` arrays above.
             size_t expert_recv_source_indices_sizes[1];
             size_t expert_dispatch_layout_sizes[2];
@@ -3375,7 +3402,12 @@ static size_t ll_handle_mem_size(ncclEpGroup_t ep_group, int num_topk) {
     // Layout: nRanks per-rank counts + nRanks * max_tokens * (num_topk+1) token entries
     size_t sz_recv_src = align256(nRanks * (1 + static_cast<size_t>(num_topk + 1) * max_tokens) * sizeof(int32_t));
     size_t sz_dispatch = align256(local_experts * nRanks * sizeof(int64_t));
-    return sz_recv_src + sz_dispatch;
+    // Want-1-sided output for NCCL_EP_COMBINE_LSA auto mode (dispatch_want_1sided above), packed
+    // ahead of the sender-side srcInfo for combine_kernel_impl_1sided_rm_lsa (dispatch_dst_info
+    // above) into one aligned region -- both related/unconditional.
+    size_t sz_send_src =
+        align256(sizeof(int32_t) + max_tokens * static_cast<size_t>(num_topk) * 2 * sizeof(int32_t));
+    return sz_recv_src + sz_dispatch + sz_send_src;
 }
 
 // All individual buffer sizes for a HT handle_mem block plus derived totals.
@@ -3746,6 +3778,25 @@ ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
             .data = base + recv_src_bytes,
             .sizes = handle->ll.expert_dispatch_layout_sizes,
         };
+        const size_t dispatch_layout_bytes =
+            align256(static_cast<size_t>(ep_group->num_local_experts) * ep_group->nRanks * sizeof(int64_t));
+        // Packed together (want_1sided first, then send_src) -- mirrors ll_handle_mem_size's
+        // sz_send_src computation; keep in sync with it.
+        handle->ll.dispatch_want_1sided =
+            reinterpret_cast<int*>(base + recv_src_bytes + dispatch_layout_bytes);
+        handle->ll.dispatch_dst_info =
+            reinterpret_cast<int*>(base + recv_src_bytes + dispatch_layout_bytes + sizeof(int32_t));
+        // One-time zero (0 == "don't want 1-sided", the safe default) for the very first round;
+        // every later round's dispatch overwrites it fresh (see computeAndPublishWant1SidedLsa's doc
+        // comment in ll/ll_dispatch_lsa.cuh).
+        CUDA_CHECK(cudaMemset(handle->ll.dispatch_want_1sided, 0, sizeof(int32_t)));
+        // Same one-time zero, for the same reason: a round whose dispatch disqualifies 1-sided
+        // (dispatch_1sided_disqualified above) never writes this, so without this memset the very
+        // first such round would read uninitialized device memory instead of a cleanly-disqualified,
+        // all-zero buffer. Size matches ll_handle_mem_size's sz_send_src second term.
+        const size_t dst_info_bytes = static_cast<size_t>(ep_group->config.max_dispatch_tokens_per_rank) *
+            static_cast<size_t>(num_topk) * 2 * sizeof(int32_t);
+        CUDA_CHECK(cudaMemset(handle->ll.dispatch_dst_info, 0, dst_info_bytes));
     }
     handle->num_topk = num_topk;
     handle->ll.layout = layout;
@@ -4763,6 +4814,18 @@ nccl_ep::ll::NcclEpDispatchLsaMode resolve_dispatch_lsa_mode(const ncclEpEnvConf
     }
 }
 
+// Maps env.combine_lsa (NCCL_EP_COMBINE_LSA, choices {"2sided", "1sided", "universal"} indexed
+// 0/1/2) to the kernel it enforces (ll::LlCombineKernel); unset is kNone (see combine_lsa's doc
+// comment in nccl_ep_env.h).
+ll::LlCombineKernel resolve_combine_enforced_kernel(const ncclEpEnvConfig& env) {
+    if (!env.combine_lsa.is_set) return ll::LlCombineKernel::kNone;
+    switch (env.combine_lsa.value.ul) {
+        case 0: return ll::LlCombineKernel::k2SidedRmLsa;
+        case 1: return ll::LlCombineKernel::k1SidedRmLsa;
+        default: return ll::LlCombineKernel::kDefault;
+    }
+}
+
 } // namespace
 
 ncclResult_t ncclEpDispatch(
@@ -4931,7 +4994,6 @@ ncclResult_t ncclEpDispatch(
         const int cft_parity = group->ll_cft_buffers.dispatch_parity;
         group->ll_cft_buffers.dispatch_parity ^= 1;
         const auto& buffer = handle->ll.layout.buffer;
-        const auto next_clean_meta = buffer.clean_meta_offset();
 
         unsigned signal_base = 0;
         // LL rank-major zero-copy writes each available peer payload window directly.
@@ -5013,12 +5075,50 @@ ncclResult_t ncclEpDispatch(
                 layout_info != nullptr
                     ? layout_info->recv_topk_idx_kind
                     : NCCL_EP_EXPERT_ID_AUTO);
+        // NCCL_EP_COMBINE_LSA={1sided,auto(unset)} requests dispatch ALSO record the sender-side
+        // srcInfo combine_kernel_impl_1sided_rm_lsa needs, alongside (never instead of) the
+        // receiver-side write below, AND track/publish the consensus max-token-count auto mode's
+        // device-side wrapper compares against its threshold -- combine still decides per-call
+        // (statically when forced, dynamically on-device when auto) whether it actually goes
+        // 1-sided; all of this must be valid whenever 1-sided could possibly be selected at
+        // combine time. Not needed for "2sided"/"universal" (1-sided is never selected in either).
+        // See nccl_ep_env.h's combine_lsa doc comment.
+        const ll::LlCombineKernel combine_enforced_kernel = resolve_combine_enforced_kernel(group->env);
+        // NCCL_EP_DISPATCH_LSA=universal always runs the general dispatch kernel (see
+        // NcclEpDispatchLsaMode's doc comment), which has no dstInfo/max-token-count machinery at
+        // all -- collecting it would be wasted work the general kernel never reads.
+        const ll::NcclEpDispatchLsaMode dispatch_lsa_mode = resolve_dispatch_lsa_mode(group->env);
+        const bool want_1sided_combine =
+            (combine_enforced_kernel == ll::LlCombineKernel::kNone ||
+             combine_enforced_kernel == ll::LlCombineKernel::k1SidedRmLsa) &&
+            dispatch_lsa_mode != ll::NcclEpDispatchLsaMode::kUniversal;
+        // Resolved here, at dispatch time, since dispatch itself now makes the want-1-sided
+        // decision (see dispatch_kernel_args_t::combineLsaThreshold's doc comment). Default
+        // resolved here, next to where it's used, rather than in nccl_ep_env.cc's parser (see
+        // combine_lsa_threshold's doc comment in nccl_ep_env.h).
+        const int combine_lsa_threshold = group->env.combine_lsa_threshold.is_set
+            ? static_cast<int>(group->env.combine_lsa_threshold.value.ul)
+            : 512;
+        // Statically unreachable: no round can ever dispatch more than max_dispatch_tokens_per_rank
+        // tokens for a given rank, so if even that ceiling can't clear the auto-mode threshold, no
+        // actual per-round count can either -- 1-sided is disqualified regardless of what this call's
+        // dispatch kernel selection ends up being. <=, not <: computeAndPublishWant1SidedLsa's
+        // on-device check is strict "count > threshold" (a count equal to the threshold still goes
+        // 2-sided), so a ceiling equal to the threshold is just as unreachable as one below it.
+        // Seeded into the initial value below (see DispatchParams::dstInfoDisqualifiedOut's doc
+        // comment: the kernel-selection result can only add disqualifying reasons on top of this,
+        // never clear it).
+        const bool max_tokens_below_threshold =
+            static_cast<int>(group->config.max_dispatch_tokens_per_rank) <= combine_lsa_threshold;
+        handle->ll.dispatch_1sided_disqualified = max_tokens_below_threshold;
         auto dispatch_fn = [=](int phases) -> ncclResult_t {
             void* const rdma_buf = group->rdma_buffer;
             // Prepare data pointers
             auto* recv_x_data = recv_x->data;
             auto* scales_data = scales ? scales->data : nullptr;
             auto* expert_recv_source_indices_data = static_cast<int*>(handle->ll.expert_recv_source_indices.data);
+            auto* dispatch_dst_info_data = want_1sided_combine ? handle->ll.dispatch_dst_info : nullptr;
+            auto* dispatch_want_1sided_data = want_1sided_combine ? handle->ll.dispatch_want_1sided : nullptr;
             auto* src_rank_counter_data = src_rank_counter ? static_cast<int*>(src_rank_counter->data) : nullptr;
             auto* expert_dispatch_layout_data = static_cast<int64_t*>(handle->ll.expert_dispatch_layout.data);
             auto* recv_count_data = recv_count ? static_cast<int*>(recv_count->data) : nullptr;
@@ -5052,6 +5152,11 @@ ncclResult_t ncclEpDispatch(
                 params.outDataBuf = recv_x_data;
                 params.outScalesBuf = scales_data;
                 params.outSrcInfo = expert_recv_source_indices_data;
+                params.outDstInfo = dispatch_dst_info_data;
+                params.outWant1Sided = dispatch_want_1sided_data;
+                params.recordDstInfo = want_1sided_combine;
+                params.combineLsaThreshold = combine_lsa_threshold;
+                params.dstInfoDisqualifiedOut = &handle->ll.dispatch_1sided_disqualified;
                 params.outRecvRankCounter = src_rank_counter_data;
                 params.outLayout = expert_dispatch_layout_data;
                 params.outCnt = recv_count_data;
@@ -5061,7 +5166,8 @@ ncclResult_t ncclEpDispatch(
                 params.sendOff = buffer.dispatch_rdma_send_buffer_offset;
                 params.recvOff = buffer.dispatch_rdma_recv_data_buffer_offset;
                 params.recvCntOff = buffer.dispatch_rdma_recv_count_buffer_offset;
-                params.nextRecvCntBufSize = next_clean_meta.second;
+                params.totalTokenOff = buffer.dispatch_rdma_total_token_buffer_offset;
+                params.lsaSignalingCleanCount = buffer.lsa_signaling_clean_int_count;
                 params.recvStats = nullptr;
                 params.waitStats = nullptr;
                 params.epochState = group->ll_epoch_state;
@@ -5122,7 +5228,7 @@ ncclResult_t ncclEpDispatch(
                         static_cast<size_t>(cft_parity) * lb.cumul_slots_per_parity;
                     params.cftCumulByteExpect = lb.cumul_byte_expect_dev + cumul_off;
                 }
-                params.lsaMode = resolve_dispatch_lsa_mode(group->env);
+                params.lsaMode = dispatch_lsa_mode;
                 if (tma_quant && group->env.ll_tma_quant_warps.is_set) {
                     params.tmaQuantWarps = static_cast<int>(group->env.ll_tma_quant_warps.value.ul);
                 }
@@ -5158,6 +5264,11 @@ ncclResult_t ncclEpDispatch(
                     return ncclInvalidArgument;
             }
         };
+
+        // dispatch_want_1sided is handle-owned and touched only by this rank's own kernels:
+        // dispatch's RECV phase overwrites it fresh each round (see
+        // computeAndPublishWant1SidedLsa's doc comment in ll/ll_dispatch_lsa.cuh), and combine
+        // just reads it -- no epoch-parity double-buffering or reset needed.
 
         // Execute dispatch with appropriate phase flags
         const int dispatch_phases =
@@ -6358,10 +6469,19 @@ ncclResult_t ncclEpCombine(
         const ncclEpTensor_t* global_scales = tensor_ptr(inputs->scales);
         assert(x->ndim > 0);
 
-        // LSA-eligibility input to ll_combine_select_algo (device/jit/ll_combine_jit.cuh),
-        // which picks the RDMA-staged 2-sided kernel for eligible calls
+        // LSA-eligibility input to ll_combine_lsa_eligible (called by call_combine in
+        // device/ll_ep_adapter.cu), which picks the RDMA-staged 2-sided kernel for eligible calls
         // unless CFT requires the general combine kernel.
         const bool nvlink_only = (handle->group->lsa_team_size == handle->group->nRanks);
+
+        // Resolve x's own window binding (if any) -- combine_kernel_impl_1sided_rm_lsa pulls
+        // directly from peer ranks' inData via ncclGetPeerPointer, which requires x (inputs->
+        // tokens, typically the same window-backed tensor ncclEpDispatch wrote its zero-copy
+        // output into) to carry a window handle. Harmless/no-op when x isn't window-backed --
+        // call_combine's one_sided_eligible just stays false in that case and the 2-sided path is
+        // unaffected.
+        ncclEpTensor_t x_local;
+        NCCLCHECK(resolveTensorWindowBinding(handle->group, x, &x_local, 0, &x));
 
         const ncclEpTensor_t* topk_idx = &handle->topk_idx;
         const ncclEpTensor_t* src_info = &handle->ll.expert_recv_source_indices;
@@ -6402,6 +6522,12 @@ ncclResult_t ncclEpCombine(
             hidden = static_cast<int>(x->sizes[2]);
             break;
         }
+
+        // NCCL_EP_COMBINE_LSA, resolved to the kernel it enforces (see resolve_combine_enforced_kernel's
+        // doc comment); eligibility and the enforced-but-unreachable error are call_combine's job.
+        // combine_lsa_threshold itself is resolved at dispatch time now, not here -- dispatch makes
+        // the want-1-sided decision (see dispatch_kernel_args_t::combineLsaThreshold's doc comment).
+        const ll::LlCombineKernel combine_enforced_kernel = resolve_combine_enforced_kernel(handle->group->env);
 
         if (quantization_recipe == NCCL_EP_COMB_QUANT_NVFP4) {
             constexpr int kNvfp4WarpSize = 32;
@@ -6457,7 +6583,6 @@ ncclResult_t ncclEpCombine(
 
         // Manage double-buffering
         const auto& buffer = handle->ll.layout.buffer;
-        const auto next_clean_meta = buffer.clean_meta_offset();
 
         // Validate buffer layout
         assert(handle->ll.layout.total_bytes <= handle->group->rdma_buffer_size_alloc);
@@ -6489,6 +6614,10 @@ ncclResult_t ncclEpCombine(
             auto* x_data = x->data;
             auto* topk_weights_data = topk_weights ? static_cast<float*>(topk_weights->data) : nullptr;
             auto* src_info_data = static_cast<int*>(src_info->data);
+            // Passed through unconditionally -- call_combine decides whether 1-sided is actually
+            // reachable (forced, or auto mode's on-device wrapper picking it at runtime) and only
+            // dereferences these if so; see its doc comment.
+            auto* dst_info_data = handle->ll.dispatch_dst_info;
             auto* layout_range_data = static_cast<int64_t*>(layout_range->data);
 
             // LL accepts int32 or int64 topk_idx; the cached dtype picks the JIT
@@ -6501,6 +6630,9 @@ ncclResult_t ncclEpCombine(
                 params.inData = x_data;
                 params.inGlobalScales = global_scales ? static_cast<const float*>(global_scales->data) : nullptr;
                 params.srcInfo = src_info_data;
+                params.dstInfo = dst_info_data;
+                params.inDataWindow = x->win_hdl;
+                params.inDataWindowOffset = static_cast<size_t>(x->win_offset);
                 params.layoutRange = layout_range_data;
                 params.inTopkIdx = topk_idx_data;
                 params.topkIdxIsInt64 = topk_is_int64;
@@ -6510,7 +6642,8 @@ ncclResult_t ncclEpCombine(
                 params.sendOff = buffer.combine_rdma_send_buffer_offset;
                 params.recvOff = buffer.combine_rdma_recv_data_buffer_offset;
                 params.recvFlagOff = buffer.combine_rdma_recv_flag_buffer_offset;
-                params.nextRecvCntBufSize = next_clean_meta.second;
+                params.readDoneOffBase = buffer.combine_rdma_read_done_buffer_offset;
+                params.lsaSignalingCleanCount = buffer.lsa_signaling_clean_int_count;
                 params.waitStats = nullptr;
                 params.epochState = handle->group->ll_epoch_state;
                 params.payloadSlotStride = handle->ll.layout.payload_slot_stride;
@@ -6527,6 +6660,7 @@ ncclResult_t ncclEpCombine(
                 params.windows = handle->group->nccl_wins;
                 params.signalsBase = signal_base;
                 params.combineSync = handle->group->ws_combine_sync;
+                params.want1SidedBuf = handle->ll.dispatch_want_1sided;
                 params.numDeviceSms = handle->group->combine_num_sms;
                 params.deviceSm = handle->group->device_sm;
                 params.maxDynamicSmem = handle->group->max_dynamic_smem;
@@ -6542,6 +6676,9 @@ ncclResult_t ncclEpCombine(
                 params.tokenDtype = x->datatype;
                 params.quantizationRecipe = quantization_recipe;
                 params.nvlinkOnly = nvlink_only;
+                params.enforced = combine_enforced_kernel;
+                params.groupZeroCopyOn = handle->group->config.zero_copy == NCCL_EP_ZERO_COPY_ON;
+                params.dispatch1SidedDisqualified = handle->ll.dispatch_1sided_disqualified;
                 params.cftEnabled = handle->group->ll_cft_buffers.initialized;
                 return nccl_ep::ll::call_combine(
                     params, stream, nccl_ep_env_flag_on(handle->group->env.nucs));

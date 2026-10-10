@@ -27,11 +27,6 @@ namespace nccl_ep {
 
 namespace ll {
 
-__forceinline__ __device__ void cleanNextRecvCntBufLsa(int* nextRecvCntBuf, int nextRecvCntBufSize, int offset, int stride) {
-#pragma unroll
-    for (int i = offset; i < nextRecvCntBufSize; i += stride) nextRecvCntBuf[i] = 0;
-}
-
 // Copy the split-layout routing header and return the peer payload slot.
 // Both send paths use the same per-source-rank addressing and header stores.
 __forceinline__ __device__ uint8_t* sendTokenHeaderLsa(
@@ -207,6 +202,37 @@ __forceinline__ __device__ void sendPeerTokenCountLsa(
     if (not isRankMasked(rankMask, dstRank)) {
         EP_DEVICE_ASSERT(dstP2pPtr != 0);
         st_relaxed_sys_global(reinterpret_cast<int*>(dstP2pPtr), -numTokensSent - 1);
+    }
+}
+
+// Publishes this rank's total dispatched batch size (args.numTokens, the same value for every
+// dstRank) into the peer's totalTokenRecvBuf[currRank] slot -- the NCCL_EP_COMBINE_LSA auto-mode
+// counterpart to sendPeerTokenCountLsa above. Unlike that call, this value needs no grid-wide
+// rendezvous: args.numTokens is known at SEND-phase entry, not accumulated across CTAs, so it's
+// issued early (dispatchSendPhaseLsa's bank-clearing section, smId == 0 only -- one publish per
+// round, not one per CTA), well before syncAndSendCounts's last-CTA election. It's still correctly
+// ordered: this store happens-before that CTA's own atomic_add_release_global(ctaDone, 1), which
+// (if this CTA isn't the elected one) is itself ordered-before the elected CTA's acquiring
+// memory_fence_gpu() and its subsequent memory_fence_release_sys() -- the same chain that already
+// covers every other SEND-phase write, not something special-cased for this one. Unlike
+// recvCntBuf's value, this store is never itself used as a readiness flag -- readers only ever
+// consult it after confirming recvCntBuf[peer] != 0 (see computeAndPublishWant1SidedLsa below),
+// so it needs no sentinel encoding and no separate "not arrived yet" convention.
+__forceinline__ __device__ void sendPeerTotalTokenCountLsa(
+    int numTokensThisRound,
+    int dstRank,
+    int currRank,
+    int* totalTokenRecvBufLocal,
+    size_t totalTokenOff,
+    int* rankMask,
+    const ncclWindow_t* windows,
+    ncclDevComm* devComm) {
+    const uint64_t totalTokenPtr = reinterpret_cast<uint64_t>(totalTokenRecvBufLocal + currRank);
+    const size_t totalTokenOffset = totalTokenOff + static_cast<size_t>(currRank) * sizeof(int);
+    const auto dstP2pPtr = ncclGetP2pPtr(totalTokenPtr, totalTokenOffset, currRank, dstRank, windows, devComm);
+    if (not isRankMasked(rankMask, dstRank)) {
+        EP_DEVICE_ASSERT(dstP2pPtr != 0);
+        st_relaxed_sys_global(reinterpret_cast<int*>(dstP2pPtr), numTokensThisRound);
     }
 }
 
@@ -407,6 +433,37 @@ __forceinline__ __device__ void syncAndRecvCounts(
     __syncthreads();
 }
 
+// NCCL_EP_COMBINE_LSA auto mode: scans totalTokenRecvBuf (populated by every active peer's
+// sendPeerTotalTokenCountLsa call, already visible to this CTA -- syncAndRecvCounts above must run
+// first, same epoch) and overwrites want1SidedBuf with whether ANY active peer's count exceeds
+// combineLsaThreshold. Only the LAST warp of the LAST SM does this (any CTA/warp would compute the
+// same value) -- deliberately not smId/warpId 0, which is both the busiest SM (it also carries
+// dispatchSendPhaseLsa(Tma)'s SEND-phase cleanup) and never idle in recordRecvTokensLsa; the last
+// warp is usually genuine spare capacity instead. A plain store, not an atomic: each round fully
+// overwrites the previous round's value, so no reset between rounds is needed.
+__forceinline__ __device__ void computeAndPublishWant1SidedLsa(
+    int smId,
+    int warpId,
+    int laneId,
+    int numSms,
+    int numWarps,
+    int numRanks,
+    int* rankMask,
+    const int* totalTokenRecvBuf,
+    int combineLsaThreshold,
+    int* want1SidedBuf) {
+    if (smId != numSms - 1 || warpId != numWarps - 1) return;
+    bool exceedsThreshold = false;
+    for (int peer = laneId; peer < numRanks; peer += 32) {
+        if (isRankMasked(rankMask, peer)) continue;
+        exceedsThreshold = exceedsThreshold || totalTokenRecvBuf[peer] > combineLsaThreshold;
+    }
+    const bool anyExceedsThreshold = __ballot_sync(0xffffffffu, exceedsThreshold) != 0;
+    if (laneId == 0) {
+        *want1SidedBuf = anyExceedsThreshold ? 1 : 0;
+    }
+}
+
 // Record source information for every
 // token received from `responsibleExpertIdx`'s source rank. Per-(srcRank,
 // localExpert) warp-group assignment is unchanged from the general kernel (a
@@ -522,11 +579,30 @@ __forceinline__ __device__ void recordRecvTokensLsa(
     }
 }
 
+// Records one topk-slot's dstInfo entry for combine_kernel_impl_1sided_rm_lsa: a real
+// (dstRank, slotIdx) when `valid` (what qualifies varies by caller -- see call sites), else a -1
+// dstRank sentinel so combine knows no token landed there. No-op (and should compile away
+// entirely) when kRecordDstInfo is false. Shared by the non-TMA and TMA kRecordDstInfo writes
+// below so the two stay in sync.
+template <bool kRecordDstInfo>
+__forceinline__ __device__ void recordDstInfoLsa(
+    int* outDstInfo, int tokenIdx, int numTopk, int topkSlot, int laneId, bool valid, int dstRank,
+    int slotIdx) {
+    if constexpr (kRecordDstInfo) {
+        if (topkSlot < numTopk && laneId == 0) {
+            const size_t infoIdx = (static_cast<size_t>(tokenIdx) * numTopk + topkSlot) * 2;
+            outDstInfo[infoIdx + 0] = valid ? dstRank : -1;
+            outDstInfo[infoIdx + 1] = slotIdx;
+        }
+    }
+}
+
 // Send-phase per-token body used by dispatch_kernel_impl_2sided_rm_lsa:
 // stages the routing header, dedups by destination rank (one send per
 // (token, destRank) pair, elected via the lowest topk slot targeting that
 // rank), and selects the unquantized or DS-FP8 send helper.
-template <ncclEpDispQuant_t kRecipe, int kHidden, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant>
+template <ncclEpDispQuant_t kRecipe, int kHidden, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant,
+    bool kRecordDstInfo = false>
 __forceinline__ __device__ void dispatchSendTokenLsa(
     const dispatch_kernel_args_t& args,
     int tokenIdx,
@@ -634,6 +710,8 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
             }
         }
     }
+    recordDstInfoLsa<kRecordDstInfo>(
+        args.outDstInfo, tokenIdx, numTopk, warpId, laneId, slotIdx >= 0, dstRank, slotIdx);
     if constexpr (kStageQuant) {
         // All peer copies must finish before the next token overwrites CTA storage.
         syncSmGroup<true>(SYNC_DISP_LSA_SEND_COPY, numWritingThreads);
@@ -646,7 +724,8 @@ __forceinline__ __device__ void dispatchSendTokenLsa(
 // epoch. Callers still call syncAndSendCounts themselves right after this
 // returns -- that's the SEND/RECV synchronization handoff, kept visible at
 // the kernel top level rather than folded in here.
-template <ncclEpDispQuant_t kRecipe, int kHidden, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant>
+template <ncclEpDispQuant_t kRecipe, int kHidden, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant,
+    bool kRecordDstInfo = false>
 __forceinline__ __device__ void dispatchSendPhaseLsa(
     const dispatch_kernel_args_t& args,
     int smId,
@@ -665,7 +744,9 @@ __forceinline__ __device__ void dispatchSendPhaseLsa(
     void* recvBuf,
     size_t recvOff,
     int* nextRecvCntBuf,
-    int* rankSentCnt) {
+    int* rankSentCnt,
+    int* totalTokenRecvBuf,
+    size_t totalTokenOff) {
     // There are 2 kinds of warps in this part:
     // 1. The first-kind warps for forwarding top-k tokens
     // 2. The last warp for reading `topk_idx` and count for per-expert information
@@ -681,7 +762,7 @@ __forceinline__ __device__ void dispatchSendPhaseLsa(
 
         // Split token processing across SMs
         for (int tokenIdx = smId; tokenIdx < args.numTokens; tokenIdx += numSms) {
-            dispatchSendTokenLsa<kRecipe, kHidden, TopkIdxT, kTokenDtype, kUseSharedQuant>(
+            dispatchSendTokenLsa<kRecipe, kHidden, TopkIdxT, kTokenDtype, kUseSharedQuant, kRecordDstInfo>(
                 args, tokenIdx, warpId, laneId, numTopk, numLocalExperts, srcRankRegionBytes, numBytesPerMsg,
                 dispatch_hdr_sz, hiddenBytes, inputHiddenInt4, scaleBytes, sendBuf, recvBuf, recvOff, rankSentCnt,
                 numWritingThreads);
@@ -696,7 +777,23 @@ __forceinline__ __device__ void dispatchSendPhaseLsa(
         }
         EP_DEVICE_ASSERT(numSms > 1);
         if (smId == 0) {
-            cleanNextRecvCntBufLsa(nextRecvCntBuf, args.nextRecvCntBufSize, laneId, 32);
+            // Clears this bank's signal + read-done span in one pass, even though dispatch itself
+            // never reads read-done -- it's prepping the bank for whichever op (combine, if
+            // 1-sided) lands there next. See LowLatencyBuffer::lsa_signaling_clean_int_count.
+            cleanNextRecvCntBufStrided(nextRecvCntBuf, args.lsaSignalingCleanCount, laneId, 32);
+
+            // NCCL_EP_COMBINE_LSA auto-mode consensus input: args.numTokens is known up front, not
+            // accumulated across CTAs, so it doesn't need to wait for syncAndSendCounts's last-CTA
+            // election -- see sendPeerTotalTokenCountLsa's doc comment for why issuing it here,
+            // one warp/32 lanes wide, is still correctly ordered.
+            if constexpr (kRecordDstInfo) {
+#pragma unroll 1
+                for (int dstRank = laneId; dstRank < args.numRanks; dstRank += 32) {
+                    sendPeerTotalTokenCountLsa(
+                        args.numTokens, dstRank, args.currRank, totalTokenRecvBuf, totalTokenOff, args.rankMask,
+                        args.windows, args.devComm);
+                }
+            }
         }
     }
 }
@@ -710,7 +807,8 @@ __forceinline__ __device__ void dispatchSendPhaseLsa(
 // nccl_ep::ll::dispatch_kernel_impl in ll_ep.cuh with a supported kRecipe,
 // kNvlinkOnly = true, and kLayout = NCCL_EP_LAYOUT_RANK_MAJOR baked in, as a
 // base for further (e.g. CTA-per-token) prototyping.
-template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant>
+template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, typename TopkIdxT, ncclDataType_t kTokenDtype, bool kUseSharedQuant,
+    bool kRecordDstInfo = false>
 __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa(const dispatch_kernel_args_t& args) {
     static constexpr ncclEpLayout_t kLayout = NCCL_EP_LAYOUT_RANK_MAJOR;
     EP_STATIC_ASSERT(
@@ -745,6 +843,8 @@ __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa(const dispatc
     int* const recvCntBuf = reinterpret_cast<int*>(rdmaBase + recvCntOff);
     int* const nextRecvCntBuf =
         reinterpret_cast<int*>(rdmaBase + args.recvCntOff + bank_next * args.signalSlotStride);
+    int* const totalTokenRecvBuf =
+        reinterpret_cast<int*>(rdmaBase + args.totalTokenOff + bank * args.signalSlotStride);
 
     auto rankSentCnt = args.rankSentCnt;
 
@@ -776,9 +876,10 @@ __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa(const dispatc
         goto LOW_LATENCY_DISPATCH_LSA_RECV;
     }
 
-    dispatchSendPhaseLsa<kRecipe, kHidden, TopkIdxT, kTokenDtype, kUseSharedQuant>(
+    dispatchSendPhaseLsa<kRecipe, kHidden, TopkIdxT, kTokenDtype, kUseSharedQuant, kRecordDstInfo>(
         args, smId, warpId, laneId, numSms, numWarps, numTopk, numLocalExperts, numBytesPerMsg, dispatch_hdr_sz,
-        hiddenBytes, inputHiddenInt4, scaleBytes, sendBuf, recvBuf, recvOff, nextRecvCntBuf, rankSentCnt);
+        hiddenBytes, inputHiddenInt4, scaleBytes, sendBuf, recvBuf, recvOff, nextRecvCntBuf, rankSentCnt,
+        totalTokenRecvBuf, args.totalTokenOff + bank * args.signalSlotStride);
 
     isLastCta = syncAndSendCounts(
         warpId, numWarps, laneId, args.rankDone, numSms, args.numRanks, rankSentCnt, args.currRank, recvCntBuf,
@@ -805,6 +906,12 @@ LOW_LATENCY_DISPATCH_LSA_RECV:
 
     syncAndRecvCounts(
         threadId, args.numRanks, args.rankMask, recvCntBuf, args.timeoutCycles, args.currRank, args.asyncErrorFlag);
+
+    if constexpr (kRecordDstInfo) {
+        computeAndPublishWant1SidedLsa(
+            smId, warpId, laneId, numSms, numWarps, args.numRanks, args.rankMask, totalTokenRecvBuf,
+            args.combineLsaThreshold, args.outWant1Sided);
+    }
 
     recordRecvTokensLsa<kRecipe>(
         responsibleExpertIdx, args.numExperts, numLocalExperts, laneId, subWarpId, args.numWarpsPerGroup, numTopk,
@@ -849,7 +956,8 @@ LOW_LATENCY_DISPATCH_LSA_RECV:
 // ============================================================================
 
 // Warp 0 owns stage loading, destination resolution, and TMA stores.
-template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumStages, typename TopkIdxT, ncclDataType_t kTokenDtype, int kQuantWarps>
+template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumStages, typename TopkIdxT, ncclDataType_t kTokenDtype,
+    int kQuantWarps, bool kRecordDstInfo = false>
 __forceinline__ __device__ void dispatchSendTmaControlWarp(
     const dispatch_kernel_args_t& args,
     int smId,
@@ -995,9 +1103,10 @@ __forceinline__ __device__ void dispatchSendTmaControlWarp(
             void* payloadDst = nullptr;
             void* scalesDst = nullptr;
             bool doStore = false;
+            int slotIdx = -1;
             if (isWinner) {
                 // Locally allocate a slot in the remote range reserved for this rank
-                const int slotIdx = atomicAdd(rankSentCnt + dstRank, 1);
+                slotIdx = atomicAdd(rankSentCnt + dstRank, 1);
                 // Resolved once per CTA into rankP2pCache before this loop started (see the
                 // doc comment there) instead of being recomputed here every iteration.
                 const uint64_t dstSrcRankP2pPtr = rankP2pCache[dstRank];
@@ -1082,6 +1191,9 @@ __forceinline__ __device__ void dispatchSendTmaControlWarp(
                 // Prefetch-issue another token if not done
                 issueLoad(nextIter, nextStage);
             }
+
+            recordDstInfoLsa<kRecordDstInfo>(
+                args.outDstInfo, tokenIdx, numTopk, laneId, 0, doStore, dstRank, slotIdx);
         }
 
         // Ensure that all stores are visible at NVL-level (not just read from smem)
@@ -1156,7 +1268,8 @@ __forceinline__ __device__ void dispatchSendTmaQuantWarps(
     }
 }
 
-template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumStages, typename TopkIdxT, ncclDataType_t kTokenDtype, int kQuantWarps>
+template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumStages, typename TopkIdxT, ncclDataType_t kTokenDtype,
+    int kQuantWarps, bool kRecordDstInfo = false>
 __forceinline__ __device__ void dispatchSendPhaseLsaTma(
     const dispatch_kernel_args_t& args,
     int smId,
@@ -1172,6 +1285,8 @@ __forceinline__ __device__ void dispatchSendPhaseLsaTma(
     size_t recvOff,
     int* nextRecvCntBuf,
     int* rankSentCnt,
+    int* totalTokenRecvBuf,
+    size_t totalTokenOff,
     uint8_t* smemBase) {
     // Each token's whole row moves in one TMA transfer, so the only alignment requirement is
     // numBytesPerMsg % sizeof(int4) == 0, already asserted by the caller
@@ -1195,7 +1310,7 @@ __forceinline__ __device__ void dispatchSendPhaseLsaTma(
     static_assert(!kQuant || kHidden + scaleBytes <= inputBytes,
                   "Quantized output must fit inside the BF16 stage");
     if (warpId == 0) {
-        dispatchSendTmaControlWarp<kRecipe, kHidden, kNumStages, TopkIdxT, kTokenDtype, kQuantWarps>(
+        dispatchSendTmaControlWarp<kRecipe, kHidden, kNumStages, TopkIdxT, kTokenDtype, kQuantWarps, kRecordDstInfo>(
             args, smId, laneId, numSms, numTopk, numLocalExperts, dispatch_hdr_sz,
             hiddenBytes, recvBuf, recvOff, rankSentCnt, smemBase, stageBytes);
     } else if (kQuant && warpId < firstCleanupWarp) {
@@ -1231,12 +1346,26 @@ __forceinline__ __device__ void dispatchSendPhaseLsaTma(
         }
         EP_DEVICE_ASSERT(numSms > 1);
         if (smId == 0) {
-            cleanNextRecvCntBufLsa(nextRecvCntBuf, args.nextRecvCntBufSize, postThreadId, numPostThreads);
+            cleanNextRecvCntBufStrided(nextRecvCntBuf, args.lsaSignalingCleanCount, postThreadId, numPostThreads);
+
+            // NCCL_EP_COMBINE_LSA auto-mode consensus input: args.numTokens is known up front, not
+            // accumulated across CTAs, so it doesn't need to wait for syncAndSendCounts's last-CTA
+            // election -- see sendPeerTotalTokenCountLsa's doc comment for why issuing it here,
+            // parallelized across every post-TMA warp of this CTA, is still correctly ordered.
+            if constexpr (kRecordDstInfo) {
+#pragma unroll 1
+                for (int dstRank = postThreadId; dstRank < args.numRanks; dstRank += numPostThreads) {
+                    sendPeerTotalTokenCountLsa(
+                        args.numTokens, dstRank, args.currRank, totalTokenRecvBuf, totalTokenOff, args.rankMask,
+                        args.windows, args.devComm);
+                }
+            }
         }
     }
 }
 
-template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, int kNumStages, typename TopkIdxT, ncclDataType_t kTokenDtype, int kQuantWarps>
+template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, int kNumStages, typename TopkIdxT, ncclDataType_t kTokenDtype,
+    int kQuantWarps, bool kRecordDstInfo = false>
 __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa_tma(const dispatch_kernel_args_t& args) {
     EP_STATIC_ASSERT(kRecipe == NCCL_EP_DISP_QUANT_NONE || kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4,
                      "Unsupported TMA dispatch recipe");
@@ -1269,6 +1398,8 @@ __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa_tma(const dis
     int* const recvCntBuf = reinterpret_cast<int*>(rdmaBase + recvCntOff);
     int* const nextRecvCntBuf =
         reinterpret_cast<int*>(rdmaBase + args.recvCntOff + bank_next * args.signalSlotStride);
+    int* const totalTokenRecvBuf =
+        reinterpret_cast<int*>(rdmaBase + args.totalTokenOff + bank * args.signalSlotStride);
 
     auto rankSentCnt = args.rankSentCnt;
 
@@ -1293,9 +1424,10 @@ __device__ __forceinline__ void dispatch_kernel_impl_2sided_rm_lsa_tma(const dis
         goto LOW_LATENCY_DISPATCH_LSA_TMA_RECV;
     }
 
-    dispatchSendPhaseLsaTma<kRecipe, kHidden, kNumStages, TopkIdxT, kTokenDtype, kQuantWarps>(
+    dispatchSendPhaseLsaTma<kRecipe, kHidden, kNumStages, TopkIdxT, kTokenDtype, kQuantWarps, kRecordDstInfo>(
         args, smId, warpId, laneId, numSms, numWarps, numTopk, numLocalExperts, dispatch_hdr_sz, hiddenBytes,
-        recvBuf, recvOff, nextRecvCntBuf, rankSentCnt, dispatchTmaSmem);
+        recvBuf, recvOff, nextRecvCntBuf, rankSentCnt, totalTokenRecvBuf,
+        args.totalTokenOff + bank * args.signalSlotStride, dispatchTmaSmem);
 
     isLastCta = syncAndSendCounts(
         warpId, numWarps, laneId, args.rankDone, numSms, args.numRanks, rankSentCnt, args.currRank, recvCntBuf,
@@ -1316,6 +1448,12 @@ LOW_LATENCY_DISPATCH_LSA_TMA_RECV:
 
     syncAndRecvCounts(
         threadId, args.numRanks, args.rankMask, recvCntBuf, args.timeoutCycles, args.currRank, args.asyncErrorFlag);
+
+    if constexpr (kRecordDstInfo) {
+        computeAndPublishWant1SidedLsa(
+            smId, warpId, laneId, numSms, numWarps, args.numRanks, args.rankMask, totalTokenRecvBuf,
+            args.combineLsaThreshold, args.outWant1Sided);
+    }
 
     recordRecvTokensLsa<kRecipe>(
         responsibleExpertIdx, args.numExperts, numLocalExperts, laneId, subWarpId, args.numWarpsPerGroup, numTopk,

@@ -79,6 +79,8 @@ ncclResult_t call_dispatch(
     args.outDataBuf = params.outDataBuf;
     args.outScalesBuf = params.outScalesBuf;
     args.outSrcInfo = params.outSrcInfo;
+    args.outDstInfo = params.outDstInfo;
+    args.outWant1Sided = params.outWant1Sided;
     args.outRecvRankCounter = params.outRecvRankCounter;
     args.outLayout = params.outLayout;
     args.outCnt = params.outCnt;
@@ -88,10 +90,11 @@ ncclResult_t call_dispatch(
     args.sendOff = params.sendOff;
     args.recvOff = params.recvOff;
     args.recvCntOff = params.recvCntOff;
+    args.totalTokenOff = params.totalTokenOff;
     args.rankSentCnt = params.rankSentCnt;
     args.rankArrivedCnt = params.rankArrivedCnt;
     args.rankDone = params.rankDone;
-    args.nextRecvCntBufSize = params.nextRecvCntBufSize;
+    args.lsaSignalingCleanCount = params.lsaSignalingCleanCount;
     args.recvStats = params.recvStats;
     args.waitStats = params.waitStats;
     args.epochState = params.epochState;
@@ -106,6 +109,7 @@ ncclResult_t call_dispatch(
     args.numWarpGroups = numWarpGroups;
     args.numWarpsPerGroup = numWarpsPerGroup;
     args.roundScale = params.roundScale;
+    args.combineLsaThreshold = params.combineLsaThreshold;
     args.recvTopkIdxKind = params.recvTopkIdxKind;
     args.phases = params.phases;
     args.devComm = params.devComm;
@@ -173,9 +177,11 @@ ncclResult_t call_dispatch(
         params.lsaMode,
         params.tmaQuantWarps,
         params.maxDynamicSmem,
+        params.recordDstInfo,
         args,
         stream,
-        nucs);
+        nucs,
+        params.dstInfoDisqualifiedOut);
 }
 
 // ============================================================================
@@ -214,11 +220,37 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
     // sized below -- see choose_combine_smem_config's doc comment. Only the
     // LSA path declares that static usage, so only trim the budget when
     // this call is actually eligible for it.
-    const bool lsaCombineEligible =
-        jit::ll_combine_select_algo(
-            params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout, params.cftEnabled,
-            params.hidden, params.tokenDtype) ==
-        jit::LlCombineAlgo::k2SidedRmLsa;
+    //
+    // call_combine is the sole place either eligibility question is evaluated and a request is
+    // resolved to a kernel -- see ll_combine_select_kernel's doc comment. An enforced LSA kernel
+    // falls back to kDefault silently when the call isn't LSA-eligible at all (NCCL_EP_COMBINE_LSA
+    // only governs the pick within the LSA domain); kInvalid comes back only for an in-domain
+    // request it still can't honor (e.g. 1-sided enforced but not oneSidedEligible).
+    const bool lsa_eligible = jit::ll_combine_lsa_eligible(
+        params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout, params.cftEnabled,
+        params.hidden, params.tokenDtype);
+    // oneSidedEligible implies lsaEligible by construction (AND-ed on top, never asserted
+    // independently) -- see CombineParams::groupZeroCopyOn's doc comment for why these two extra
+    // conditions live here rather than being precomputed by the caller.
+    const bool one_sided_eligible = lsa_eligible && params.tokenDtype == ncclBfloat16 &&
+        params.groupZeroCopyOn && params.inDataWindow != ncclWindow_t{} && !params.dispatch1SidedDisqualified;
+    const LlCombineKernel combine_kernel =
+        jit::ll_combine_select_kernel(/*enforced_lsa=*/params.enforced, lsa_eligible, one_sided_eligible);
+    if (combine_kernel == LlCombineKernel::kInvalid) {
+        std::fprintf(
+            stderr,
+            "[nccl_ep] LL combine: NCCL_EP_COMBINE_LSA enforced kernel %s could not be honored for this call "
+            "(lsa_eligible=%d, one_sided_eligible=%d, bf16=%d, zero_copy=%d, windowed=%d, "
+            "dispatch_universal=%d).\n",
+            jit::ll_combine_kernel_name(params.enforced), static_cast<int>(lsa_eligible),
+            static_cast<int>(one_sided_eligible), static_cast<int>(params.tokenDtype == ncclBfloat16),
+            static_cast<int>(params.groupZeroCopyOn), static_cast<int>(params.inDataWindow != ncclWindow_t{}),
+            static_cast<int>(params.dispatch1SidedDisqualified));
+        return ncclInvalidArgument;
+    }
+
+    const bool lsaCombineEligible = combine_kernel == LlCombineKernel::k2SidedRmLsa ||
+        combine_kernel == LlCombineKernel::k1SidedRmLsa || combine_kernel == LlCombineKernel::kAutoRmLsa;
     const int max_dynamic_smem_for_combine =
         params.maxDynamicSmem - (lsaCombineEligible ? combine_smem::kLsaStaticSmemBytes : 0);
     const combine_smem_config_t smem_config = choose_combine_smem_config(
@@ -265,6 +297,9 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
     args.inData = params.inData;
     args.inGlobalScales = params.inGlobalScales;
     args.srcInfo = params.srcInfo;
+    args.dstInfo = params.dstInfo;
+    args.inDataWindow = params.inDataWindow;
+    args.inDataWindowOffset = params.inDataWindowOffset;
     args.layoutRange = params.layoutRange;
     args.inTopkIdx = params.inTopkIdx;
     args.topkWeights = params.topkWeights;
@@ -275,8 +310,10 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
     args.sendOff = params.sendOff;
     args.recvOff = params.recvOff;
     args.recvFlagOff = params.recvFlagOff;
+    args.readDoneOffBase = params.readDoneOffBase;
     args.combineSync = combineSync;
-    args.nextRecvCntBufSize = params.nextRecvCntBufSize;
+    args.want1SidedBuf = params.want1SidedBuf;
+    args.lsaSignalingCleanCount = params.lsaSignalingCleanCount;
     args.waitStats = params.waitStats;
     args.epochState = params.epochState;
     args.payloadSlotStride = params.payloadSlotStride;
@@ -297,8 +334,6 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
     args.timeoutCycles = params.timeoutCycles;
 
     return jit::launch_ll_combine(
-        params.nvlinkOnly,
-        params.cftEnabled,
         params.useLogFmt,
         params.quantizationRecipe,
         params.deviceSm,
@@ -310,6 +345,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
         numSms,
         numWarps,
         smem_size,
+        combine_kernel,
         args,
         stream,
         nucs);

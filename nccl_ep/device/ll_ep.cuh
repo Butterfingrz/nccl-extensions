@@ -190,12 +190,6 @@ __forceinline__ __device__ void sendToken(
     }
 }
 
-// Clean next receive count buffer
-__forceinline__ __device__ void cleanNextRecvCntBuf(int* nextRecvCntBuf, int nextRecvCntBufSize, int laneId) {
-#pragma unroll
-    for (int i = laneId; i < nextRecvCntBufSize; i += 32) nextRecvCntBuf[i] = 0;
-}
-
 // CFT-path variant of the counting-warp scan. Same inputs and output as
 // countTokensPerRank_mask (per destination rank in [rankBeginIdx, rankEndIdx):
 // the number of tokens with at least one top-k expert on that rank), selected
@@ -534,7 +528,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     int* rankSentCntBase = args.rankSentCnt;
     int* rankArrivedCntBase = args.rankArrivedCnt;
     int* rankDone = args.rankDone;
-    int nextRecvCntBufSize = args.nextRecvCntBufSize;
+    int nextRecvCntBufSize = args.lsaSignalingCleanCount;
     int* recvStats = args.recvStats;
     int64_t* waitStats = args.waitStats;
     LowLatencyEpochState* epochState = args.epochState;
@@ -852,7 +846,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
         // race early count publication, which does not wait for the wipe flag.
         if constexpr (!kCft) {
             if (smId == 0) {
-                cleanNextRecvCntBuf(nextRecvCntBuf, nextRecvCntBufSize, laneId);
+                cleanNextRecvCntBufStrided(nextRecvCntBuf, nextRecvCntBufSize, laneId, 32);
                 // Notify before executing `int_p`
                 __syncwarp();
 #pragma unroll
@@ -1262,8 +1256,7 @@ __forceinline__ __device__ void cleanNextRecvCntBufAndNotify(
     int* atomicCleanFlag,
     int numExperts,
     int laneId) {
-#pragma unroll
-    for (int i = laneId; i < nextRecvCntBufSize; i += 32) nextRecvCntBuf[i] = 0;
+    cleanNextRecvCntBufStrided(nextRecvCntBuf, nextRecvCntBufSize, laneId, 32);
     // Notify before executing `int_p`
     __syncwarp();
     if (laneId == 0) atomic_add_release_global(atomicCleanFlag, numExperts);
