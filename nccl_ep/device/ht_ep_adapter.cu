@@ -339,12 +339,31 @@ template void pack_topk_idx<int64_t>(const int64_t*, uint16_t*, uint16_t*, int, 
 // Pull-native metadata (gated by NCCL_EP_HT_EM_AG_SCAN_MODE, see dispatch_pull_count_capable):
 // count-row histogram + map build
 // ============================================================================
+// Shared-memory histogram budget of pack_topk_and_count_row_kernel.
+// Derived from 32 KB (well under the static smem ceiling), expressed as an int count.
+constexpr int kPackHistBudgetBytes = 32 * 1024;
+constexpr int kPackHistMaxInts = kPackHistBudgetBytes / static_cast<int>(sizeof(int32_t));
+__host__ __device__ inline bool s_hist_ints_fit(int num_experts, int n_ranks) {
+    return num_experts + n_ranks <= kPackHistMaxInts;
+}
+
 // Pack the handle-local top-k snapshot and accumulate its send-count histogram.
 template <typename TopkIdxT>
 __global__ void pack_topk_and_count_row_kernel(
     const TopkIdxT* __restrict__ topk_idx, uint16_t* __restrict__ topk_idx_u16, int num_tokens,
     int max_tokens, int num_topk, int experts_per_rank, int num_experts,
     int32_t* __restrict__ cnt_rank, int32_t* __restrict__ cnt_expert) {
+    // Per-CTA histogram in shared memory ([cnt_expert(num_experts) | cnt_rank(nRanks)], sized by the launcher; empty
+    // when it does not fit, then the counts go straight to global memory as before), flushed once per CTA.
+    extern __shared__ int32_t s_hist[];
+    const int n_ranks = (num_experts + experts_per_rank - 1) / experts_per_rank;
+    const bool use_smem = s_hist_ints_fit(num_experts, n_ranks);
+    int32_t* const h_expert = use_smem ? s_hist : cnt_expert;
+    int32_t* const h_rank = use_smem ? s_hist + num_experts : cnt_rank;
+    if (use_smem) {
+        for (int i = threadIdx.x; i < num_experts + n_ranks; i += blockDim.x) s_hist[i] = 0;
+        __syncthreads();
+    }
     const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
     for (int token = blockIdx.x * blockDim.x + threadIdx.x; token < max_tokens; token += stride) {
         const size_t row_off = static_cast<size_t>(token) * num_topk;
@@ -362,12 +381,19 @@ __global__ void pack_topk_and_count_row_kernel(
             const uint16_t u = valid ? static_cast<uint16_t>(expert) : kTopkIdxInvalid;
             out[k] = u;
             if (!valid) continue;
-            atomicAdd(&cnt_expert[static_cast<int>(u)], 1);
+            atomicAdd(&h_expert[static_cast<int>(u)], 1);
             const int dr = static_cast<int>(u) / experts_per_rank;
             if (nccl_ep::test_bit(seen, dr)) continue;
             nccl_ep::set_bit(seen, dr);
-            atomicAdd(&cnt_rank[dr], 1);
+            atomicAdd(&h_rank[dr], 1);
         }
+    }
+    if (use_smem) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < num_experts; i += blockDim.x)
+            if (s_hist[i] != 0) atomicAdd(&cnt_expert[i], s_hist[i]);
+        for (int i = threadIdx.x; i < n_ranks; i += blockDim.x)
+            if (s_hist[num_experts + i] != 0) atomicAdd(&cnt_rank[i], s_hist[num_experts + i]);
     }
 }
 
@@ -376,11 +402,18 @@ void pack_topk_and_count_row(
     const TopkIdxT* topk_idx, uint16_t* topk_idx_u16, int num_tokens, int max_tokens, int num_topk,
     int experts_per_rank, int num_experts, int32_t* cnt_rank, int32_t* cnt_expert, int num_sms,
     cudaStream_t stream) {
-    int block = 256;
+    // Dynamic shared memory: one per-CTA histogram of num_experts + nRanks ints when it fits, else none.
+    const int n_ranks = (num_experts + experts_per_rank - 1) / experts_per_rank;
+    const bool use_smem_hist = s_hist_ints_fit(num_experts, n_ranks);
+    const size_t smem = use_smem_hist
+        ? static_cast<size_t>(num_experts + n_ranks) * sizeof(int32_t) : 0;
+    // 128 threads for the smem-histogram path (lower register pressure); 256 for the global-atomic
+    // fallback to preserve original thread count and avoid halving throughput on large histograms.
+    int block = use_smem_hist ? 128 : 256;
     int grid = nccl_ep::ceil_div(max_tokens, block);
     if (grid < 1) grid = 1;
     if (num_sms > 0 && grid > num_sms) grid = num_sms;
-    pack_topk_and_count_row_kernel<<<grid, block, 0, stream>>>(
+    pack_topk_and_count_row_kernel<<<grid, block, smem, stream>>>(
         topk_idx, topk_idx_u16, num_tokens, max_tokens, num_topk, experts_per_rank, num_experts,
         cnt_rank, cnt_expert);
 }
@@ -2431,9 +2464,11 @@ void launch_dispatch_permute(
 
 // Fused pull-count metadata publish, standalone ahead of the unfused head-sync kernel.
 __global__ void lsa_map_publish_kernel(::ht_ep::lsa_map_publish_param_t p) {
+    // Reset layout_ready to 0 before any publish stores complete so the downstream head-sync
+    // kernel (ordered after this kernel on the same stream) sees a clean state for this round.
     if (blockIdx.x == 0 && threadIdx.x == 0) *p.layout_ready = 0;
     const size_t meta_stride = ::ht_ep::pull_meta_stride(p.topk_off_bytes, p.tokens_per_rank);
-    ::ht_ep::dispatch_pull_map_publish(p.own_row, p.own_topk_snapshot, p.meta_ptrs, meta_stride,
+    ::ht_ep::dispatch_pull_map_publish_grid(p.own_row, p.own_topk_snapshot, p.meta_ptrs, meta_stride,
         p.topk_off_bytes, p.tokens_per_rank, p.top_k, p.my_rank, p.lsa_team_size);
 }
 

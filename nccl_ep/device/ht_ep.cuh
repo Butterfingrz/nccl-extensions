@@ -6914,7 +6914,8 @@ __device__ __forceinline__ void dispatch_pull_pad_fill(
     }
 }
 
-// CTA 0 in the standalone kernel, or the elected fused head CTA, publishes metadata.
+// CTA 0, or the elected fused head CTA, publishes metadata (the standalone publish kernel uses
+// dispatch_pull_map_publish_grid below).
 __device__ __forceinline__ void dispatch_pull_map_publish(
     const int32_t* __restrict__ own_row, const uint16_t* __restrict__ own_topk,
     const uint8_t* const* __restrict__ meta_ptrs, size_t row_stride, int topk_off_bytes,
@@ -6933,9 +6934,8 @@ __device__ __forceinline__ void dispatch_pull_map_publish(
         for (int i = threadIdx.x; i < total / 8; i += blockDim.x) {
             const uint4 v = reinterpret_cast<const uint4*>(own_topk)[i];
             for (int r = 0; r < nRanks; ++r) {
-                uint4* dst = reinterpret_cast<uint4*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
-                asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};"
-                             :: "l"(dst + i), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+                int4* dst = reinterpret_cast<int4*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
+                nccl_ep::st_na_relaxed(dst + i, reinterpret_cast<const int4&>(v));
             }
         }
     }
@@ -6945,6 +6945,53 @@ __device__ __forceinline__ void dispatch_pull_map_publish(
         for (int r = 0; r < nRanks; ++r) {
             volatile uint16_t* dst = reinterpret_cast<volatile uint16_t*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
             dst[i] = v;
+        }
+    }
+    __threadfence_system();
+}
+
+// Grid-strided dispatch_pull_map_publish for the standalone publish kernel (unfused sync): every CTA of the launch
+// takes a share of the (peer, element) stores, rank-major so consecutive threads write consecutive addresses of one
+// peer. The kernel boundary orders all of them before the head-sync kernel that follows on the same stream.
+__device__ __forceinline__ void dispatch_pull_map_publish_grid(
+    const int32_t* __restrict__ own_row, const uint16_t* __restrict__ own_topk,
+    const uint8_t* const* __restrict__ meta_ptrs, size_t row_stride, int topk_off_bytes,
+    int tokens_per_rank, int top_k, int my_rank, int nRanks) {
+    // Use size_t for grid-flat indices to avoid signed overflow on large (tokens_per_rank * top_k * nRanks) products.
+    const size_t nthreads = static_cast<size_t>(gridDim.x) * blockDim.x;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t count_ints = own_row ? static_cast<size_t>(topk_off_bytes) / sizeof(int32_t) : 0;
+    for (size_t idx = tid; idx < count_ints * nRanks; idx += nthreads) {
+        const int r = static_cast<int>(idx / count_ints);
+        const int i = static_cast<int>(idx - static_cast<size_t>(r) * count_ints);
+        uint8_t* const row = const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride;
+        reinterpret_cast<volatile int32_t*>(row)[i] = own_row[i];
+    }
+    const int total = tokens_per_rank * top_k;
+    int tail = 0;
+    // topk section is 16-byte aligned when topk_off_bytes & 15 == 0, enabling uint4 bulk stores.
+    if ((topk_off_bytes & 15) == 0) {
+        const size_t chunks = static_cast<size_t>(total) / 8;
+        if (chunks > 0) {
+            for (size_t idx = tid; idx < chunks * nRanks; idx += nthreads) {
+                const int r = static_cast<int>(idx / chunks);
+                const int i = static_cast<int>(idx - static_cast<size_t>(r) * chunks);
+                const uint4 v = reinterpret_cast<const uint4*>(own_topk)[i];
+                int4* dst = reinterpret_cast<int4*>(
+                    const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
+                nccl_ep::st_na_relaxed(dst + i, reinterpret_cast<const int4&>(v));
+            }
+            tail = static_cast<int>(chunks * 8);
+        }
+    }
+    const size_t rem = static_cast<size_t>(total - tail);
+    if (rem > 0) {
+        for (size_t idx = tid; idx < rem * nRanks; idx += nthreads) {
+            const int r = static_cast<int>(idx / rem);
+            const int i = tail + static_cast<int>(idx - static_cast<size_t>(r) * rem);
+            volatile uint16_t* dst = reinterpret_cast<volatile uint16_t*>(
+                const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
+            dst[i] = own_topk[i];
         }
     }
     __threadfence_system();
