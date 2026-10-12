@@ -6713,6 +6713,7 @@ ncclResult_t ncclEpCombine(
                 group->lsa_rank,
                 static_cast<int>(group->config.max_dispatch_tokens_per_rank),
                 team_size,
+                group->nRanks,
                 // Push combine is a comm kernel (NVLink push), so it uses the combine SM budget.
                 static_cast<int>(group->combine_num_sms),
                 0u,

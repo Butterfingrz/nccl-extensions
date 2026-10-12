@@ -6336,22 +6336,57 @@ constexpr int kLocalPermuteReduceBlocksPerSM = 1;
 // reads blockDim.x at runtime.
 constexpr int kCombinePushThreads = 768;
 constexpr int kCombinePushMaxSlots = kCombinePushThreads / 32;  // 24, sizes static metadata smem
-// Dynamic smem = slots * row bytes (one per-warp row buffer each). Static metadata is separate.
-__host__ __device__ constexpr size_t combine_push_dynamic_smem_bytes(int hidden_int4, int slots) {
-    return static_cast<size_t>(slots) * hidden_int4 * 16;
+// Tile geometry of a row: kHiddenVec int4 per lane, 32 lanes per warp, kNTiles tiles per row.
+__host__ __device__ constexpr int combine_push_tile_int4(int hidden_int4) {
+    const int epr = (hidden_int4 + 31) / 32;         // elems per thread
+    return (epr < 4 ? epr : 4) * 32;
 }
-// Largest slot count (<= kCombinePushMaxSlots) whose per-warp row buffer fits smem_cap, reserving
+__host__ __device__ constexpr int combine_push_ntiles(int hidden_int4) {
+    const int tile_int4 = combine_push_tile_int4(hidden_int4);
+    return (hidden_int4 + tile_int4 - 1) / tile_int4;
+}
+// Chunk size in int4: requested is rounded up to whole tiles and clamped to the row; unset (<1)
+// is the whole row (one chunk). Each chunk is reduced into one per-warp smem buffer and pushed
+// with one TMA store.
+__host__ __device__ constexpr int combine_push_chunk_size(int hidden_int4, int requested) {
+    const int tile_int4 = combine_push_tile_int4(hidden_int4);
+    const int row_int4 = combine_push_ntiles(hidden_int4) * tile_int4;
+    if (requested < 1) return row_int4;
+    const int rounded = (requested + tile_int4 - 1) / tile_int4 * tile_int4;
+    return rounded > row_int4 ? row_int4 : rounded;
+}
+__host__ __device__ constexpr int combine_push_num_chunks(int hidden_int4, int chunk_size) {
+    const int size = combine_push_chunk_size(hidden_int4, chunk_size);
+    return (hidden_int4 + size - 1) / size;
+}
+// Per-warp push-buffer width in int4: one chunk, capped at the exact row so a single-chunk
+// (whole-row) push is not padded up to a tile multiple.
+__host__ __device__ constexpr int combine_push_buf_int4(int hidden_int4, int chunk_size) {
+    const int size = combine_push_chunk_size(hidden_int4, chunk_size);
+    return size < hidden_int4 ? size : hidden_int4;
+}
+// Dynamic smem = slots * buffer bytes (one per-warp row/chunk buffer each). Static metadata separate.
+__host__ __device__ constexpr size_t combine_push_dynamic_smem_bytes(
+    int hidden_int4, int slots, int chunk_size) {
+    return static_cast<size_t>(slots) * combine_push_buf_int4(hidden_int4, chunk_size) * 16;
+}
+// Static smem reserved for the max block's metadata: flat2em[MaxTopK<=32] + nvalid + dst ptr +
+// mbarrier, per slot. s_mbar is declared unconditionally (see combine_push) even though only
+// kSingleChunk uses it. Used by combine_push_slots_per_block to find how much of smem_cap is left
+// for the per-warp row/chunk buffer.
+__host__ __device__ constexpr int combine_push_meta_reserve_bytes() {
+    return kCombinePushMaxSlots * (32 * 4 + 4 + 8 + 8) + 256;
+}
+// Largest slot count (<= kCombinePushMaxSlots) whose per-warp buffer fits smem_cap, reserving
 // headroom for the static metadata arrays. At least 1.
-__host__ __device__ constexpr int combine_push_slots_per_block(int hidden_int4, int smem_cap) {
-    const int row_bytes = hidden_int4 * 16;
-    // static smem headroom: flat2em[MaxTopK<=32] + nvalid + dst ptr + mbarrier, per slot.
-    const int meta_reserve = kCombinePushMaxSlots * (32 * 4 + 4 + 8 + 8) + 256;
-    int slots = (smem_cap - meta_reserve) / row_bytes;
+__host__ __device__ constexpr int combine_push_slots_per_block(
+    int hidden_int4, int smem_cap, int chunk_size) {
+    const int row_bytes = combine_push_buf_int4(hidden_int4, chunk_size) * 16;
+    int slots = (smem_cap - combine_push_meta_reserve_bytes()) / row_bytes;
     if (slots > kCombinePushMaxSlots) slots = kCombinePushMaxSlots;
     if (slots < 1) slots = 1;
     return slots;
 }
-
 struct local_permute_dup_param_t {
     void* recv_x_em;
     float* recv_topk_weights_em;
@@ -7760,6 +7795,25 @@ __host__ __device__ constexpr int comb_stage_stride_bytes(int row_bytes, bool re
 // also scatters input weights into peer prob staging. NONE recipe, single LSA team only.
 // ============================================================================
 
+// Exact n / divisor for 0 <= n < 2^31 by multiply-high; g < 0 falls back to decode_src.
+struct tokens_fast_div_t {
+    uint32_t divisor;
+    uint32_t magic;
+    uint32_t shift;
+};
+__host__ __device__ inline tokens_fast_div_t make_tokens_fast_div(uint32_t divisor) {
+    uint32_t shift = 0;
+    while ((1ull << shift) < divisor) ++shift;
+    return {divisor, static_cast<uint32_t>(((1ull << 32) * ((1ull << shift) - divisor)) / divisor + 1), shift};
+}
+__device__ __forceinline__ decoded_src_t decode_src_fast(int32_t g, const tokens_fast_div_t& fd, int lsa_team_size) {
+    if (g < 0) return decode_src(g, static_cast<int>(fd.divisor), lsa_team_size);
+    const uint32_t n = static_cast<uint32_t>(g);
+    const uint32_t q = (__umulhi(n, fd.magic) + n) >> fd.shift;
+    const uint32_t team = static_cast<uint32_t>(lsa_team_size);
+    return {static_cast<int>(q < team ? q : q % team), static_cast<int>(n - q * fd.divisor)};
+}
+
 struct combine_push_param_t {
     // Output: per-attn-rank staging bases (peer-writable); reduced row lands at [t*team_size + R].
     void* peer_staging_ptrs[kPullMaxLsaRanks];   // [lsa_team_size]
@@ -7788,8 +7842,14 @@ struct combine_push_param_t {
 
 // One recv slot per warp (kSlotsPerBlock in parallel), identical
 // gather-reduce to local_permute_reduce; the reduced row is assembled in a per-warp smem buffer
-// and pushed to the remote destination staging slot [t*team_size + R] with one whole-row TMA store.
-template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE = false>
+// and pushed to the remote destination staging slot [t*team_size + R], one TMA store per row
+// chunk (see combine_push_buf_int4).
+//   kChunkSize - chunk width in int4 (combine_push_chunk_size, resolved host-side in
+//                launch_combine_push); a chunk covering the whole row takes the single-chunk path,
+//                whose prefetch-pipelined reduce needs extra registers. The multi-chunk path stays
+//                register-frugal and relies on high occupancy to hide gather latency.
+template <int MaxTopK, int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE = false,
+          int kChunkSize = 0>
 __device__ __forceinline__ void combine_push(
     void* const* __restrict__ peer_staging_ptrs,
     const uint8_t* __restrict__ recv_x_em,
@@ -7828,9 +7888,10 @@ __device__ __forceinline__ void combine_push(
     __shared__ int32_t smem_flat2em_slot_map[kCombinePushMaxSlots][MaxTopK];
     __shared__ int s_nvalid[kCombinePushMaxSlots];
     __shared__ int4* s_dst[kCombinePushMaxSlots];
-    // Per-warp mbarrier for the opt-in TMA-load source relay (single-copy fast path).
+    // Per-warp mbarrier for the single-chunk path's opt-in TMA-load source relay (n==1 fast path,
+    // see below). Unused (but still reserved, see combine_push_slots_per_block) when !kSingleChunk.
     __shared__ uint64_t s_mbar[kCombinePushMaxSlots];
-    // Dynamic smem: one row buffer per warp for the TMA push (each HiddenInt4 int4).
+    // Dynamic smem: one per-warp chunk buffer for the TMA push (kBufInt4 int4 each).
     int4* const s_rows = reinterpret_cast<int4*>(smem_bytes);
     // Backward co-locates the prob in the token staging row's trailing pad (offset kRowBytes),
     // so no separate prob destination is needed.
@@ -7838,8 +7899,10 @@ __device__ __forceinline__ void combine_push(
     const int tid = threadIdx.x;
     const int slot_in_block = tid / kThreadsPerSlot;
     const int wlane = tid % kThreadsPerSlot;
-    // This warp's row staging buffer: [slot_in_block][HiddenInt4].
-    int4* const my_row = s_rows + static_cast<size_t>(slot_in_block) * HiddenInt4;
+    // This warp's push staging buffer (one chunk of the row).
+    constexpr int kBufInt4 = combine_push_buf_int4(HiddenInt4, kChunkSize);
+    constexpr bool kSingleChunk = combine_push_num_chunks(HiddenInt4, kChunkSize) == 1;
+    int4* const my_row = s_rows + static_cast<size_t>(slot_in_block) * kBufInt4;
 
     const int num_recv = *num_recv_tokens_dev;
     // Contiguous per-warp range with SM-spread global ordering: consecutive global warps land on
@@ -7856,9 +7919,22 @@ __device__ __forceinline__ void combine_push(
 
     // TMA-load relay: init this warp's mbarrier once (1 arrival: the load's complete_tx).
     uint32_t mbar_phase = 0;
-    if (wlane == 0) nccl_ep::mbarrier_init(&s_mbar[slot_in_block], 1);
-    nccl_ep::fence_barrier_init();
+    if constexpr (kSingleChunk) {
+        if (wlane == 0) nccl_ep::mbarrier_init(&s_mbar[slot_in_block], 1);
+        nccl_ep::fence_barrier_init();
+    }
     __syncthreads();
+
+    const tokens_fast_div_t tokens_div = make_tokens_fast_div(static_cast<uint32_t>(tokens_per_rank));
+    // Next slot's routing metadata is loaded one wave ahead to hide its latency.
+    int32_t next_s = -1;
+    int32_t next_g = 0;
+    auto load_meta = [&](int sl, bool want) {
+        const bool ok = want && sl < num_recv;
+        next_s = (ok && wlane < top_k) ? __ldg(flat2em_slot_map + static_cast<size_t>(sl) * top_k + wlane) : -1;
+        next_g = (ok && wlane == 0) ? __ldg(recv_slot_to_src + sl) : 0;
+    };
+    load_meta(slot_start, num_per_warp > 0);
 
     for (int wave = 0; wave < num_per_warp; ++wave) {
         const int slot = slot_start + wave;
@@ -7871,8 +7947,7 @@ __device__ __forceinline__ void combine_push(
         int32_t prob_p = -1;
         float prob_w = 0.0f;
         if (slot_valid && wlane < 32) {
-            const int32_t* slot_row_global = flat2em_slot_map + static_cast<size_t>(slot) * top_k;
-            const int32_t s = (wlane < top_k) ? __ldg(slot_row_global + wlane) : -1;
+            const int32_t s = next_s;
             EP_DEVICE_ASSERT(s < caller_num_recv_tokens);
             if constexpr (BACKWARD_COMBINE) {
                 if (wlane < top_k && s >= 0) {
@@ -7886,8 +7961,7 @@ __device__ __forceinline__ void combine_push(
             if (wlane == 0) {
                 s_nvalid[slot_in_block] = __popc(valid);
                 // Decode the destination attn (rank, token) this recv slot returns to.
-                const int32_t g = recv_slot_to_src[slot];
-                const decoded_src_t dst_id = decode_src(g, tokens_per_rank, lsa_team_size);
+                const decoded_src_t dst_id = decode_src_fast(next_g, tokens_div, lsa_team_size);
                 const int dst_rank = dst_id.rank;
                 const int t = dst_id.token;
                 const int64_t dst_row = static_cast<int64_t>(t) * lsa_team_size + my_lsa_rank;
@@ -7897,6 +7971,7 @@ __device__ __forceinline__ void combine_push(
             }
         }
         __syncwarp();
+        load_meta(slot + 1, wave + 1 < num_per_warp);
 
         if (slot_valid) {
             const int n = s_nvalid[slot_in_block];
@@ -7915,93 +7990,166 @@ __device__ __forceinline__ void combine_push(
                 return (tile * kHiddenVec + u) < kElemsPerThread && src_j(tile, u) < HiddenInt4;
             };
 
-            // Single-copy relay: TMA-load the one source row straight into the smem buffer.
-            bool filled = false;
-            if (n == 1) {
-                const int32_t em0 = smem_flat2em_slot_map[slot_in_block][0];
-                const int4* src0 =
-                    reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em0) * kRowBytes);
-                if (wlane == 0) {
-                    nccl_ep::mbarrier_arrive_and_expect_tx(&s_mbar[slot_in_block], kRowBytes);
-                    nccl_ep::tma_load_1d(my_row, src0, &s_mbar[slot_in_block], kRowBytes);
-                }
-                nccl_ep::mbarrier_wait(&s_mbar[slot_in_block], mbar_phase);
-                filled = true;
-            }
+            // First int4 index of tile t, clamped to the row width.
+            auto tile_j = [&](int t) { const int j = t * kHiddenVec * kThreadsPerSlot; return j < HiddenInt4 ? j : HiddenInt4; };
 
-            if (!filled) {
-            // Software-pipelined push: prefetch the next tile's first em copy so its read
-            // overlaps the posted writes. Registers stay bounded regardless of top_k.
-            int4 pf_a[kHiddenVec], pf_b[kHiddenVec];
-            int4* pf_cur = pf_a;
-            int4* pf_nxt = pf_b;
-            auto load_copy0 = [&](int tile, int4* pf) {
-                const int32_t em0 = smem_flat2em_slot_map[slot_in_block][0];
-                const int4* src =
-                    reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em0) * kRowBytes);
-#pragma unroll
-                for (int u = 0; u < kHiddenVec; u++)
-                    if (tile_valid(tile, u)) pf[u] = src[src_j(tile, u)];
-            };
-            if (n > 0) load_copy0(0, pf_cur);
-#pragma unroll
-            for (int tile = 0; tile < kNTiles; tile++) {
-                float2 acc[kHiddenVec][4];
-#pragma unroll
-                for (int u = 0; u < kHiddenVec; u++)
-#pragma unroll
-                    for (int p = 0; p < 4; p++) { acc[u][p].x = 0.0f; acc[u][p].y = 0.0f; }
-                if (n > 1) {  // accumulate copy 0 only when more copies follow
-#pragma unroll
-                    for (int u = 0; u < kHiddenVec; u++) {
-                        if (!tile_valid(tile, u)) continue;
-#pragma unroll
-                        for (int p = 0; p < kPairs; p++) {
-                            float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&pf_cur[u], p);
-                            acc[u][p].x += f.x;
-                            acc[u][p].y += f.y;
-                        }
+            // Chunked staging, kNumChunks iterations per token:
+            //   - reduce the chunk's tiles into the smem buffer (n copies summed per tile)
+            //   - push the chunk with one TMA store
+            //   - reuse the same buffer for the next chunk
+            // No copy-0 prefetch: at this occupancy the warps hide the gather latency, and dropping
+            // it frees registers for the tighter per-thread budget. The reuse-wait (tma_store_wait
+            // below) is hidden by other warps' concurrent gathers at this occupancy, not by this
+            // warp's own next chunk. n==1 folds through the same reduce (lossless for finite values;
+            // NaN payload/-0 sign are not preserved through the float round-trip).
+            // combine_push_tile_int4 must match the tile size the kernel computes here.
+            static_assert(kHiddenVec * kThreadsPerSlot == combine_push_tile_int4(HiddenInt4));
+            static_assert(kNTiles == combine_push_ntiles(HiddenInt4));
+            constexpr int kChunkTiles = kBufInt4 / (kHiddenVec * kThreadsPerSlot);
+            constexpr int kNumChunks = combine_push_num_chunks(HiddenInt4, kChunkSize);
+            if constexpr (kSingleChunk) {
+                // Single-copy relay: TMA-load the one source row straight into the smem buffer,
+                // bypassing the register round-trip below entirely. n==1 dominates at high EP
+                // (mean valid-copies per slot ~= top_k / lsa_team_size), so this matters more as
+                // EP grows even though it's a small win at low EP.
+                bool filled = false;
+                if (n == 1) {
+                    const int32_t em0 = smem_flat2em_slot_map[slot_in_block][0];
+                    const int4* src0 =
+                        reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em0) * kRowBytes);
+                    if (wlane == 0) {
+                        nccl_ep::mbarrier_arrive_and_expect_tx(&s_mbar[slot_in_block], kRowBytes);
+                        nccl_ep::tma_load_1d(my_row, src0, &s_mbar[slot_in_block], kRowBytes);
                     }
+                    nccl_ep::mbarrier_wait(&s_mbar[slot_in_block], mbar_phase);
+                    filled = true;
                 }
-                if (tile + 1 < kNTiles && n > 0) load_copy0(tile + 1, pf_nxt);  // prefetch
-                for (int k = 1; k < n; k++) {  // remaining copies loaded inline
-                    const int32_t em_slot = smem_flat2em_slot_map[slot_in_block][k];
+                if (!filled) {
+                // Whole row in one chunk: no multi-chunk occupancy to hide the gather latency,
+                // so pipeline copy 0's load with the previous tile's accumulate/store instead.
+                int4 pf_a[kHiddenVec], pf_b[kHiddenVec];
+                int4* pf_cur = pf_a;
+                int4* pf_nxt = pf_b;
+                auto load_copy0 = [&](int tile, int4* pf) {
+                    const int32_t em0 = smem_flat2em_slot_map[slot_in_block][0];
                     const int4* src =
-                        reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em_slot) * kRowBytes);
+                        reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em0) * kRowBytes);
+#pragma unroll
+                    for (int u = 0; u < kHiddenVec; u++)
+                        if (tile_valid(tile, u)) pf[u] = src[src_j(tile, u)];
+                };
+                if (n > 0) load_copy0(0, pf_cur);
+                for (int tile = 0; tile < kNTiles; tile++) {
+                    float2 acc[kHiddenVec][4];
+#pragma unroll
+                    for (int u = 0; u < kHiddenVec; u++)
+#pragma unroll
+                        for (int p = 0; p < 4; p++) { acc[u][p].x = 0.0f; acc[u][p].y = 0.0f; }
+                    if (n > 0) {
+#pragma unroll
+                        for (int u = 0; u < kHiddenVec; u++) {
+                            if (!tile_valid(tile, u)) continue;
+#pragma unroll
+                            for (int p = 0; p < kPairs; p++) {
+                                float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&pf_cur[u], p);
+                                acc[u][p].x += f.x;
+                                acc[u][p].y += f.y;
+                            }
+                        }
+                    }
+                    if (tile + 1 < kNTiles && n > 0) load_copy0(tile + 1, pf_nxt);  // prefetch
+                    for (int k = 1; k < n; k++) {
+                        const int32_t em_slot = smem_flat2em_slot_map[slot_in_block][k];
+                        const int4* src =
+                            reinterpret_cast<const int4*>(recv_x_em + static_cast<size_t>(em_slot) * kRowBytes);
+#pragma unroll
+                        for (int u = 0; u < kHiddenVec; u++) {
+                            if (!tile_valid(tile, u)) continue;
+                            int4 b = src[src_j(tile, u)];
+#pragma unroll
+                            for (int p = 0; p < kPairs; p++) {
+                                float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&b, p);
+                                acc[u][p].x += f.x;
+                                acc[u][p].y += f.y;
+                            }
+                        }
+                    }
 #pragma unroll
                     for (int u = 0; u < kHiddenVec; u++) {
                         if (!tile_valid(tile, u)) continue;
-                        int4 b = src[src_j(tile, u)];
-#pragma unroll
-                        for (int p = 0; p < kPairs; p++) {
-                            float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&b, p);
-                            acc[u][p].x += f.x;
-                            acc[u][p].y += f.y;
-                        }
-                    }
-                }
-#pragma unroll
-                for (int u = 0; u < kHiddenVec; u++) {
-                    if (!tile_valid(tile, u)) continue;
-                    int4 out;
-                    if (n == 1) {  // single copy: relay verbatim, no repack
-                        out = pf_cur[u];
-                    } else {
+                        // n == 1 is handled by the TMA relay above, so n >= 2 here: always repack.
+                        int4 out;
 #pragma unroll
                         for (int p = 0; p < kPairs; p++)
                             nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
+                        my_row[src_j(tile, u)] = out;
                     }
-                    my_row[src_j(tile, u)] = out;  // assemble reduced row in smem
+                    int4* tmp = pf_cur; pf_cur = pf_nxt; pf_nxt = tmp;
                 }
-                int4* tmp = pf_cur; pf_cur = pf_nxt; pf_nxt = tmp;
+                }  // end if (!filled): scalar reduce path
+                nccl_ep::tma_store_fence();
+                __syncwarp();
+                if (wlane == 0) nccl_ep::tma_store_1d(my_row, dst_int4, kRowBytes);
+            } else {
+            for (int chunk = 0; chunk < kNumChunks; chunk++) {
+                const int tile0 = chunk * kChunkTiles;
+                const int tile1 = tile0 + kChunkTiles < kNTiles ? tile0 + kChunkTiles : kNTiles;
+                const int base_j = tile_j(tile0);
+                const int end_j = tile_j(tile1);
+                if (chunk > 0 && wlane == 0) nccl_ep::tma_store_wait<0>();  // reuse buffer after prior chunk push
+                __syncwarp();
+                for (int tile = tile0; tile < tile1; tile++) {
+                    const int32_t* const f2e = smem_flat2em_slot_map[slot_in_block];
+                    float2 acc[kHiddenVec][4];
+#pragma unroll
+                    for (int u = 0; u < kHiddenVec; u++)
+#pragma unroll
+                        for (int p = 0; p < 4; p++) { acc[u][p].x = 0.0f; acc[u][p].y = 0.0f; }
+                    // Copies in ascending order; each batch's loads are all issued before any is summed.
+                    constexpr int kCopyBatch = 8 / kHiddenVec;
+#pragma unroll
+                    for (int kb = 0; kb < MaxTopK; kb += kCopyBatch) {
+                        if (kb > 0 && kb >= n) break;
+                        int4 b[kCopyBatch][kHiddenVec];
+#pragma unroll
+                        for (int kk = 0; kk < kCopyBatch; kk++) {
+                            if (kb + kk >= n) continue;
+                            const int4* src = reinterpret_cast<const int4*>(
+                                recv_x_em + static_cast<size_t>(f2e[kb + kk]) * kRowBytes);
+#pragma unroll
+                            for (int u = 0; u < kHiddenVec; u++)
+                                if (tile_valid(tile, u)) b[kk][u] = src[src_j(tile, u)];
+                        }
+#pragma unroll
+                        for (int kk = 0; kk < kCopyBatch; kk++) {
+                            if (kb + kk >= n) continue;
+#pragma unroll
+                            for (int u = 0; u < kHiddenVec; u++) {
+                                if (!tile_valid(tile, u)) continue;
+#pragma unroll
+                                for (int p = 0; p < kPairs; p++) {
+                                    float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&b[kk][u], p);
+                                    acc[u][p].x += f.x;
+                                    acc[u][p].y += f.y;
+                                }
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int u = 0; u < kHiddenVec; u++) {
+                        if (!tile_valid(tile, u)) continue;
+                        int4 out;
+#pragma unroll
+                        for (int p = 0; p < kPairs; p++)
+                            nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);
+                        my_row[src_j(tile, u) - base_j] = out;
+                    }
+                }
+                nccl_ep::tma_store_fence();
+                __syncwarp();
+                if (wlane == 0) nccl_ep::tma_store_1d(my_row, dst_int4 + base_j, (end_j - base_j) * 16);
             }
-            }  // end if (!filled): scalar reduce path
-
-            // Push the row. The proxy fence makes the scalar smem writes visible to the async
-            // (TMA) proxy read.
-            nccl_ep::tma_store_fence();
-            __syncwarp();
-            if (wlane == 0) nccl_ep::tma_store_1d(my_row, dst_int4, kRowBytes);
+            }
 
             // Backward: store the prefetched weight to its srcpos in this (t,R) token row's trailing
             // pad (co-located, one remote write per slot), after the token push has hidden the load.

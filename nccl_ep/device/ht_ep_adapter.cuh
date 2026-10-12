@@ -524,6 +524,7 @@ ncclResult_t launch_combine_push(
     int my_lsa_rank,
     int tokens_per_rank,
     int lsa_team_size,
+    int ep_size,
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,

@@ -18,6 +18,7 @@
 
 #include "test_common.h"
 #include "../nccl_ep_test_internal.h"
+#include "../device/ht_ep.cuh"
 #include "../device/ll_ep_adapter.cuh"
 
 TEST(LlDispatchSmem, StagingRespectsCapacityAndHiddenLimit) {
@@ -144,6 +145,65 @@ TEST(LlCombineSmem, Nvfp4ReceiveBufferMatchesDevicePacketLayout) {
             kHidden, nccl_ep::ll::combine_smem::kTwoByteElementBytes, /*nvfp4=*/true),
         nccl_ep::ll::combine_smem::kRecvTmaBarrierBytes + kAlignedPacketBytes);
 }
+
+// Pure host-side sizing tests for combine_push's chunking (see
+// combine_push_chunk_size/combine_push_slots_per_block in device/ht_ep.cuh). smem_cap is passed
+// explicitly (never queried from the live device) so these stay deterministic and portable across
+// whatever GPU CI happens to run on. hidden_int4=896 (ntiles=7, tile_int4=128) is the shape
+// ep_bench -V exercises end to end; hidden_int4=2 covers the single-tile edge case.
+struct CombinePushChunkingCase {
+    std::string name;
+    int hidden_int4;
+    int chunk_size;          // requested chunk width in int4; <1 = whole row
+    int smem_cap;
+    int expected_chunks;     // combine_push_num_chunks's chunk count
+    int expected_buf_int4;   // combine_push_buf_int4's per-warp buffer width
+    int expected_slots;      // combine_push_slots_per_block's warp count
+};
+
+const std::vector<CombinePushChunkingCase> kCombinePushChunkingCases = {
+    // A single-tile row is one chunk regardless of the request.
+    {"SmallHiddenWholeRow", 2, 0, 232448, 1, 2, 24},
+    // Unset is the whole row.
+    {"UnsetIsWholeRow", 896, 0, 232448, 1, 7 * 128, 15},
+    // A request up to one tile is one tile per chunk.
+    {"OneTilePerChunk", 896, 128, 232448, 7, 128, 24},
+    {"BelowOneTileRoundsUp", 896, 1, 232448, 7, 128, 24},
+    // A request that is not a tile multiple rounds up; the last chunk is short.
+    {"TwoTilesPerChunk", 896, 200, 232448, 4, 2 * 128, 24},
+    // A request at or above the row clamps to the whole row.
+    {"ClampedToWholeRow", 896, 100000, 232448, 1, 7 * 128, 15},
+    // Whole row that is not a tile multiple: buffer is the exact row, not tile-rounded (769 pads to
+    // 896 and would give 15 slots).
+    {"NonAlignedWholeRow769", 769, 0, 232448, 1, 769, 18},
+    // 513 pads to 640; at this cap the exact width fits all 24 slots, the padded width only 19.
+    {"NonAlignedWholeRow513", 513, 0, 200800, 1, 513, 24},
+    // A request at or above a non-aligned row clamps to the exact row.
+    {"NonAlignedClampedToWholeRow", 769, 100000, 232448, 1, 769, 18},
+    // Multi-chunk on a non-aligned row keeps a tile-multiple reusable buffer.
+    {"NonAlignedOneTilePerChunk", 769, 128, 232448, 7, 128, 24},
+    // A tight smem cap forces slots down to the floor of 1, never below.
+    {"TinyCapClampsToOneSlot", 896, 128, 6000, 7, 128, 1},
+};
+
+class CombinePushChunkingTest : public ::testing::TestWithParam<CombinePushChunkingCase> {};
+
+TEST_P(CombinePushChunkingTest, ChunksBufWidthAndSlotsMatchExpected) {
+    const auto& c = GetParam();
+    EXPECT_EQ(ht_ep::combine_push_num_chunks(c.hidden_int4, c.chunk_size), c.expected_chunks);
+    EXPECT_EQ(ht_ep::combine_push_buf_int4(c.hidden_int4, c.chunk_size), c.expected_buf_int4);
+    EXPECT_EQ(ht_ep::combine_push_slots_per_block(c.hidden_int4, c.smem_cap, c.chunk_size),
+              c.expected_slots);
+    // dynamic_smem_bytes is the actual CUDA launch's dynamic-smem request; must stay in lockstep
+    // with the slots/buf_int4 it's built from.
+    EXPECT_EQ(ht_ep::combine_push_dynamic_smem_bytes(c.hidden_int4, c.expected_slots, c.chunk_size),
+              static_cast<size_t>(c.expected_slots) * c.expected_buf_int4 * 16);
+}
+
+INSTANTIATE_TEST_SUITE_P(Sizing, CombinePushChunkingTest, ::testing::ValuesIn(kCombinePushChunkingCases),
+                          [](const ::testing::TestParamInfo<CombinePushChunkingCase>& info) {
+                              return info.param.name;
+                          });
 
 static float bf16_val(nv_bfloat16 v) {
     return __bfloat162float(v);

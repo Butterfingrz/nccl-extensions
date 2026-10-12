@@ -2674,6 +2674,7 @@ ncclResult_t launch_combine_push(
     int my_lsa_rank,
     int tokens_per_rank,
     int lsa_team_size,
+    int ep_size,
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,
@@ -2720,7 +2721,7 @@ ncclResult_t launch_combine_push(
 
     if (unfused_sync) NCCLCHECK(jit::launch_lsa_head_sync(dcomm, head_sync_flag, stream));
     const ncclResult_t status = ::nccl_ep::ht::jit::launch_combine_push(
-        top_k, row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward, nucs);
+        top_k, row_bytes, static_cast<int>(grid), ep_size, p, stream, token_dtype, backward, nucs);
     if (status != ncclSuccess) return status; // skip the tail sync: the kernel never launched
     if (unfused_sync) {
         NCCLCHECK(jit::launch_lsa_tail_sync(dcomm, grid_barrier_counter, head_sync_flag, stream));
