@@ -150,6 +150,13 @@ constexpr int kLsaStaticSmemBytes = kActiveRankMaskWords * static_cast<int>(size
 
 namespace nccl_ep::ll::dispatch_tma_smem {
 
+constexpr int kMinQuantWarps = 2;
+constexpr int kMaxQuantWarps = 6;
+constexpr int kControlWarps = 1;
+constexpr int kCleanupWarps = 1;
+constexpr int kQuantReadyBarrier = 1;
+constexpr int kQuantReadBarrier = 2;
+
 constexpr int kTmaBarrierBytes = sizeof(std::uint64_t);
 constexpr int kTmaPaddingBytes = sizeof(std::uint64_t);
 constexpr int kTmaBarrierAndPaddingBytes = kTmaBarrierBytes + kTmaPaddingBytes; // 16

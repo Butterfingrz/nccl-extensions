@@ -32,9 +32,10 @@ enum class ncclEpEnvType {
 };
 
 // A single environment variable bound to its name and type (both set at
-// construction). `is_set` is true only when the variable is present with a
-// valid value (an invalid value is warned about and left unset). `value` then
-// holds the parsed result in the union member selected by `type`; callers must
+// construction). `is_set` indicates that the parser supplied a value. Most
+// invalid settings are warned about and left unset; numeric knobs may preserve
+// an invalid value for the consumer to reject. `value` holds the parsed result
+// in the union member selected by `type`; callers must
 // check `is_set` before reading it. The union lets more representations
 // (double, string, ...) be added later without churn.
 struct ncclEpEnvVar {
@@ -96,6 +97,10 @@ struct ncclEpEnvConfig {
     // device/ll_ep_adapter.cuh.
     static constexpr const char* dispatch_lsa_modes[] = {"simt", "tma", "universal", nullptr};
     ncclEpEnvVar dispatch_lsa{"NCCL_EP_DISPATCH_LSA", ncclEpEnvType::choice, dispatch_lsa_modes};
+    // Quantization workers in addition to the TMA/control warp, LL DSFP8 only.
+    // Default is two workers. Invalid settings are rejected when launching
+    // DSFP8 TMA dispatch rather than silently restoring the default.
+    ncclEpEnvVar ll_tma_quant_warps{"NCCL_EP_LL_TMA_QUANT_WARPS", ncclEpEnvType::ulong};
 };
 
 // True iff a flag variable was explicitly set to an "on" value (1/on/true).

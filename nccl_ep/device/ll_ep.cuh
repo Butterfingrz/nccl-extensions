@@ -66,7 +66,6 @@ namespace ll {
 //     [hdr | data | scales] message from the local staging slot into the
 //     peer's recvBuf at the corresponding per-slot offset.
 //
-// Recipe-defined copies are shared by RDMA and the NVLink direct path.
 // kNvlinkOnly redirects token (and QUANT_FWD scale) payloads to peer windows.
 template <ncclEpDispQuant_t kRecipe, bool kNvlinkOnly, typename ScaleT, bool kSharedQuant>
 __forceinline__ __device__ void sendToken(
@@ -148,7 +147,6 @@ __forceinline__ __device__ void sendToken(
                 dstScales, rcvScalesWin, rcvScalesOffs, recvSlot,
                 recvScalesPerToken * sizeof(typename recipe_types::scale_t), dstRank);
         }
-        using src_t = const typename recipe_types::source_vec_t*;
         int scaleBytes = 0;
         if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
             scaleBytes = scalesPerToken * static_cast<int>(sizeof(typename recipe_types::scale_t));
@@ -162,17 +160,23 @@ __forceinline__ __device__ void sendToken(
                 dstScales[i] = quantizedScales[i];
             }
         } else {
-            castAndWriteToSendBuf<kRecipe, ScaleT>(
-                static_cast<src_t>(srcData),
-                dstDataVec,
-                dstScales,
-                /*threadId=*/laneId,
-                /*numThreads=*/32,
-                laneId,
-                hiddenBf16Int4,
-                roundScale,
-                inScales,
-                scaleBytes);
+            const auto* input = static_cast<const int4*>(srcData);
+#pragma unroll
+            for (int i = laneId; i < hiddenBf16Int4; i += ::nccl_ep::kWarpSize) {
+                if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
+                    float scaleInv;
+                    const int2 value = quantizeDsFp8Vector(__ldg(input + i), roundScale, scaleInv);
+                    if (laneId % ds_fp8::kLanesPerScale == 0)
+                        dstScales[i * ::nccl_ep::kBf16PerInt4 / kDsFp8E3M4ElementsPerScale] = scaleInv;
+                    dstDataVec[i] = value;
+                } else {
+                    dstDataVec[i] = __ldg(input + i);
+                }
+            }
+            if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
+                auto* dstBytes = reinterpret_cast<uint8_t*>(dstScales);
+                for (int i = laneId; i < scaleBytes; i += ::nccl_ep::kWarpSize) dstBytes[i] = inScales[i];
+            }
         }
     } else {
         // ---- RDMA path (interleaved layout) ----
@@ -712,27 +716,37 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             // send branch below. CFT stages through TMA; kNvlinkOnly stores
             // write directly to peers. Neither needs this staged payload.
             if constexpr (!kCft && !kNvlinkOnly) {
-                using src_t = const typename recipe_types::source_vec_t*;
-                castAndWriteToSendBuf<kRecipe, ScaleT>(
-                    static_cast<src_t>(srcDataInt4),
-                    sendBufVec,
-                    sendBufScales,
-                    threadId,
-                    numWritingThreads,
-                    laneId,
-                    hiddenBf16Int4,
-                    roundScale,
-                    inScalesTok,
-                    scaleBytes);
+#pragma unroll
+                for (int i = threadId; i < hiddenBf16Int4; i += numWritingThreads) {
+                    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
+                        float scaleInv;
+                        const int2 value = quantizeDsFp8Vector(__ldg(srcDataInt4 + i), roundScale, scaleInv);
+                        if (laneId % ds_fp8::kLanesPerScale == 0)
+                            sendBufScales[i * ::nccl_ep::kBf16PerInt4 / kDsFp8E3M4ElementsPerScale] = scaleInv;
+                        sendBufVec[i] = value;
+                    } else {
+                        sendBufVec[i] = __ldg(srcDataInt4 + i);
+                    }
+                }
+                if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
+                    auto* dstBytes = reinterpret_cast<uint8_t*>(sendBufScales);
+                    for (int i = threadId; i < scaleBytes; i += numWritingThreads) dstBytes[i] = inScalesTok[i];
+                }
             }
 
             if constexpr (kSharedQuant) {
-                castAndWriteToSendBuf<kRecipe, float>(srcDataInt4, quantized, quantizedScales,
-                    threadId, numWritingThreads, laneId, hiddenBf16Int4, roundScale);
+#pragma unroll
+                for (int i = threadId; i < hiddenBf16Int4; i += numWritingThreads) {
+                    float scaleInv;
+                    const int2 value = quantizeDsFp8Vector(__ldg(srcDataInt4 + i), roundScale, scaleInv);
+                    if (laneId % ds_fp8::kLanesPerScale == 0)
+                        quantizedScales[i * ::nccl_ep::kBf16PerInt4 / kDsFp8E3M4ElementsPerScale] = scaleInv;
+                    quantized[i] = value;
+                }
             }
 
             // Make sure that all working warps in the SM have completed the header writing.
-            syncSmGroup(SYNC_DISP_SEND_COPY, numWritingThreads);
+            syncSmGroup<true>(SYNC_DISP_SEND_COPY, numWritingThreads);
 
             if constexpr (!kCft) {
                 // Do filtering to avoid duplicate sending of tokens to the same rank.
@@ -800,7 +814,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             }
             if constexpr (kSharedQuant) {
                 // No producer may overwrite this token until every peer copy has read it.
-                syncSmGroup(SYNC_DISP_SEND_COPY, numWritingThreads);
+                syncSmGroup<true>(SYNC_DISP_SEND_COPY, numWritingThreads);
             }
 #if NCCL_EP_CFT_DEVICE_SUPPORTED
             // Warp 0 sends every destination from one staged tile, including

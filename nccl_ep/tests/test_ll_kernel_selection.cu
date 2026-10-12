@@ -29,10 +29,16 @@ TEST(LlKernelSelection, PartialDispatchTilesUseUniversalInBothModes) {
     }
 }
 
-TEST(LlKernelSelection, DispatchPreservesOtherFallbacks) {
+TEST(LlKernelSelection, DsFp8DispatchSupportsTmaAndSimt) {
     EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_DS_FP8E3M4,
         NCCL_EP_LAYOUT_RANK_MAJOR, false, NcclEpDispatchLsaMode::kTma, 7168, ncclBfloat16),
+        LlDispatchAlgo::k2SidedRmLsaTma);
+    EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_DS_FP8E3M4,
+        NCCL_EP_LAYOUT_RANK_MAJOR, false, NcclEpDispatchLsaMode::kSimt, 7168, ncclBfloat16),
         LlDispatchAlgo::k2SidedRmLsa);
+}
+
+TEST(LlKernelSelection, DispatchPreservesOtherFallbacks) {
     EXPECT_EQ(ll_dispatch_select_algo(true, NCCL_EP_DISP_QUANT_DS_FP8E3M4,
         NCCL_EP_LAYOUT_RANK_MAJOR, false, NcclEpDispatchLsaMode::kTma, 128, ncclBfloat16),
         LlDispatchAlgo::kDefault);

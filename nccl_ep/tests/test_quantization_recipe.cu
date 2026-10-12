@@ -314,6 +314,17 @@ TEST_F(QuantizationRecipeTest, ScalesForwardDispatchCompletes) {
 }
 
 TEST_F(QuantizationRecipeTest, DsFp8OneTokenCapacityFallbackMatchesStaging) {
+    // This specifically tests the SIMT shared-quantization capacity fallback.
+    struct SimtOverride {
+        bool present = std::getenv("NCCL_EP_DISPATCH_LSA") != nullptr;
+        std::string previous = present ? std::getenv("NCCL_EP_DISPATCH_LSA") : "";
+        SimtOverride() { setenv("NCCL_EP_DISPATCH_LSA", "simt", 1); }
+        ~SimtOverride() {
+            if (present) setenv("NCCL_EP_DISPATCH_LSA", previous.c_str(), 1);
+            else unsetenv("NCCL_EP_DISPATCH_LSA");
+        }
+    } simt_override;
+
     constexpr int hidden = 7168;
     constexpr int scales = hidden / 128;
     ncclEpGroupConfig_t gc = NCCL_EP_GROUP_CONFIG_INIT;
@@ -398,7 +409,24 @@ TEST_F(QuantizationRecipeTest, DsFp8OneTokenCapacityFallbackMatchesStaging) {
     }
 }
 
-static void run_dsfp8_window_offsets(bool strict, int tokenCount = 1) {
+static void run_dsfp8_window_offsets(
+    bool strict, int tokenCount = 1, int smemBudget = 0, bool simtReference = false,
+    ncclResult_t expectedDispatch = ncclSuccess) {
+    // Optionally establish the bitwise payload/scale reference with the existing
+    // SIMT recipe, independently of TMA's new in-place arithmetic and layout.
+    struct ReferenceOverride {
+        bool enabled;
+        bool present = std::getenv("NCCL_EP_DISPATCH_LSA") != nullptr;
+        std::string previous = present ? std::getenv("NCCL_EP_DISPATCH_LSA") : "";
+        explicit ReferenceOverride(bool useSimt) : enabled(useSimt) {
+            if (enabled) setenv("NCCL_EP_DISPATCH_LSA", "simt", 1);
+        }
+        ~ReferenceOverride() {
+            if (!enabled) return;
+            if (present) setenv("NCCL_EP_DISPATCH_LSA", previous.c_str(), 1);
+            else unsetenv("NCCL_EP_DISPATCH_LSA");
+        }
+    };
     constexpr int hidden = 7168;
     constexpr int scales = hidden / 128;
     ncclEpGroupConfig_t gc = NCCL_EP_GROUP_CONFIG_INIT;
@@ -413,6 +441,7 @@ static void run_dsfp8_window_offsets(bool strict, int tokenCount = 1) {
     gc.num_channels = NCCL_EP_AUTO;
     ncclEpGroup_t group = nullptr;
     NCCL_ASSERT(ncclEpCreateGroup(&group, g_comm, &gc));
+    if (smemBudget) NCCL_ASSERT(ncclEpGroup_test_setMaxDynamicSmem(group, smemBudget));
     std::vector<ncclEpTensor_t*> tensors;
     auto alloc = [&](ncclDataType_t dtype, size_t bytes, std::vector<size_t> dims) {
         ncclEpTensor_t* t = nullptr;
@@ -447,13 +476,16 @@ static void run_dsfp8_window_offsets(bool strict, int tokenCount = 1) {
                                      &scaleWindow, NCCL_WIN_COLL_SYMMETRIC));
     CUDA_ASSERT(cudaMemset(tokenStorage, 0x5a, offset));
     CUDA_ASSERT(cudaMemset(scaleStorage, 0x5a, offset));
-    // One incoming source per rank; larger tokenCount exercises repeated shared-buffer reuse.
+    // One incoming source per rank; larger tokenCount exercises ring reuse.
     const int64_t expert = ((g_rank + 1) % g_nranks) * (kNumExperts / g_nranks);
     std::vector<int64_t> experts(tokenCount, expert);
-    std::vector<float> weightsHost(tokenCount, 1.0f);
+    std::vector<float> weightsHost(tokenCount);
+    for (int t = 0; t < tokenCount; ++t) weightsHost[t] = float(t + 1);
     std::vector<nv_bfloat16> input(tokenCount * hidden);
     for (int i = 0; i < tokenCount * hidden; ++i) {
-        input[i] = __float2bfloat16(float(((i % hidden) % 127) - 63 + g_rank));
+        const int token = i / hidden;
+        input[i] = __float2bfloat16(float(((i % hidden + 17 * token) % 127) - 63 + g_rank) *
+                                   float((1 + token % 5) * (1 << ((i % hidden) / 128 % 4))));
     }
     CUDA_ASSERT(cudaMemcpy(idx->data, experts.data(), tokenCount * sizeof(expert), cudaMemcpyHostToDevice));
     CUDA_ASSERT(cudaMemcpy(tokens->data, input.data(), tokenCount * hidden * sizeof(nv_bfloat16), cudaMemcpyHostToDevice));
@@ -480,9 +512,8 @@ static void run_dsfp8_window_offsets(bool strict, int tokenCount = 1) {
         config.round_scales = rounded;
         std::fill(reference_scales.begin(), reference_scales.end(), 0.0f);
         for (int windows : {0, 3, 1, 2, 3, 0}) {
-            if (strict && windows == 0) {
-                continue;
-            }
+            if (strict && windows == 0) continue;
+            ReferenceOverride referenceKernel(simtReference && reference_scales[0] == 0);
             recv->win_hdl = windows & 1 ? tokenWindow : ncclWindow_t{};
             recv->win_offset = windows & 1 ? offset : 0;
             recv_scales->win_hdl = windows & 2 ? scaleWindow : ncclWindow_t{};
@@ -494,7 +525,11 @@ static void run_dsfp8_window_offsets(bool strict, int tokenCount = 1) {
             NCCL_ASSERT(ncclAllReduce(counts->data, counts->data, 1, ncclInt32,
                                      ncclSum, g_comm, g_stream));
             SCOPED_TRACE(::testing::Message() << "rank=" << g_rank << " windows=" << windows);
-            NCCL_ASSERT(ncclEpDispatch(handle, &inputs, &outputs, &layout, &config, g_stream));
+            ASSERT_EQ(ncclEpDispatch(handle, &inputs, &outputs, &layout, &config, g_stream), expectedDispatch);
+            if (expectedDispatch != ncclSuccess) {
+                CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+                continue;
+            }
             NCCL_ASSERT(ncclEpComplete(handle, nullptr, g_stream));
             CUDA_ASSERT(cudaStreamSynchronize(g_stream));
             std::vector<int> received(g_nranks);
@@ -506,6 +541,25 @@ static void run_dsfp8_window_offsets(bool strict, int tokenCount = 1) {
                                    tokenCount * hidden, cudaMemcpyDeviceToHost));
             CUDA_ASSERT(cudaMemcpy(actual_scales.data(), static_cast<float*>(recv_scales->data) + source * tokenCount * scales,
                                    tokenCount * scales * sizeof(float), cudaMemcpyDeviceToHost));
+            // Receive slots are allocated concurrently; use the unique weight
+            // tag to compare each token against the same source token, not slot order.
+            std::vector<float> tags(tokenCount);
+            CUDA_ASSERT(cudaMemcpy(tags.data(), static_cast<float*>(recv_weights->data) + source * tokenCount,
+                                   tokenCount * sizeof(float), cudaMemcpyDeviceToHost));
+            auto payloadByToken = actual;
+            auto scalesByToken = actual_scales;
+            std::vector<bool> seen(tokenCount, false);
+            for (int slot = 0; slot < tokenCount; ++slot) {
+                const int token = static_cast<int>(tags[slot]) - 1;
+                ASSERT_GE(token, 0);
+                ASSERT_LT(token, tokenCount);
+                ASSERT_FALSE(seen[token]);
+                seen[token] = true;
+                std::copy_n(actual.data() + slot * hidden, hidden, payloadByToken.data() + token * hidden);
+                std::copy_n(actual_scales.data() + slot * scales, scales, scalesByToken.data() + token * scales);
+            }
+            actual.swap(payloadByToken);
+            actual_scales.swap(scalesByToken);
             if (reference_scales[0] == 0) {
                 reference = actual;
                 reference_scales = actual_scales;
@@ -543,8 +597,44 @@ TEST_F(QuantizationRecipeTest, DsFp8RankMajorStrictZeroCopyWindowOffsets) {
     run_dsfp8_window_offsets(true);
 }
 
-TEST_F(QuantizationRecipeTest, DsFp8RankMajorMultiTokenWindowOffsets) {
-    run_dsfp8_window_offsets(false, 33);
+TEST_F(QuantizationRecipeTest, DsFp8RankMajorSmallSmemRingReuse) {
+    // H=7168 in-place BF16/FP8 stage fits once in 16 KiB. 33 tokens
+    // across eight expert CTAs forces repeated reuse, including the short tail.
+    run_dsfp8_window_offsets(false, 33, 16 * 1024);
+}
+
+TEST_F(QuantizationRecipeTest, DsFp8RankMajorMultiStageRingReuse) {
+    // Two-stage and default eight-stage rings; 73 tokens wrap both rings.
+    run_dsfp8_window_offsets(false, 73, 32 * 1024);
+    run_dsfp8_window_offsets(false, 73, 0, true);
+}
+
+TEST_F(QuantizationRecipeTest, DsFp8TmaQuantWorkerOverrides) {
+    struct RestoreEnv {
+        const char* name;
+        bool present;
+        std::string previous;
+        explicit RestoreEnv(const char* key)
+            : name(key), present(getenv(key) != nullptr), previous(present ? getenv(key) : "") {}
+        ~RestoreEnv() {
+            if (present) setenv(name, previous.c_str(), 1);
+            else unsetenv(name);
+        }
+    } restoreFamily("NCCL_EP_DISPATCH_LSA"), restoreWorkers("NCCL_EP_LL_TMA_QUANT_WARPS");
+    setenv("NCCL_EP_DISPATCH_LSA", "tma", 1);
+    // Switching groups in one process exercises the runtime JIT cache key as
+    // well as the environment snapshot. Compare every choice against SIMT.
+    for (const char* workers : {"", "2", "3", "4", "5", "6", "2"}) {
+        SCOPED_TRACE(workers);
+        if (*workers) setenv("NCCL_EP_LL_TMA_QUANT_WARPS", workers, 1);
+        else unsetenv("NCCL_EP_LL_TMA_QUANT_WARPS");
+        run_dsfp8_window_offsets(false, 73, 0, true);
+    }
+    for (const char* workers : {"0", "1", "7", "-1", " -1", " ", "invalid", "2junk", "18446744073709551615", "18446744073709551616"}) {
+        SCOPED_TRACE(workers);
+        setenv("NCCL_EP_LL_TMA_QUANT_WARPS", workers, 1);
+        run_dsfp8_window_offsets(false, 1, 0, false, ncclInvalidArgument);
+    }
 }
 
 TEST_F(QuantizationRecipeTest, DsFp8E3M4DispatchCompletes) {

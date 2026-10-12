@@ -40,10 +40,9 @@ BF16 token inputs and no input scale tensor. Dispatch produces E4M3 token
 bytes and required FP32 output scales, one per 128 token elements. The hidden
 dimension must be divisible by 512.
 
-On an NVLink-only, rank-major group, the universal and LSA SIMT LL dispatch kernels
-(`NCCL_EP_DISPATCH_LSA=universal|simt`) support writing generated tokens
+On an NVLink-only, rank-major group, all three LL dispatch families
+(`NCCL_EP_DISPATCH_LSA=universal|simt|tma`) support writing generated tokens
 and scales directly into their independently registered output windows.
-The default TMA selector falls back to SIMT for this recipe.
 See [Zero-Copy](zero_copy.md) for window registration and `zero_copy` semantics.
 
 ## `NCCL_EP_COMB_QUANT_NVFP4` (EXPERIMENTAL)

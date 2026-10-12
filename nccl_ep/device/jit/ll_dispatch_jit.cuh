@@ -32,19 +32,11 @@ constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel"
 // never pick a kernel directly.
 //   kDefault:     the general kernel (every recipe/layout, RDMA/GIN capable).
 //                 Also used for CFT; the LSA-only kernel has no CFT transport.
-//   k2SidedRmLsa: LSA-only rank-major kernel that stages payload through
-//                 RDMA buffers. Selected for LSA-only rank-major calls with
-//                 CFT disabled, using NONE or fused DS_FP8E3M4. NONE still writes each token's payload
-//                 directly into the peer's registered output window instead
-//                 of staging through RDMA whenever the EP group's zero-copy
-//                 flag (ncclEpGroupConfig_t::zero_copy) is ON and a window
-//                 is present (args.recvDataWindow) -- that's an independent,
-//                 runtime toggle inside the kernel, not a separate algo.
-//   k2SidedRmLsaTma: TMA-pipelined SEND phase (dispatch_kernel_impl_2sided_rm_lsa_tma,
-//                 ll/ll_dispatch_lsa.cuh). The default for LSA-eligible, unquantized (NONE) calls
-//                 (NCCL_EP_DISPATCH_LSA=tma, see NcclEpDispatchLsaMode's doc comment in
-//                 device/ll_ep_adapter.cuh) -- the TMA kernel takes no recipe template, so it is
-//                 never selected for DS_FP8E3M4.
+//   k2SidedRmLsa: LSA-only rank-major SIMT kernel, quantization: NONE or fused DS_FP8E3M4.
+//                 Token and scale windows independently bypass receive staging.
+//   k2SidedRmLsaTma: TMA-pipelined SEND, NONE or fused DS_FP8E3M4, with the same
+//                 direct-output contract. DSFP8 quantizes once per token into
+//                 the existing BF16 stage in place before issuing peer TMA stores.
 enum class LlDispatchAlgo { kDefault, k2SidedRmLsa, k2SidedRmLsaTma };
 
 // Picks the most performant kernel for the configuration; overridable via NCCL_EP_DISPATCH_LSA
@@ -65,14 +57,12 @@ inline LlDispatchAlgo ll_dispatch_select_algo(
     const int elemsPerWarp = 32 * static_cast<int>(sizeof(int4)) / (tokenDtype == ncclFloat32 ? 4 : 2);
     const bool lsaEligible = hidden > 0 && hidden % elemsPerWarp == 0 &&
         !cftEnabled && nvlinkOnly && lsaRecipe && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
-    const bool tmaEligible = recipe == NCCL_EP_DISP_QUANT_NONE;
 
-    // Most preferred: the TMA kernel, when both LSA- and TMA-eligible.
-    if (lsaEligible && tmaEligible && lsaMode == NcclEpDispatchLsaMode::kTma) {
+    // Prefer TMA for both supported LSA recipes unless explicitly overridden.
+    if (lsaEligible && lsaMode == NcclEpDispatchLsaMode::kTma) {
         return LlDispatchAlgo::k2SidedRmLsaTma;
     }
-    // LSA-eligible but TMA isn't (e.g. DS_FP8E3M4, which the TMA kernel doesn't support): fall
-    // back to the SIMT LSA kernel.
+    // Explicit SIMT selection uses the non-TMA LSA kernel.
     if (lsaEligible) {
         return LlDispatchAlgo::k2SidedRmLsa;
     }
@@ -92,7 +82,8 @@ inline std::string ll_dispatch_jit_source(
     bool compactQuant,
     bool stageQuant,
     bool cftEnabled,
-    int numTmaStages) {
+    int numTmaStages,
+    int numTmaQuantWarps) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     const char* topk_type = topkIdxIsInt64 ? "int64_t" : "int32_t";
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(tokenDtype);
@@ -114,11 +105,13 @@ inline std::string ll_dispatch_jit_source(
     switch (algo) {
     case LlDispatchAlgo::k2SidedRmLsaTma:
         src << "  nccl_ep::ll::dispatch_kernel_impl_2sided_rm_lsa_tma<\n"
+            << "      " << kernel_spec.recipe_source_literal << ",\n"
             << "      " << hidden << ",\n"
             << "      " << num_topk << ",\n"
             << "      " << numTmaStages << ",\n"
             << "      " << topk_type << ",\n"
-            << "      " << token_dtype_literal << ">(p);\n";
+            << "      " << token_dtype_literal << ",\n"
+            << "      " << numTmaQuantWarps << ">(p);\n";
         break;
     case LlDispatchAlgo::k2SidedRmLsa:
         // dispatch_kernel_impl_2sided_rm_lsa hardcodes NCCL_EP_LAYOUT_RANK_MAJOR
@@ -164,6 +157,7 @@ inline ncclResult_t launch_ll_dispatch(
     bool stageQuant,
     int cft_smem_bytes,
     NcclEpDispatchLsaMode lsaMode,
+    int tmaQuantWarps,
     int maxDynamicSmem,
     const dispatch_kernel_args_t& args,
     cudaStream_t stream,
@@ -172,6 +166,23 @@ inline ncclResult_t launch_ll_dispatch(
     const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout, cftEnabled, lsaMode, hidden, tokenDtype);
     const bool twoSidedRmLsa = algo == LlDispatchAlgo::k2SidedRmLsa;
     const bool twoSidedRmLsaTma = algo == LlDispatchAlgo::k2SidedRmLsaTma;
+    const bool tmaQuant = twoSidedRmLsaTma && recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
+    // Non-quantizing variants have no TMA quantization workers. Keep their
+    // specialization independent of the DSFP8 TMA tuning knob.
+    const int numTmaQuantWarps = tmaQuant ? tmaQuantWarps : 0;
+    if (tmaQuant && (numTmaQuantWarps < dispatch_tma_smem::kMinQuantWarps ||
+                     numTmaQuantWarps > dispatch_tma_smem::kMaxQuantWarps)) {
+        std::fprintf(stderr, "[nccl_ep jit] LL TMA quantization worker count must be %d..%d (got %d).\n",
+                     dispatch_tma_smem::kMinQuantWarps, dispatch_tma_smem::kMaxQuantWarps, numTmaQuantWarps);
+        return ncclInvalidArgument;
+    }
+    const int requiredTmaWarps = dispatch_tma_smem::kControlWarps + numTmaQuantWarps +
+                                dispatch_tma_smem::kCleanupWarps;
+    if (tmaQuant && numWarps < requiredTmaWarps) {
+        std::fprintf(stderr, "[nccl_ep jit] LL TMA quantization needs %d CTA warps (got %d).\n",
+                     requiredTmaWarps, numWarps);
+        return ncclInvalidArgument;
+    }
     // Keep the compact thread limit with a one-block launch bound: repeated
     // single- and multi-node tuning did not favor the tighter register budget.
     const bool compactQuant = stageQuant && numWarps <= kLlDsFp8CompactWarps;
@@ -183,6 +194,7 @@ inline ncclResult_t launch_ll_dispatch(
     int numTmaStages = 0;
     int tmaDynamicSmemBytes = 0;
     if (twoSidedRmLsaTma) {
+        // DSFP8 compacts in place; preserve the BF16 stage size and depth.
         const int hiddenBytes = static_cast<int>(::nccl_ep::token_row_bytes(tokenDtype, hidden));
         const size_t dispatchHdrSz = get_dispatch_hdr_sz(num_topk, layout);
         // Reserve syncAndSendCounts's static __shared__ state out of the budget before sizing the
@@ -241,6 +253,9 @@ inline ncclResult_t launch_ll_dispatch(
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(stageQuant));
     key = ::nccl_ep::jit::runtime_key_mix(
         key, twoSidedRmLsaTma ? (1u | (static_cast<std::uint64_t>(numTmaStages) << 2)) : 0u);
+    if (tmaQuant) {
+        key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(numTmaQuantWarps));
+    }
     variant.runtime_key = key;
     variant.num_blocks = numSms;
     variant.block_dim = numWarps * 32;
@@ -276,6 +291,7 @@ inline ncclResult_t launch_ll_dispatch(
              << (twoSidedRmLsa ? "_2sidedrmlsa" : "")
              << (twoSidedRmLsaTma ? "_2sidedrmlsatma" : "")
              << (twoSidedRmLsaTma ? ("_stages" + std::to_string(numTmaStages)) : "")
+             << (tmaQuant ? ("_qwarps" + std::to_string(numTmaQuantWarps)) : "")
              << (cftEnabled ? "_cft" : "")
              << (compactQuant ? "_compact" : "")
              << (stageQuant ? "_staged" : "")
@@ -284,7 +300,7 @@ inline ncclResult_t launch_ll_dispatch(
         variant_name = name.str();
         const std::string source = ll_dispatch_jit_source(
             kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype, algo,
-            compactQuant, stageQuant, cftEnabled, numTmaStages);
+            compactQuant, stageQuant, cftEnabled, numTmaStages, numTmaQuantWarps);
         variant.variant_name = variant_name;
         variant.source = source;
         status = ::nccl_ep::jit::launch_jit_kernel(

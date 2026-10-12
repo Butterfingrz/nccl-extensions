@@ -72,8 +72,14 @@ __device__ __forceinline__ void completeFullLowLatencyEpoch(
     completeFullLowLatencyEpochImpl(epochState, phases, isElectedCta && threadId == 0);
 }
 
+// Opt in to compiler memory ordering without changing existing callers.
+template <bool kMemoryClobber = false>
 __device__ __forceinline__ void syncSmGroup(int groupIdx, int nThreads) {
-    asm volatile("bar.sync %0, %1;" ::"r"(groupIdx), "r"(nThreads));
+    if constexpr (kMemoryClobber) {
+        asm volatile("bar.sync %0, %1;" ::"r"(groupIdx), "r"(nThreads) : "memory");
+    } else {
+        asm volatile("bar.sync %0, %1;" ::"r"(groupIdx), "r"(nThreads));
+    }
 }
 
 // Warp-cooperative: all 32 lanes must call together.

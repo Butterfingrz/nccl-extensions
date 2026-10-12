@@ -83,9 +83,14 @@ LL dispatch takes the direct path only when all of these hold:
 Then `outputs->tokens` is written directly when windowed. Under `QUANT_FWD`
 and fused `DS_FP8E3M4`, `outputs->scales` is independently written directly
 when windowed — either, both, or neither. DSFP8 accepts BF16 input and generates
-FP8 tokens and FP32 inverse scales inside dispatch. Universal and LSA SIMT
-dispatch support this fused zero-copy path. The default TMA selector falls back
-to SIMT for DSFP8; the TMA kernel remains unquantized.
+FP8 tokens and FP32 inverse scales inside dispatch. Universal, LSA SIMT, and
+LSA TMA dispatch all support this fused zero-copy path.
+
+Set `NCCL_EP_LL_TMA_QUANT_WARPS` to `2` through `6` to tune LL TMA fused
+DSFP8 performance (default `2`). The setting is captured when the group is
+created. TMA dispatch requires these quantization workers plus a control warp
+and a cleanup warp. Invalid worker counts or insufficient CTA warps return
+`ncclInvalidArgument`. The setting does not affect BF16, SIMT, or universal dispatch.
 
 ## The group-wide `zero_copy` flag
 

@@ -4947,9 +4947,25 @@ ncclResult_t ncclEpDispatch(
             handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
             recipe_zcopy_ok &&
             !cft_active;
+        const bool tma_quant = nvlink_only && !cft_active && hidden > 0 &&
+            hidden % (32 * sizeof(int4) / ncclTypeSize(x->datatype)) == 0 &&
+            handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR &&
+            recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4 &&
+            resolve_dispatch_lsa_mode(group->env) == nccl_ep::ll::NcclEpDispatchLsaMode::kTma;
+        if (tma_quant && group->env.ll_tma_quant_warps.is_set) {
+            const auto workers = group->env.ll_tma_quant_warps.value.ul;
+            if (workers < nccl_ep::ll::dispatch_tma_smem::kMinQuantWarps ||
+                workers > nccl_ep::ll::dispatch_tma_smem::kMaxQuantWarps) {
+                std::fprintf(stderr, "NCCL EP: %s must be an integer in %d..%d (parsed %lu)\n",
+                             group->env.ll_tma_quant_warps.name,
+                             nccl_ep::ll::dispatch_tma_smem::kMinQuantWarps,
+                             nccl_ep::ll::dispatch_tma_smem::kMaxQuantWarps, workers);
+                return ncclInvalidArgument;
+            }
+        }
         const bool zcopy_rcv_x = zcopy_ok && recv_x->win_hdl != ncclWindow_t{};
         const bool zcopy_rcv_scales =
-            zcopy_ok && recipe != NCCL_EP_DISP_QUANT_NONE &&
+            zcopy_ok && (recipe == NCCL_EP_DISP_QUANT_FWD || recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) &&
             scales != nullptr && scales->win_hdl != ncclWindow_t{};
         const bool zcopy_any = zcopy_rcv_x || zcopy_rcv_scales;
         const char* zcopy_reason =
@@ -5107,6 +5123,9 @@ ncclResult_t ncclEpDispatch(
                     params.cftCumulByteExpect = lb.cumul_byte_expect_dev + cumul_off;
                 }
                 params.lsaMode = resolve_dispatch_lsa_mode(group->env);
+                if (tma_quant && group->env.ll_tma_quant_warps.is_set) {
+                    params.tmaQuantWarps = static_cast<int>(group->env.ll_tma_quant_warps.value.ul);
+                }
                 // Keep recipe dispatch explicit at the kernel launch boundary. The
                 // selected branch becomes the JIT kernel's quantization variant.
                 switch (recipe) {

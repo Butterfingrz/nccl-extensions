@@ -48,6 +48,9 @@
 
 namespace nccl_ep {
 
+constexpr int kWarpSize = 32; // CUDA hardware warp width.
+constexpr int kBf16PerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
+
 //==============================================================================
 // Type Traits and Helper Types
 //==============================================================================
@@ -900,10 +903,11 @@ __device__ __forceinline__ void mbarrier_inval(uint64_t* mbar_ptr) {
     asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(mbar_int_ptr));
 }
 
-template <bool kWithMultiStages = false>
+template <bool kWithMultiStages = false, bool kMemoryClobber = false>
 __device__ __forceinline__ void mbarrier_wait(uint64_t* mbar_ptr, uint32_t& phase, int stage_idx = 0) {
     auto mbar_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
     const auto& wait = kWithMultiStages ? (phase >> stage_idx) & 1 : phase;
+    if constexpr (kMemoryClobber) asm volatile("" ::: "memory");
     asm volatile(
         "{\n\t"
         ".reg .pred       P1; \n\t"
@@ -915,6 +919,7 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t* mbar_ptr, uint32_t& phas
         "}" ::"r"(mbar_int_ptr),
         "r"(wait),
         "r"(0x989680));
+    if constexpr (kMemoryClobber) asm volatile("" ::: "memory");
     phase ^= kWithMultiStages ? (1 << stage_idx) : 1;
 }
 
@@ -950,8 +955,14 @@ __device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar_ptr) {
 constexpr uint64_t kEvictFirst = 0x12f0000000000000;
 constexpr uint64_t kEvictNormal = 0x1000000000000000;
 
+// Opt in to compiler memory ordering without changing existing callers.
+template <bool kMemoryClobber = false>
 __device__ __forceinline__ void tma_store_fence() {
-    asm volatile("fence.proxy.async.shared::cta;");
+    if constexpr (kMemoryClobber) {
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    } else {
+        asm volatile("fence.proxy.async.shared::cta;");
+    }
 }
 
 __device__ __forceinline__ void

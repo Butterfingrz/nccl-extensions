@@ -64,67 +64,40 @@ struct DispatchRecipeDeviceTypes<NCCL_EP_DISP_QUANT_DS_FP8E3M4, ScaleT> {
     }
 };
 
-template <ncclEpDispQuant_t kRecipe, typename ScaleT>
-__forceinline__ __device__ void castAndWriteToSendBuf(
-    const typename DispatchRecipeDeviceTypes<kRecipe, ScaleT>::source_vec_t* srcData,
-    typename DispatchRecipeDeviceTypes<kRecipe, ScaleT>::transport_vec_t* sendBufVec,
-    typename DispatchRecipeDeviceTypes<kRecipe, ScaleT>::scale_t* sendBufScales,
-    int threadId,
-    int numThreads,
-    int laneId,
-    int hiddenBf16Int4,
-    bool roundScale,
-    const uint8_t* inScales = nullptr,  // QUANT_FWD: raw scale bytes for this token
-    int scaleBytes = 0) {               // QUANT_FWD: total bytes to copy
+// Geometry of the DS-FP8 recipe's int4 input and half-warp scale reduction.
+namespace ds_fp8 {
+constexpr int kLanesPerScale = kDsFp8E3M4ElementsPerScale / kBf16PerInt4;
+constexpr int kElementsPerWarp = kWarpSize * kBf16PerInt4;
+constexpr int kScalesPerWarp = kElementsPerWarp / kDsFp8E3M4ElementsPerScale;
+static_assert(kLanesPerScale == kWarpSize / 2, "DS-FP8 scales require half-warp groups");
+} // namespace ds_fp8
 
-    // DS_FP8E3M4 derives scales with fixed half-warp groups. Plain vector
-    // copies do not require a whole warp and may finish with a partial warp.
-    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
-        EP_DEVICE_ASSERT(hiddenBf16Int4 % 32 == 0);
-    }
+// Quantize eight BF16 elements per lane. All 32 lanes must participate;
+// each half warp shares one scale for 128 elements. Memory placement and
+// synchronization for overlapping input/output belong to the caller.
+__forceinline__ __device__ int2 quantizeDsFp8Vector(int4 packed, bool roundScale, float& scaleInv) {
+    constexpr int kElementsPerRead = ::nccl_ep::kBf16PerInt4;
+    EP_STATIC_ASSERT(kElementsPerRead * ds_fp8::kLanesPerScale == kDsFp8E3M4ElementsPerScale,
+                     "Invalid DS_FP8E3M4 vectorization");
+    const auto* bf16 = reinterpret_cast<const nv_bfloat16*>(&packed);
+    float values[kElementsPerRead];
+    float amax = kFP8Margin;
 #pragma unroll
-    for (int i = threadId; i < hiddenBf16Int4; i += numThreads) {
-        if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
-            sendBufVec[i] = __ldg(srcData + i);
-        } else if constexpr (kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) {
-            constexpr int kElementsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
-            auto dataInt4 = __ldg(srcData + i);
-            auto bf16Data = reinterpret_cast<nv_bfloat16*>(&dataInt4);
-            float fp32Data[kElementsPerRead];
-            float amax = kFP8Margin;
-            float scale;
-            float scaleInv;
-#pragma unroll
-            for (int j = 0; j < kElementsPerRead; ++j) {
-                fp32Data[j] = static_cast<float>(bf16Data[j]);
-                amax = fmaxf(amax, fabsf(fp32Data[j]));
-            }
-
-            EP_STATIC_ASSERT(kElementsPerRead * 32 / kDsFp8E3M4ElementsPerScale == 2,
-                             "Invalid DS_FP8E3M4 vectorization");
-            amax = warp_reduce_max<16>(amax);
-            calculate_fp8_scales(amax, scale, scaleInv, roundScale);
-            if (laneId == 0 || laneId == 16) {
-                sendBufScales[i * kElementsPerRead / kDsFp8E3M4ElementsPerScale] = scaleInv;
-            }
-
-            int2 dataInt2;
-            auto fp8x2Data = reinterpret_cast<__nv_fp8x2_storage_t*>(&dataInt2);
-#pragma unroll
-            for (int j = 0; j < kElementsPerRead; j += 2) {
-                const float2 fp32x2 = {fp32Data[j] * scale, fp32Data[j + 1] * scale};
-                fp8x2Data[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
-            }
-            sendBufVec[i] = dataInt2;
-        } else {
-            auto dataInt4 = __ldg(srcData + i);
-            sendBufVec[i] = *reinterpret_cast<int4*>(&dataInt4);
-        }
+    for (int j = 0; j < kElementsPerRead; ++j) {
+        values[j] = static_cast<float>(bf16[j]);
+        amax = fmaxf(amax, fabsf(values[j]));
     }
-    if constexpr (kRecipe == NCCL_EP_DISP_QUANT_FWD) {
-        auto* dstBytes = reinterpret_cast<uint8_t*>(sendBufScales);
-        for (int i = threadId; i < scaleBytes; i += numThreads) dstBytes[i] = inScales[i];
+    amax = warp_reduce_max<ds_fp8::kLanesPerScale>(amax);
+    float scale;
+    calculate_fp8_scales(amax, scale, scaleInv, roundScale);
+    int2 quantized;
+    auto* fp8 = reinterpret_cast<__nv_fp8x2_storage_t*>(&quantized);
+#pragma unroll
+    for (int j = 0; j < kElementsPerRead; j += 2) {
+        const float2 scaled = {values[j] * scale, values[j + 1] * scale};
+        fp8[j / 2] = __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
     }
+    return quantized;
 }
 
 } // namespace ll

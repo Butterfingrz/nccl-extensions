@@ -33,14 +33,20 @@ void parse_flag(ncclEpEnvVar& var) {
     }
 }
 
-// Parse an unsigned-long environment variable into var (is_set + value.ul).
-// Unset/empty leaves it not-set; otherwise the raw strtoul() value is stored
-// without interpretation — validity/range is the consumer's responsibility.
-void parse_ulong(ncclEpEnvVar& var) {
+// Parse an unsigned-long setting. Strict consumers receive zero for malformed
+// input and reject it during range validation; legacy consumers retain strtoul
+// semantics. Unset/empty leaves the setting unset in either mode.
+void parse_ulong(ncclEpEnvVar& var, bool strict = false) {
     const char* v = std::getenv(var.name);
-    if (v == nullptr || v[0] == '\0') return;  // unset/empty -> not set
+    if (v == nullptr || v[0] == '\0') return;
     var.is_set = true;
-    var.value.ul = std::strtoul(v, nullptr, 10);
+    const char* number = v;
+    while (std::isspace(static_cast<unsigned char>(*number))) ++number;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(number, &end, 10);
+    const bool valid = *number != '-' && end != number && *end == '\0' && errno != ERANGE;
+    var.value.ul = !strict || valid ? parsed : 0;
 }
 
 // Reject invalid timeout settings instead of turning negative or overflowing
@@ -99,6 +105,7 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_timeout_ms(cfg->timeout_ms);
     parse_choice(cfg->dispatch_copy_mode);
     parse_choice(cfg->dispatch_lsa);
+    parse_ulong(cfg->ll_tma_quant_warps, true);
 
     // Numeric (ulong) vars: is_set means present, value.ul holds the raw integer
     // (no range checks here — consumers in nccl_ep.cc validate per their needs).
@@ -189,6 +196,7 @@ void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {
         &cfg.combine_num_pipelines,
         &cfg.ll_cft_debug_min_driver,
         &cfg.dispatch_lsa,
+        &cfg.ll_tma_quant_warps,
     };
 
     std::fprintf(stderr, "[nccl_ep][env] NCCL EP environment configuration:\n");

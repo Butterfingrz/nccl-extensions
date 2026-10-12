@@ -171,6 +171,7 @@ ncclResult_t call_dispatch(
         stageQuant,
         cft_smem_bytes,
         params.lsaMode,
+        params.tmaQuantWarps,
         params.maxDynamicSmem,
         args,
         stream,
