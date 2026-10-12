@@ -14,7 +14,7 @@ function: [Quantization](quantization.md), [Zero-Copy](zero_copy.md),
 | [Library](#library) | `ncclEpGetVersion` |
 | [Group Management](#group-management) | `ncclEpCreateGroup`, `ncclEpGroupDestroy` |
 | [Tensor Descriptors](#tensor-descriptors) | `ncclEpTensorAlloc`, `ncclEpTensorDestroy` |
-| [Handle Management](#handle-management) | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpHandleDestroy` |
+| [Handle Management](#handle-management) | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpImportHandle`, `ncclEpHandleDestroy` |
 | [Communication Operations](#communication-operations) | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete` |
 | [Fault Tolerance](#fault-tolerance) | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear` |
 
@@ -241,6 +241,43 @@ ncclResult_t ncclEpHandleMemSize(
     size_t* size_out,
     int num_topk);
 ```
+
+### `ncclEpImportHandle()` (HT only)
+
+Binds a handle to a `handle_mem` buffer already prepared by `ncclEpUpdateHandle`
+on a *different* handle, without rerunning the collective. Intended for callers
+that snapshot a prepared `handle_mem` and later rebind it at a different address
+— `ncclEpHandleState_t` carries the host metadata needed to reinterpret that
+snapshot.
+
+```c
+// Import an HT handle from a caller-owned handle buffer already prepared by
+// ncclEpUpdateHandle with matching group, layout, config, and state metadata.
+// Local only: no device-state copy, CUDA launch, or metadata scan. Dispatch
+// and Combine can use the returned handle without another UpdateHandle.
+//
+// Arguments:
+//   handle     - [OUT] Newly imported handle
+//   ep_group   - [IN]  The EP group used to prepare handle_mem
+//   layout     - [IN]  The layout used to prepare handle_mem
+//   config     - [IN]  Handle configuration used to prepare handle_mem. NULL = defaults.
+//   state      - [IN]  Host metadata describing the prepared state
+//   handle_mem - [IN]  Caller-owned prepared 1D ncclUint8 device buffer
+//
+// Returns: ncclResult_t error code
+
+ncclResult_t ncclEpImportHandle(
+    ncclEpHandle_t* handle,
+    ncclEpGroup_t ep_group,
+    ncclEpLayout_t layout,
+    const ncclEpHandleConfig_t* config,
+    const ncclEpHandleState_t* state,
+    const ncclEpTensor_t* handle_mem);
+```
+
+`ncclEpHandleState_t` (`num_tokens`, `num_topk`, `topk_idx_datatype`) is
+caller-constructed from the values used to prepare the snapshot; initialize it
+with `NCCL_EP_HANDLE_STATE_INIT`.
 
 ## Tensor Descriptors
 

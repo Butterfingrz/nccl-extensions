@@ -3019,13 +3019,11 @@ struct ncclEpHandle {
     // User-owned (do not free). LL reads directly; HT uses cached ht.topk_idx.
     ncclEpTensor_t topk_idx;
     int num_tokens, num_topk;
-    // True once `num_tokens` has been authoritatively populated by
-    // `ncclEpUpdateHandle` (or `ncclEpCreateHandle` via its inner update call).
-    // Distinguishes a legitimate zero-token configuration from the
-    // "not yet bound" state -- the dispatch / combine lazy branches must not
-    // treat a real 0 as "uninitialised" and re-fetch sizes[0] from inputs,
-    // since the input tensors on zero-token ranks are empty (and now legally
-    // carry data == nullptr per tensorHasBinding's empty-tensor relaxation).
+    // True once `num_tokens` is populated by ncclEpUpdateHandle,
+    // ncclEpCreateHandle, or ncclEpImportHandle. Distinguishes a legitimate
+    // zero-token rank from "not yet bound" -- ncclEpDispatch/ncclEpCombine
+    // reject an unset handle instead of guessing num_tokens from an input
+    // tensor, since zero-token ranks may legally carry data == nullptr.
     bool num_tokens_set;
 
     bool cached_mode;
@@ -4220,6 +4218,84 @@ static ncclResult_t ht_update_handle_pull_count_mode(
     return ncclSuccess;
 }
 
+ncclResult_t ncclEpImportHandle(
+    ncclEpHandle_t* out_handle,
+    ncclEpGroup_t ep_group,
+    ncclEpLayout_t layout,
+    const ncclEpHandleConfig_t* config,
+    const ncclEpHandleState_t* state,
+    const ncclEpTensor_t* handle_mem) {
+    if (out_handle == nullptr || ep_group == nullptr || handle_mem == nullptr) {
+        return ncclInvalidArgument;
+    }
+    *out_handle = nullptr;
+    EP_VALIDATE_STRUCT(state, NCCL_EP_HANDLE_STATE);
+    const ncclEpHandleState_t parsed_state =
+        epDecodeStruct(state, NCCL_EP_HANDLE_STATE_INIT);
+
+    if (ep_group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        fprintf(stderr, "ncclEpImportHandle supports HT mode only\n");
+        return ncclInvalidUsage;
+    }
+    if (parsed_state.num_tokens < 0 ||
+        static_cast<unsigned int>(parsed_state.num_tokens) > ep_group->config.max_dispatch_tokens_per_rank) {
+        fprintf(stderr, "ncclEpImportHandle: state.num_tokens=%d is invalid (max %u)\n",
+                parsed_state.num_tokens, ep_group->config.max_dispatch_tokens_per_rank);
+        return ncclInvalidArgument;
+    }
+    if (parsed_state.num_topk <= 0) {
+        fprintf(stderr, "ncclEpImportHandle: state.num_topk=%d must be > 0\n", parsed_state.num_topk);
+        return ncclInvalidArgument;
+    }
+    if (parsed_state.topk_idx_datatype != ncclInt32 && parsed_state.topk_idx_datatype != ncclInt64) {
+        fprintf(stderr, "ncclEpImportHandle: state.topk_idx_datatype=%d must be ncclInt32 or ncclInt64\n",
+                static_cast<int>(parsed_state.topk_idx_datatype));
+        return ncclInvalidArgument;
+    }
+
+    // ht_init_handle only asserts handle_mem's size (compiled out in NDEBUG), so
+    // cross-check it here -- a mismatched group/layout/config would otherwise
+    // silently reinterpret the buffer at the wrong offsets.
+    const ncclEpTensor_t* checked_handle_mem = tensor_ptr(handle_mem);
+    if (checked_handle_mem->ndim != 1 || checked_handle_mem->datatype != ncclUint8) {
+        fprintf(stderr, "ncclEpImportHandle: handle_mem must be a 1D ncclUint8 tensor\n");
+        return ncclInvalidArgument;
+    }
+    size_t required_bytes = 0;
+    NCCLCHECK(ncclEpHandleMemSize(ep_group, layout, config, &required_bytes, parsed_state.num_topk));
+    if (checked_handle_mem->sizes[0] < required_bytes) {
+        fprintf(stderr,
+                "ncclEpImportHandle: handle_mem does not match (group, layout, config, num_topk) -- "
+                "expected >= %zu bytes\n",
+                required_bytes);
+        return ncclInvalidArgument;
+    }
+
+    // Init into a local pointer -- it may allocate a partial handle before
+    // failing, and out_handle must stay atomic (nullptr or fully valid).
+    ncclEpHandle_t handle = nullptr;
+    ncclResult_t res = ncclEpInitHandle(&handle, ep_group, layout, config, parsed_state.num_topk, handle_mem);
+    if (res != ncclSuccess) {
+        ncclEpHandleDestroy(handle);
+        return res;
+    }
+
+    const size_t topk_idx_sizes[2] = {
+        static_cast<size_t>(parsed_state.num_tokens),
+        static_cast<size_t>(parsed_state.num_topk)};
+    ncclEpTensor_t topk_idx = NCCL_EP_TENSOR_INIT;
+    topk_idx.ndim = 2;
+    topk_idx.datatype = parsed_state.topk_idx_datatype;
+    topk_idx.sizes = const_cast<size_t*>(topk_idx_sizes);
+    tensor_permanent_copy(&handle->topk_idx, &topk_idx);
+    handle->num_tokens = parsed_state.num_tokens;
+    handle->num_tokens_set = true;
+    handle->ht.dispatch_tokens_per_chunk =
+        ht_select_dispatch_chunk(ep_group, handle->layout, handle->num_tokens);
+    *out_handle = handle;
+    return ncclSuccess;
+}
+
 ncclResult_t ncclEpUpdateHandle(
     ncclEpHandle_t handle,
     const ncclEpTensor_t* topk_idx,
@@ -4747,15 +4823,12 @@ ncclResult_t ncclEpDispatch(
         return ncclInvalidUsage;
     }
 
-    // Lazy num_tokens for callers that skip UpdateHandle (e.g. backward reusing forward's handle_mem).
-    // Guard on `num_tokens_set` -- a real zero-token configuration is valid
-    // and must not trigger a re-fetch from inputs->tokens (whose data pointer
-    // may be NULL on the zero-token rank per the empty-tensor relaxation).
+    // num_tokens == 0 is a legitimate empty-rank value, so this can't be an
+    // assert (NDEBUG builds would silently treat "unbound" as "bound to zero").
     if (!handle->num_tokens_set) {
-        const ncclEpTensor_t* t = tensor_required(inputs->tokens);
-        assert(t->ndim > 0);
-        handle->num_tokens = static_cast<int>(t->sizes[0]);
-        handle->num_tokens_set = true;
+        fprintf(stderr,
+                "ncclEpDispatch: handle has no num_tokens; call ncclEpUpdateHandle first\n");
+        return ncclInvalidUsage;
     }
 
     if (group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
@@ -6234,16 +6307,12 @@ ncclResult_t ncclEpCombine(
         return ncclInvalidUsage;
     }
 
-    // Lazy num_tokens for callers that skip UpdateHandle (e.g. handle relocation between prepare and combine).
-    // Guard on `num_tokens_set` so a legitimate zero-token configuration is
-    // preserved (the outputs->tokens descriptor for a zero-token rank may
-    // carry data == nullptr, which is now legal per tensorHasBinding's
-    // empty-tensor relaxation but would still fail the assert on dim 0).
+    // num_tokens == 0 is a legitimate empty-rank value, so this can't be an
+    // assert (NDEBUG builds would silently treat "unbound" as "bound to zero").
     if (!handle->num_tokens_set) {
-        const ncclEpTensor_t* lazy_combined = tensor_required(outputs->tokens);
-        assert(lazy_combined->ndim > 0);
-        handle->num_tokens = static_cast<int>(lazy_combined->sizes[0]);
-        handle->num_tokens_set = true;
+        fprintf(stderr,
+                "ncclEpCombine: handle has no num_tokens; call ncclEpUpdateHandle first\n");
+        return ncclInvalidUsage;
     }
 
     // Consolidated token-dtype gate for the NONE recipe on all combine paths (LL/HT):
@@ -7169,6 +7238,10 @@ ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned 
 
 void ncclEpHandle_test_clearTopkIdx(ncclEpHandle_t handle) {
     handle->topk_idx.data = nullptr;
+}
+
+int ncclEpHandle_test_getDispatchTokensPerChunk(ncclEpHandle_t handle) {
+    return handle->ht.dispatch_tokens_per_chunk;
 }
 
 ncclResult_t ncclEpGroup_test_setMaxDynamicSmem(ncclEpGroup_t group, int max_dynamic_smem) {

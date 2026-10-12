@@ -127,6 +127,15 @@ void ncclEpHandleConfig_backwards_compat_test() {
     static_assert(sizeof(ncclEpHandleConfig_t) == 16);
 }
 
+void ncclEpHandleState_backwards_compat_test() {
+    static_assert(offsetof(ncclEpHandleState_t, size) == 0);
+    static_assert(offsetof(ncclEpHandleState_t, magic) == 4);
+    static_assert(offsetof(ncclEpHandleState_t, num_tokens) == 8);
+    static_assert(offsetof(ncclEpHandleState_t, num_topk) == 12);
+    static_assert(offsetof(ncclEpHandleState_t, topk_idx_datatype) == 16);
+    static_assert(sizeof(ncclEpHandleState_t) == 20);
+}
+
 void ncclEpDispatchConfig_backwards_compat_test() {
     static_assert(offsetof(ncclEpDispatchConfig_t, size) == 0);
     static_assert(offsetof(ncclEpDispatchConfig_t, magic) == 4);
@@ -177,6 +186,7 @@ TEST(PublicStructAbiTest, InitializersPopulatePrefix) {
     ncclEpCombineInputs_t combine_inputs = NCCL_EP_COMBINE_INPUTS_INIT;
     ncclEpCombineOutputs_t combine_outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
     ncclEpHandleConfig_t handle = NCCL_EP_HANDLE_CONFIG_INIT;
+    ncclEpHandleState_t handle_state = NCCL_EP_HANDLE_STATE_INIT;
     ncclEpDispatchConfig_t dispatch = NCCL_EP_DISPATCH_CONFIG_INIT;
     ncclEpCombineConfig_t combine = NCCL_EP_COMBINE_CONFIG_INIT;
     ncclEpCompleteConfig_t complete = NCCL_EP_COMPLETE_CONFIG_INIT;
@@ -197,6 +207,8 @@ TEST(PublicStructAbiTest, InitializersPopulatePrefix) {
     expectPublicStructPrefix(
         combine_outputs, NCCL_EP_COMBINE_OUTPUTS_SIZE, NCCL_EP_MAGIC);
     expectPublicStructPrefix(handle, NCCL_EP_HANDLE_CONFIG_SIZE, NCCL_EP_MAGIC);
+    expectPublicStructPrefix(
+        handle_state, NCCL_EP_HANDLE_STATE_SIZE, NCCL_EP_MAGIC);
     expectPublicStructPrefix(
         dispatch, NCCL_EP_DISPATCH_CONFIG_SIZE, NCCL_EP_MAGIC);
     expectPublicStructPrefix(

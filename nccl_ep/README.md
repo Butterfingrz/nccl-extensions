@@ -634,14 +634,14 @@ documentation for more details.
 ## API Reference
 
 The complete C API reference lives in **[docs/documentation/api_reference.md](docs/documentation/api_reference.md)**,
-covering all 18 public entry points:
+covering all 19 public entry points:
 
 | Group                    | Functions                                                                                                    |
 |--------------------------|--------------------------------------------------------------------------------------------------------------|
 | Library                  | `ncclEpGetVersion`                                                                                           |
 | Group Management         | `ncclEpCreateGroup`, `ncclEpGroupDestroy`                                                                    |
 | Tensor Descriptors       | `ncclEpTensorAlloc`, `ncclEpTensorDestroy`                                                                   |
-| Handle Management        | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpHandleDestroy` |
+| Handle Management        | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpImportHandle`, `ncclEpHandleDestroy` |
 | Communication Operations | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete`                                                          |
 | Fault Tolerance (LL)     | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear`          |
 

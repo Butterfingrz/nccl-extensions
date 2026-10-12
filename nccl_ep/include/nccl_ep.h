@@ -570,6 +570,28 @@ typedef struct {
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpHandleConfig_t, NCCL_EP_HANDLE_CONFIG);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpHandleConfig_t, NCCL_EP_HANDLE_CONFIG, 1);
 
+// Host metadata needed to import an already-prepared HT handle buffer.
+typedef struct {
+    unsigned int size; // = sizeof(this struct); first field, never moves
+    unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
+    int num_tokens;
+    int num_topk;
+    ncclDataType_t topk_idx_datatype; // ncclInt32 or ncclInt64
+} ncclEpHandleState_t;
+
+#define NCCL_EP_HANDLE_STATE_INIT \
+    NCCL_EP_STRUCT_INIT(ncclEpHandleState_t, NCCL_EP_MAGIC)
+
+#define NCCL_EP_HANDLE_STATE_SIZE ((unsigned int)sizeof(ncclEpHandleState_t))
+
+#define NCCL_EP_HANDLE_STATE_V1_LAST_FIELD topk_idx_datatype
+#define NCCL_EP_HANDLE_STATE_V1_SIZE 20u
+
+#define NCCL_EP_HANDLE_STATE_CURRENT_VERSION 1
+
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpHandleState_t, NCCL_EP_HANDLE_STATE);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpHandleState_t, NCCL_EP_HANDLE_STATE, 1);
+
 // Query the device bytes required for a handle's routing buffers.
 //
 // Arguments:
@@ -629,6 +651,37 @@ ncclResult_t ncclEpInitHandle(
     int num_topk,
     const ncclEpTensor_t* handle_mem // NULL = library allocates internally
 );
+
+// Import an HT handle from a caller-owned handle buffer already prepared by
+// ncclEpUpdateHandle with matching group, layout, config, and state metadata.
+// Local only: no device-state copy, CUDA launch, or metadata scan. Dispatch
+// and Combine can use the returned handle without another UpdateHandle.
+//
+// For forward dispatch: handle_mem may be snapshotted any time after
+// ncclEpUpdateHandle completes on the source stream.
+//
+// For expert-major backward dispatch: handle_mem must be snapshotted after the
+// matching forward ncclEpDispatch has completed, with the copy ordered after
+// that work. ncclEpUpdateHandle alone does not write the per-token maps that
+// backward dispatch reads.
+//
+// Arguments:
+//   handle     - [OUT] Newly imported handle
+//   ep_group   - [IN]  The EP group used to prepare handle_mem
+//   layout     - [IN]  The layout used to prepare handle_mem
+//   config     - [IN]  Handle configuration used to prepare handle_mem. NULL = defaults.
+//   state      - [IN]  Host metadata describing the prepared state
+//   handle_mem - [IN]  Caller-owned prepared 1D ncclUint8 device buffer
+//
+// Returns: ncclResult_t error code
+
+ncclResult_t ncclEpImportHandle(
+    ncclEpHandle_t* handle,
+    ncclEpGroup_t ep_group,
+    ncclEpLayout_t layout,
+    const ncclEpHandleConfig_t* config,
+    const ncclEpHandleState_t* state,
+    const ncclEpTensor_t* handle_mem);
 
 // Per-step collective: prepare the handle for the given top-k routing decisions.
 // Must be called after ncclEpInitHandle and before ncclEpDispatch.

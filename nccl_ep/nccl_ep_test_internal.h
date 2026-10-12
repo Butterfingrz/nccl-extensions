@@ -39,6 +39,9 @@ ncclResult_t ncclEpHandle_test_getNumRecvTokens(ncclEpHandle_t handle, unsigned 
 // scatter (backward, no-routing) mode.  HT only.
 void ncclEpHandle_test_clearTopkIdx(ncclEpHandle_t handle);
 
+// Returns the HT dispatch_tokens_per_chunk selected for this handle.
+int ncclEpHandle_test_getDispatchTokensPerChunk(ncclEpHandle_t handle);
+
 // Override the cached dynamic shared-memory limit for an internally-created
 // test group. This is test-only and lets unit tests exercise launch fitting on
 // devices whose physical limit is larger than the target budget.

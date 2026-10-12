@@ -9,6 +9,13 @@
  *   CallerOwnedHandleMem — caller allocates handle_mem (>= ncclEpHandleMemSize) and
  *                          passes a 1D ncclUint8 tensor to ncclEpInitHandle.
  *                          ncclEpHandleDestroy must not free the caller buffer.
+ *   ImportsRelocatedPreparedHandleMem -- ncclEpImportHandle from a handle_mem
+ *                          snapshot at a different address than the original,
+ *                          which keeps mutating; dispatch+combine on the
+ *                          imported handle must still work from the snapshot.
+ *   ImportedHandleSelectsDispatchChunkFromNumTokens -- ncclEpImportHandle recomputes
+ *                          dispatch_tokens_per_chunk from state.num_tokens (not the
+ *                          group default), covering the 32/64 chunk selection boundary.
  *   MultiIterReuse        — single ncclEpCreateHandle followed by 4 back-to-back
  *                          dispatch+combine pairs (buffer ping-pong / signal counter
  *                          correctness across iterations).
@@ -548,6 +555,158 @@ TEST_F(LifecycleTest, CallerOwnedHandleMem) {
     // The caller still owns d_handle_mem; free it ourselves.
     ncclEpTensorDestroy(t_handle_mem);
     CUDA_ASSERT(cudaFree(d_handle_mem));
+}
+
+// -- Test: ImportsRelocatedPreparedHandleMem -- ncclEpImportHandle from a snapshot --
+// Snapshots a prepared handle_mem into a second buffer, then keeps mutating the
+// original so the two buffers diverge. Dispatch+combine on the imported handle
+// must still complete correctly from the snapshot alone (also covers ncclInt32
+// topk_idx_datatype recovery).
+
+TEST_F(LifecycleTest, ImportsRelocatedPreparedHandleMem) {
+    SKIP_IF_PULL_PUSH();
+
+    auto make_handle_mem = [&](size_t bytes, void** d_mem, ncclEpTensor_t** t) {
+        CUDA_ASSERT(cudaMalloc(d_mem, bytes));
+        NCCL_ASSERT(epTensorCreate(t, 1, ncclUint8, *d_mem, static_cast<unsigned int>(bytes)));
+    };
+
+    size_t handle_mem_bytes = 0;
+    NCCL_ASSERT(ncclEpHandleMemSize(g_ep_group, NCCL_EP_LAYOUT_FLAT, nullptr, &handle_mem_bytes, kTopK));
+
+    void* d_forward_mem = nullptr;
+    void* d_restored_mem = nullptr;
+    ncclEpTensor_t* t_forward_mem = nullptr;
+    ncclEpTensor_t* t_restored_mem = nullptr;
+    make_handle_mem(handle_mem_bytes, &d_forward_mem, &t_forward_mem);
+    make_handle_mem(handle_mem_bytes, &d_restored_mem, &t_restored_mem);
+
+    std::vector<int32_t> h_topk(kNumTokens * kTopK);
+    for (int i = 0; i < kNumTokens; ++i) h_topk[i] = expert_for_token(i);
+    int32_t* d_topk = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_topk, h_topk.size() * sizeof(int32_t)));
+    CUDA_ASSERT(cudaMemcpy(d_topk, h_topk.data(), h_topk.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    ncclEpTensor_t* t_topk = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_topk, 2, ncclInt32, d_topk, kNumTokens, kTopK));
+
+    ncclEpHandle_t forward_handle = nullptr;
+    NCCL_ASSERT(ncclEpInitHandle(
+        &forward_handle, g_ep_group, NCCL_EP_LAYOUT_FLAT, nullptr, kTopK, t_forward_mem));
+    NCCL_ASSERT(ncclEpUpdateHandle(forward_handle, t_topk, nullptr, g_stream));
+    CUDA_ASSERT(cudaMemcpyAsync(
+        d_restored_mem, d_forward_mem, handle_mem_bytes, cudaMemcpyDeviceToDevice, g_stream));
+
+    // Mutate the live handle after the snapshot: the import must not see this.
+    for (int i = 0; i < kNumTokens; ++i) h_topk[i] = (expert_for_token(i) + 1) % kNumExperts;
+    CUDA_ASSERT(cudaMemcpyAsync(
+        d_topk, h_topk.data(), h_topk.size() * sizeof(int32_t), cudaMemcpyHostToDevice, g_stream));
+    NCCL_ASSERT(ncclEpUpdateHandle(forward_handle, t_topk, nullptr, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    ncclEpHandleState_t state = NCCL_EP_HANDLE_STATE_INIT;
+    state.num_tokens = kNumTokens;
+    state.num_topk = kTopK;
+    state.topk_idx_datatype = ncclInt32;
+    ncclEpHandle_t restored_handle = nullptr;
+    NCCL_ASSERT(ncclEpImportHandle(
+        &restored_handle, g_ep_group, NCCL_EP_LAYOUT_FLAT, nullptr, &state, t_restored_mem));
+
+    NCCL_ASSERT(ncclEpHandleDestroy(forward_handle));
+    ncclEpTensorDestroy(t_forward_mem);
+    ncclEpTensorDestroy(t_topk);
+    CUDA_ASSERT(cudaFree(d_forward_mem));
+    CUDA_ASSERT(cudaFree(d_topk));
+
+    auto combined = run_dispatch_combine_flat(restored_handle);
+    for (int i = 0; i < kNumTokens; ++i) {
+        float expected = static_cast<float>(g_rank * kNumTokens + i + 1);
+        EXPECT_NEAR(combined[i], expected, 0.5f) << "rank " << g_rank << " token " << i;
+    }
+
+    NCCL_ASSERT(ncclEpHandleDestroy(restored_handle));
+    ncclEpTensorDestroy(t_restored_mem);
+    CUDA_ASSERT(cudaFree(d_restored_mem));
+}
+
+// -- Test: ImportedHandleSelectsDispatchChunkFromNumTokens -------------------
+// ncclEpImportHandle must recompute dispatch_tokens_per_chunk from
+// state.num_tokens exactly as ncclEpUpdateHandle does, not inherit the group
+// default installed by ncclEpInitHandle. A mismatch silently corrupts
+// own_chunk_rank in count-mode dispatch (EM+kLocalPermute).
+//
+// Uses 33+ tokens so nccl_ep_select_dispatch_chunk returns 32 on systems with
+// dispatch_num_sms in [16,64]; on narrower SM counts the function returns the
+// group default regardless, and the test still verifies UpdateHandle and Import
+// agree.
+TEST_F(LifecycleTest, ImportedHandleSelectsDispatchChunkFromNumTokens) {
+    SKIP_IF_PULL_PUSH();
+
+    constexpr int kLargeTokens = 48;
+    constexpr int kLargeRecvSlots = 4 * kLargeTokens;
+
+    ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
+    gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
+    gcfg.num_experts = kNumExperts;
+    gcfg.max_dispatch_tokens_per_rank = kLargeTokens;
+    gcfg.max_token_bytes = kHidden * sizeof(nv_bfloat16);
+    gcfg.rdma_buffer_size = NCCL_EP_AUTO;
+    gcfg.num_qp_per_rank = NCCL_EP_AUTO;
+    gcfg.num_channels = NCCL_EP_AUTO;
+    gcfg.max_recv_tokens_per_rank = kLargeRecvSlots;
+
+    ncclEpGroup_t local_group = nullptr;
+    NCCL_ASSERT(ncclEpCreateGroup(&local_group, g_comm, &gcfg));
+
+    size_t handle_mem_bytes = 0;
+    NCCL_ASSERT(ncclEpHandleMemSize(local_group, NCCL_EP_LAYOUT_FLAT, nullptr, &handle_mem_bytes, kTopK));
+
+    void* d_src_mem = nullptr;
+    void* d_snap_mem = nullptr;
+    ncclEpTensor_t* t_src_mem = nullptr;
+    ncclEpTensor_t* t_snap_mem = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_src_mem, handle_mem_bytes));
+    CUDA_ASSERT(cudaMalloc(&d_snap_mem, handle_mem_bytes));
+    NCCL_ASSERT(epTensorCreate(&t_src_mem, 1, ncclUint8, d_src_mem, (unsigned int)handle_mem_bytes));
+    NCCL_ASSERT(epTensorCreate(&t_snap_mem, 1, ncclUint8, d_snap_mem, (unsigned int)handle_mem_bytes));
+
+    std::vector<int32_t> h_topk(kLargeTokens * kTopK);
+    for (int i = 0; i < kLargeTokens; ++i) h_topk[i] = (g_rank * kLargeTokens + i) % kNumExperts;
+    int32_t* d_topk = nullptr;
+    CUDA_ASSERT(cudaMalloc(&d_topk, h_topk.size() * sizeof(int32_t)));
+    CUDA_ASSERT(cudaMemcpy(d_topk, h_topk.data(), h_topk.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    ncclEpTensor_t* t_topk = nullptr;
+    NCCL_ASSERT(epTensorCreate(&t_topk, 2, ncclInt32, d_topk, kLargeTokens, kTopK));
+
+    ncclEpHandle_t src_handle = nullptr;
+    NCCL_ASSERT(ncclEpInitHandle(&src_handle, local_group, NCCL_EP_LAYOUT_FLAT, nullptr, kTopK, t_src_mem));
+    NCCL_ASSERT(ncclEpUpdateHandle(src_handle, t_topk, nullptr, g_stream));
+
+    CUDA_ASSERT(cudaMemcpyAsync(
+        d_snap_mem, d_src_mem, handle_mem_bytes, cudaMemcpyDeviceToDevice, g_stream));
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+
+    const int expected_chunk = ncclEpHandle_test_getDispatchTokensPerChunk(src_handle);
+
+    ncclEpHandleState_t state = NCCL_EP_HANDLE_STATE_INIT;
+    state.num_tokens = kLargeTokens;
+    state.num_topk = kTopK;
+    state.topk_idx_datatype = ncclInt32;
+    ncclEpHandle_t imported_handle = nullptr;
+    NCCL_ASSERT(ncclEpImportHandle(
+        &imported_handle, local_group, NCCL_EP_LAYOUT_FLAT, nullptr, &state, t_snap_mem));
+
+    EXPECT_EQ(ncclEpHandle_test_getDispatchTokensPerChunk(imported_handle), expected_chunk)
+        << "Import must recompute dispatch_tokens_per_chunk from num_tokens, not the group default";
+
+    NCCL_ASSERT(ncclEpHandleDestroy(imported_handle));
+    NCCL_ASSERT(ncclEpHandleDestroy(src_handle));
+    ncclEpTensorDestroy(t_snap_mem);
+    ncclEpTensorDestroy(t_src_mem);
+    ncclEpTensorDestroy(t_topk);
+    CUDA_ASSERT(cudaFree(d_snap_mem));
+    CUDA_ASSERT(cudaFree(d_src_mem));
+    CUDA_ASSERT(cudaFree(d_topk));
+    NCCL_ASSERT(ncclEpGroupDestroy(local_group));
 }
 
 // ── Test: MultiIterHandleReuse — 4 dispatch+combine pairs on one handle ───────
