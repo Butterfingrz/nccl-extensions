@@ -356,14 +356,16 @@ __forceinline__ __device__ bool syncAndSendCounts(
     return shIsLastCta;
 }
 
-// REceive-side completion protocol:
-// each CTA's thread independently confirms every active peer's
-// token count has landed (relaxed poll on the count-doubles-as-flag
-// buffer, with a timeout that masks off an unresponsive peer),
-// acquire-fences those now-confirmed reads (and,
-// transitively, the peer's payload writes ordered before it by the peer's
-// own release fence), then propagates that visibility to the rest of the
-// CTA via __syncthreads(). Must be called by every thread of the CTA.
+// Receive-side completion protocol: in every CTA, warp 0 confirms every
+// active peer's token count has landed, one peer per lane (strided when
+// numRanks > 32) -- relaxed poll on the count-doubles-as-flag buffer, with a
+// per-peer timeout that masks off an unresponsive peer. Peers' arrival times
+// are independent, so polling them on separate lanes overlaps their latencies
+// instead of stacking one round trip per peer on a single thread. Each lane
+// acquire-fences its now-confirmed reads (and, transitively, the peer's
+// payload writes ordered before them by the peer's own release fence), then
+// __syncthreads() propagates that visibility to the rest of the CTA. Must be
+// called by every thread of the CTA.
 __forceinline__ __device__ void syncAndRecvCounts(
     int threadId,
     int numRanks,
@@ -372,12 +374,12 @@ __forceinline__ __device__ void syncAndRecvCounts(
     uint64_t timeoutCycles,
     int currRank,
     int* asyncErrorFlag) {
-    // Step 5: every CTA's thread 0 independently confirms every active
-    // peer's token count has landed. Relaxed poll -- ordering is established
-    // by the acquire fence in step 6 below, not by this load itself.
-    if (threadId == 0) {
+    // Step 5: every CTA's warp 0 independently confirms every active peer's
+    // token count has landed. Relaxed poll -- ordering is established by the
+    // acquire fence in step 6 below, not by this load itself.
+    if (threadId < 32) {
         const auto startTime = clock64();
-        for (int peer = 0; peer < numRanks; peer++) {
+        for (int peer = threadId; peer < numRanks; peer += 32) {
             if (isRankMasked(rankMask, peer)) continue;
             uint64_t waitCost = 0;
             bool flagReady;
@@ -392,12 +394,12 @@ __forceinline__ __device__ void syncAndRecvCounts(
                 if (asyncErrorFlag != nullptr) atomicExch_system(asyncErrorFlag, 1);
             }
         }
-        // Step 6: acquire-fence this thread's now-confirmed reads (and,
+        // Step 6: acquire-fence this lane's now-confirmed reads (and,
         // transitively, the peer's payload writes ordered before it by the
         // peer's own release fence) before any thread in this CTA touches
         // recvBuf. Each relaxed flag read above followed by this fence is an
         // acquire pattern pairing with the peer's fence.release.sys + relaxed
-        // store. No release half is needed: nothing this thread wrote earlier
+        // store. No release half is needed: nothing this lane wrote earlier
         // has to be ordered before a later signal.
         memory_fence_acquire_sys();
     }
