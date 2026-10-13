@@ -330,6 +330,15 @@ __device__ __forceinline__ void memory_fence_release_sys() {
     asm volatile("fence.release.sys;" ::: "memory");
 }
 
+// Acquire-only system-scope fence: a strong read (e.g. ld_relaxed_sys_global)
+// followed by this fence forms an acquire pattern on the read location, so the
+// thread's later accesses observe every write ordered before the matching
+// release pattern of the writer. It does not order the thread's earlier writes
+// (no release half), so it does not wait for outstanding stores to drain.
+__device__ __forceinline__ void memory_fence_acquire_sys() {
+    asm volatile("fence.acquire.sys;" ::: "memory");
+}
+
 __device__ __forceinline__ void memory_fence_gpu() {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }

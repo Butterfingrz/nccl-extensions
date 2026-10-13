@@ -172,8 +172,12 @@ __forceinline__ __device__ void waitForAllRanksFinishLsa(
     if (didWork) {
         // Acquire-fence this thread's now-confirmed reads (and, transitively,
         // the peer's payload writes ordered before it by the peer's own
-        // release fence) before any thread in this CTA touches recvBuf.
-        memory_fence();
+        // release fence) before any thread in this CTA touches recvBuf. The
+        // relaxed flag read followed by this fence is an acquire pattern
+        // pairing with the peer's fence.release.sys + relaxed store; no
+        // release half is needed because no later signal depends on this
+        // thread's earlier writes.
+        memory_fence_acquire_sys();
     }
     __syncthreads();
 }

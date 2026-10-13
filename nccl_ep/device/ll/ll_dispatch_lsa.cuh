@@ -390,8 +390,11 @@ __forceinline__ __device__ void syncAndRecvCounts(
         // Step 6: acquire-fence this thread's now-confirmed reads (and,
         // transitively, the peer's payload writes ordered before it by the
         // peer's own release fence) before any thread in this CTA touches
-        // recvBuf.
-        memory_fence();
+        // recvBuf. Each relaxed flag read above followed by this fence is an
+        // acquire pattern pairing with the peer's fence.release.sys + relaxed
+        // store. No release half is needed: nothing this thread wrote earlier
+        // has to be ordered before a later signal.
+        memory_fence_acquire_sys();
     }
     // Step 7: propagate that visibility to the rest of the CTA.
     __syncthreads();
