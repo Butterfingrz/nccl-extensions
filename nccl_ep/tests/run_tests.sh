@@ -22,6 +22,7 @@ GTEST_ARGS=()
 [[ -n "${GTEST_FILTER:-}" ]] && GTEST_ARGS=(--gtest_filter="${GTEST_FILTER}")
 TEST_SUITE="${TEST_SUITE:-}"
 OVERALL_FAIL=0
+HT_EM_RERUN=0
 
 # Driver compatibility checks use mocked CUDA queries and need no GPU ranks.
 if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_cft_driver_api" ]]; then
@@ -46,6 +47,16 @@ run_suite() {
     local SUITE_NAME="$2"
     local MIN_GPUS="${3:-4}"
     local FILTER="${4:-}"
+    # DSFP8 tests create LL groups, so HT-EM mode changes add no coverage.
+    # Keep them in the baseline pass, including when a user supplies a filter.
+    if [[ "${BINARY}" == test_quantization_recipe && "${HT_EM_RERUN}" == 1 ]]; then
+        FILTER="${FILTER:-${GTEST_FILTER:-*}}"
+        if [[ "${FILTER}" == *-* ]]; then
+            FILTER+=":QuantizationRecipeTest.DsFp8*"
+        else
+            FILTER+="-QuantizationRecipeTest.DsFp8*"
+        fi
+    fi
     local RUN_GTEST_ARGS=()
     if [[ -n "${FILTER}" ]]; then
         RUN_GTEST_ARGS=(--gtest_filter="${FILTER}")
@@ -175,6 +186,7 @@ run_fixed_rank_suite() {
 run_fixed_rank_suite test_ll_epoch_protocol "EP LL Epoch Protocol Tests" 1
 run_fixed_rank_suite test_ll_group_epoch    "EP LL Group Epoch Tests"    4
 
+HT_EM_RERUN=1
 for mode in LOCAL_DUP NVLINK_DUP; do
     label="$( [[ ${mode} == LOCAL_DUP ]] && echo 'Local Fanout' || echo 'NVLink Dup' )"
     export "NCCL_EP_HT_EM_${mode}=1"
