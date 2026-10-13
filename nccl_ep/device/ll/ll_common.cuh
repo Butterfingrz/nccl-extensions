@@ -72,8 +72,8 @@ __device__ __forceinline__ void completeFullLowLatencyEpoch(
     completeFullLowLatencyEpochImpl(epochState, phases, isElectedCta && threadId == 0);
 }
 
-// Opt in to compiler memory ordering without changing existing callers.
-template <bool kMemoryClobber = false>
+// Enable compiler memory ordering by default; callers can explicitly opt out.
+template <bool kMemoryClobber = true>
 __device__ __forceinline__ void syncSmGroup(int groupIdx, int nThreads) {
     if constexpr (kMemoryClobber) {
         asm volatile("bar.sync %0, %1;" ::"r"(groupIdx), "r"(nThreads) : "memory");
