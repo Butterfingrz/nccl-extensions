@@ -343,6 +343,14 @@ __device__ __forceinline__ void memory_fence_gpu() {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }
 
+// Acquire-only GPU-scope fence: a strong read (e.g. the read half of an
+// atomic RMW) followed by this fence forms an acquire pattern on the read
+// location. It does not order the thread's earlier writes (no release half),
+// so it does not wait for outstanding stores to drain.
+__device__ __forceinline__ void memory_fence_acquire_gpu() {
+    asm volatile("fence.acquire.gpu;" ::: "memory");
+}
+
 __device__ __forceinline__ void memory_fence_cta() {
     asm volatile("fence.acq_rel.cta;" ::: "memory");
 }

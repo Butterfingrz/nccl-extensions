@@ -309,9 +309,14 @@ __forceinline__ __device__ bool syncAndSendCounts(
 
         if (isLastCta) {
 
-            // Step 3.1 Pairing Acquire to other CTAs' 
-            // atomic_add_release_global(ctaDone, 1) above.
-            memory_fence_gpu();
+            // Step 3.1 Pairing Acquire to other CTAs'
+            // atomic_add_release_global(ctaDone, 1) above: the read half of
+            // this CTA's own atomic on ctaDone followed by this fence is an
+            // acquire pattern. Acquire-only: the release half is provided by
+            // the fence.release.sys in step 3.3, which orders this thread's
+            // earlier accesses (and, cumulatively, every write it observed)
+            // before the publish stores.
+            memory_fence_acquire_gpu();
 
             // Step 3.2 Transitively observe the updates made visible to lane0 by the
             // above acquire GPU-wide fence

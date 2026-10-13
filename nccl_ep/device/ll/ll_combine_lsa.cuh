@@ -405,7 +405,11 @@ __forceinline__ __device__ bool syncAndSendFinishLsa(
             // Step 3: pairing acquire fence for the atomic release on ctaDone
             // above -- required to observe every other CTA's preceding writes
             // (their token sends) before publishing readiness for them.
-            memory_fence_gpu();
+            // Acquire-only: the release half is provided by the
+            // fence.release.sys in step 4, which orders this thread's earlier
+            // accesses (and, cumulatively, every write it observed) before
+            // the flag stores.
+            memory_fence_acquire_gpu();
             __syncwarp();
 
             // Step 4: publish this rank's writes for this round (now provably
