@@ -1458,7 +1458,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         // Initialize the expected counters to the first-invocation value
         // (grid-barrier counters stay at 0). Bootstrap is outside any user
         // CUDA-graph capture, so a one-shot H2D memcpy + stream sync is safe.
-        const bool is_single_node = (ep_group->nNodes == 1);
+        const bool is_single_node = !is_internode_available(ep_group);  // no cross-LSA-team RDMA
         const uint64_t init_rdma = is_single_node ? 0ull : 1ull;
         const uint32_t init_intra = static_cast<uint32_t>(ep_group->lsa_team_size);
         uint8_t host_init[kCounterBlockBytes] = {0};
@@ -3866,7 +3866,7 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     // global_routing_map: read directly from ep_group->ht_buffers (not duplicated on the handle).
     handle->ht.rdma_to_attn_map = reinterpret_cast<bool*>(ptr + offset);
     offset += L.sz_r2a;
-    handle->ht.attn_to_rdma_map = (ep_group->nNodes > 1) ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
+    handle->ht.attn_to_rdma_map = is_internode_available(ep_group) ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
     offset += L.sz_a2r;
     handle->ht.local_expert_routing_map = reinterpret_cast<bool*>(ptr + offset);
     offset += L.sz_ler;
