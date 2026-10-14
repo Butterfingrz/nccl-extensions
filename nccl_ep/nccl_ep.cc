@@ -3251,7 +3251,8 @@ struct ncclEpHandle {
             // pull dispatch kernel to read each source row over NVLink.
             int32_t* recv_slot_to_src;
             // [max_recv_tokens, num_topk] source top-k position of each flat2em hit
-            // (parallel to flat2em_slot_map). Null unless em_pull. Lets pull read the
+            // (parallel to flat2em_slot_map). FLAT packs local expert + source position
+            // with flat_route_pack instead. Null unless pull is enabled. Lets pull read the
             // source's topk_weights at the correct position (order-preserving weights).
             int32_t* srcpos_map;
 
@@ -3466,10 +3467,11 @@ struct HtBlockLayout {
         const size_t ler_rows = em_staging_indexed_by_em_slot(ep_group)
                                     ? static_cast<size_t>(ep_group->max_recv_tokens)
                                     : ht_max_flat_recv_tokens(ep_group);
-        L.sz_ler = count_mode_capable ?
-                       align256(ht_max_flat_recv_tokens(ep_group) *
-                                nccl_ep::bit_words(experts_per_rank) * sizeof(uint64_t)) :
-                       align256(ler_rows * experts_per_rank * sizeof(bool));
+        // Only EM count mode saves packed expert-membership rows.
+        const size_t ler_row_bytes = count_mode_capable && has_expert_major
+            ? nccl_ep::bit_words(experts_per_rank) * sizeof(uint64_t)
+            : experts_per_rank * sizeof(bool);
+        L.sz_ler = needs_pull_buffers && !has_expert_major ? 0 : align256(ler_rows * ler_row_bytes);
         L.sz_ntfe = align256(sizeof(int32_t));
         // Match the existing receiver conversion's row capacity. Native EM has
         // one weight per slot; FLAT and EM-permute's internal FLAT scratch need
@@ -3485,19 +3487,21 @@ struct HtBlockLayout {
         // for FLAT and for EM-permute (unified FLAT-shape s2d — em_scan_kernel's
         // EM-shape writes are suppressed in em-permute mode).
         const int s2d_inner_dim = (has_expert_major && !em_permute) ? num_topk : lsa_team_size;
-        // pull-push never touches s2d (dispatch passes nullptr, push combine ignores it).
-        L.sz_s2d = needs_pull_buffers
+        // EM pull-push does not need S2D. Flat keeps the retained destination
+        // slots so DROP combine can exclude contributions that were never delivered.
+        L.sz_s2d = (needs_pull_buffers &&
+                    (has_expert_major || ep_group->config.overflow_policy != NCCL_EP_OVERFLOW_DROP))
                        ? 0
                        : align256(static_cast<size_t>(rdma_team_size) * max_tokens * s2d_inner_dim * sizeof(int32_t));
         // rank_mask and scan_tmp back the preprocessing scan only; count mode rebuilds the recv
         // tables from a device-side histogram and never runs it, so skip both for count handles.
-        L.sz_rank_mask = count_mode_capable ? 0 : align256(
+        L.sz_rank_mask = count_mode_capable && has_expert_major ? 0 : align256(
             static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size *
             nccl_ep::ht::get_rank_mask_elem_size(lsa_team_size));
         // Size for device_sm_count blocks: the upper bound on the preprocessing
         // scan's block count (ep_group->preprocess_num_sms, incl. any
         // NCCL_EP_PREPROCESS_NUM_SMS override) so the buffer always fits.
-        L.sz_scan_tmp = count_mode_capable ? 0 : align256(
+        L.sz_scan_tmp = count_mode_capable && has_expert_major ? 0 : align256(
             nccl_ep::ht::get_preprocessing_scan_tmp_size(
                 static_cast<int>(ep_group->device_sm_count),
                 lsa_team_size));
@@ -3919,7 +3923,7 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     offset += L.sz_r2a;
     handle->ht.attn_to_rdma_map = is_internode_available(ep_group) ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
     offset += L.sz_a2r;
-    handle->ht.local_expert_routing_map = reinterpret_cast<bool*>(ptr + offset);
+    handle->ht.local_expert_routing_map = L.sz_ler > 0 ? reinterpret_cast<bool*>(ptr + offset) : nullptr;
     offset += L.sz_ler;
     handle->ht.num_tokens_for_experts = reinterpret_cast<int32_t*>(ptr + offset);
     offset += L.sz_ntfe;

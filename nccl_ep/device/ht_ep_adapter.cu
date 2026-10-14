@@ -1107,7 +1107,7 @@ ncclResult_t call_metadata_preprocessing(
         /*has_expert_counts=*/per_expert_token_counts != nullptr, /*has_em_permute=*/false));
 
     ::ht_ep::scan_flat_kernel_param_t sp{};
-    sp.input_routing_map = global_routing_map;
+    sp.input_routing_map = use_topk_idx ? reinterpret_cast<const uint8_t*>(global_topk_idx) : global_routing_map;
     sp.tmp = reinterpret_cast<::ht_ep::tmp_state_t*>(ranks_scan_tmp);
     sp.sparse_to_dense_map = sparse_to_dense_map;
     sp.rdma_to_attn_map = rdma_to_attn_map;
@@ -1125,6 +1125,9 @@ ncclResult_t call_metadata_preprocessing(
     sp.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
     sp.allow_overflow_drop = allow_overflow_drop;
     sp.token_to_recv_slot = nullptr;
+    sp.em_top_k = em_top_k; // top-k row stride for uint16 routing, including flat pull
+    sp.recv_slot_to_src = recv_slot_to_src;
+    sp.srcpos_map = srcpos_map;
 
     jit::launch_scan_flat(
         NUM_THREADS_PER_BLOCK,
@@ -1135,7 +1138,7 @@ ncclResult_t call_metadata_preprocessing(
         per_expert_token_counts != nullptr,
         /*enable_em_permute=*/false,
         out_is_int64,
-        /*use_topk_idx=*/false,
+        use_topk_idx,
         sp,
         dynamic_smem_bytes,
         stream);

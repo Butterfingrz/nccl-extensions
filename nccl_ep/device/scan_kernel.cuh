@@ -394,7 +394,9 @@ __device__ __forceinline__ void write_local_routing(
             local_rank_bitmap_row =
                 input_routing_map + current_token_id * g.packed_row_bytes + lsa_team * g.experts_per_lsa_team_packed;
         }
-        local_expert_routing_map_store_base_addr = local_expert_routing_map + local_rank_slot * experts_per_rank;
+        if (local_expert_routing_map != nullptr) {
+            local_expert_routing_map_store_base_addr = local_expert_routing_map + local_rank_slot * experts_per_rank;
+        }
     }
 
     // topk_idx: fold the row into a per-local-expert hit mask in a single O(num_topk) pass so
@@ -426,6 +428,12 @@ __device__ __forceinline__ void write_local_routing(
                 local_expert_routing_map_store_base_addr[k] = routed_to_expert;
         }
 
+        if constexpr (USE_TOPK_IDX && !ENABLE_EM_PERMUTE) {
+            if (routed_to_expert && srcpos_map != nullptr && em_k < num_topk) {
+                const int pos = topk_idx_find_pos(local_rank_topk_idx_row, num_topk, local_expert_global_base + k);
+                srcpos_map[static_cast<size_t>(local_rank_slot) * num_topk + em_k++] = flat_route_pack(k, pos);
+            }
+        }
         if constexpr (ENABLE_EM_PERMUTE) {
             // Each thread is processing a unique token (assigned to it by the scan geometry)
             // 1. If thread's current token is routed to the local expert k, 
@@ -493,6 +501,13 @@ __device__ __forceinline__ void write_local_routing(
         }
     }
 
+    if constexpr (USE_TOPK_IDX && !ENABLE_EM_PERMUTE) {
+        if (lane_participates && srcpos_map != nullptr) {
+            for (int k = em_k; k < num_topk; ++k) {
+                srcpos_map[static_cast<size_t>(local_rank_slot) * num_topk + k] = -1;
+            }
+        }
+    }
     // Pad trailing flat2em slots with -1 so the copy kernel skips them.
     if constexpr (ENABLE_EM_PERMUTE) {
         if (lane_participates) {

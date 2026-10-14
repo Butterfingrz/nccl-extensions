@@ -8389,6 +8389,19 @@ __device__ __forceinline__ void combine_reduce(
     }
 }
 
+// Flat receive rows contain local experts in ascending order. One 32-bit entry
+// records both the expert and its original top-k position; -1 marks the tail.
+// Kept with the handle so backward combine never consults another handle's routing.
+__host__ __device__ constexpr int32_t flat_route_pack(int expert, int source_pos) {
+    return expert * MAX_NUM_TOPK + source_pos;
+}
+__host__ __device__ constexpr int flat_route_expert(int32_t route) {
+    return route / MAX_NUM_TOPK;
+}
+__host__ __device__ constexpr int flat_route_source_pos(int32_t route) {
+    return route % MAX_NUM_TOPK;
+}
+
 } // namespace ht_ep
 
 #include "scan_kernel.cuh"
