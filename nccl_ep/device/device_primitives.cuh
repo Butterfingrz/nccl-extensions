@@ -12,6 +12,7 @@
 #pragma once
 
 #include "common.hpp"
+#include <cuda/atomic>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
@@ -336,6 +337,21 @@ __forceinline__ __device__ out_dtype_t extract_required_scale_format(float value
 //==============================================================================
 // Memory Fences
 //==============================================================================
+
+__device__ __forceinline__ void named_barrier_sync(int barrier, int threads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(barrier), "r"(threads) : "memory");
+}
+
+__device__ __forceinline__ void st_release_block_shared(unsigned* ptr, unsigned value) {
+    cuda::atomic_ref<unsigned, cuda::thread_scope_block> ready(*ptr);
+    ready.store(value, cuda::memory_order_release);
+}
+
+__device__ __forceinline__ void wait_acquire_block_shared(unsigned* ptr, unsigned value) {
+    cuda::atomic_ref<unsigned, cuda::thread_scope_block> ready(*ptr);
+    while (ready.load(cuda::memory_order_acquire) < value) {
+    }
+}
 
 __device__ __forceinline__ void memory_fence() {
     asm volatile("fence.acq_rel.sys;" ::: "memory");

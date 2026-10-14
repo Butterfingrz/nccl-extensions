@@ -111,6 +111,7 @@ struct State {
     bool layout_info_at_update = false;
     bool em = false, use_i64 = false, topk_order = false;
     int topk = 0, experts = 0, capacity = 0, ntokens = 0, epoch = 0;
+    int token_capacity = kTokens;
     std::vector<int> source_tokens;
     Snapshot output;
 
@@ -128,22 +129,22 @@ struct State {
     void initialize(ncclEpGroup_t group, bool expert_major, bool int64_ids, int k, int e, int cap,
                     int alignment = kAlignment, bool guard_buffers = false) {
         em = expert_major; use_i64 = int64_ids; topk = k; experts = e; capacity = cap;
-        ASSERT_NO_FATAL_FAILURE(ids32.allocate(kTokens * topk));
-        ASSERT_NO_FATAL_FAILURE(ids64.allocate(kTokens * topk));
-        ASSERT_NO_FATAL_FAILURE(tokens.allocate(kTokens * kWidth));
-        ASSERT_NO_FATAL_FAILURE(weights.allocate(kTokens * topk));
+        ASSERT_NO_FATAL_FAILURE(ids32.allocate(token_capacity * topk));
+        ASSERT_NO_FATAL_FAILURE(ids64.allocate(token_capacity * topk));
+        ASSERT_NO_FATAL_FAILURE(tokens.allocate(token_capacity * kWidth));
+        ASSERT_NO_FATAL_FAILURE(weights.allocate(token_capacity * topk));
         ASSERT_NO_FATAL_FAILURE(recv_tokens.allocate(capacity * kWidth + (guard_buffers ? 16 : 0)));
         ASSERT_NO_FATAL_FAILURE(recv_weights.allocate(capacity * (em ? 1 : topk) + (guard_buffers ? 4 : 0)));
         ASSERT_NO_FATAL_FAILURE(recv_ids.allocate(capacity * topk));
-        ASSERT_NO_FATAL_FAILURE(combined_tokens.allocate(kTokens * kWidth));
-        ASSERT_NO_FATAL_FAILURE(combined_weights.allocate(kTokens * topk + 4));
+        ASSERT_NO_FATAL_FAILURE(combined_tokens.allocate(token_capacity * kWidth));
+        ASSERT_NO_FATAL_FAILURE(combined_weights.allocate(token_capacity * topk + 4));
         ASSERT_NO_FATAL_FAILURE(counts.allocate(experts / g_nranks));
         ASSERT_NO_FATAL_FAILURE(offsets.allocate(experts / g_nranks));
         ASSERT_NO_FATAL_FAILURE(total.allocate(1));
         void* ids_ptr = use_i64 ? static_cast<void*>(ids64.p) : static_cast<void*>(ids32.p);
-        ASSERT_NO_FATAL_FAILURE(tensor(&ids, 2, use_i64 ? ncclInt64 : ncclInt32, ids_ptr, kTokens, topk));
-        ASSERT_NO_FATAL_FAILURE(tensor(&x, 2, ncclBfloat16, tokens.p, kTokens, kWidth));
-        ASSERT_NO_FATAL_FAILURE(tensor(&w, 2, ncclFloat32, weights.p, kTokens, topk));
+        ASSERT_NO_FATAL_FAILURE(tensor(&ids, 2, use_i64 ? ncclInt64 : ncclInt32, ids_ptr, token_capacity, topk));
+        ASSERT_NO_FATAL_FAILURE(tensor(&x, 2, ncclBfloat16, tokens.p, token_capacity, kWidth));
+        ASSERT_NO_FATAL_FAILURE(tensor(&w, 2, ncclFloat32, weights.p, token_capacity, topk));
         ASSERT_NO_FATAL_FAILURE(tensor(&rx, 2, ncclBfloat16, recv_tokens.p, capacity, kWidth));
         if (em) {
             ASSERT_NO_FATAL_FAILURE(tensor(&rw, 1, ncclFloat32, recv_weights.p, capacity));
@@ -155,8 +156,8 @@ struct State {
             ASSERT_NO_FATAL_FAILURE(tensor(&rw, 2, ncclFloat32, recv_weights.p, capacity, topk));
             ASSERT_NO_FATAL_FAILURE(tensor(&ri, 2, ncclInt64, recv_ids.p, capacity, topk));
         }
-        ASSERT_NO_FATAL_FAILURE(tensor(&cx, 2, ncclBfloat16, combined_tokens.p, kTokens, kWidth));
-        ASSERT_NO_FATAL_FAILURE(tensor(&cw, 2, ncclFloat32, combined_weights.p, kTokens, topk));
+        ASSERT_NO_FATAL_FAILURE(tensor(&cx, 2, ncclBfloat16, combined_tokens.p, token_capacity, kWidth));
+        ASSERT_NO_FATAL_FAILURE(tensor(&cw, 2, ncclFloat32, combined_weights.p, token_capacity, topk));
         ASSERT_NO_FATAL_FAILURE(tensor(&total_tensor, 1, ncclInt64, total.p, 1));
         info.recv_total_counter = total_tensor;
         info.recv_topk_idx_kind = NCCL_EP_EXPERT_ID_LOCAL;
@@ -207,7 +208,13 @@ struct State {
         std::vector<nv_bfloat16> ht(ntokens * kWidth);
         std::vector<float> hw(ntokens * topk);
         for (int t = 0; t < ntokens; ++t) {
-            for (int d = 0; d < kWidth; ++d) ht[t * kWidth + d] = __float2bfloat16(g_rank * kTokens + t + 1);
+            // Encode identity in BF16 bits so larger token IDs remain exact.
+            const uint16_t identity = 0x3f80 + g_rank * token_capacity + t;
+            nv_bfloat16 value;
+            std::memcpy(&value, &identity, sizeof(value));
+            for (int d = 0; d < kWidth; ++d) {
+                ht[t * kWidth + d] = value;
+            }
             for (int k = 0; k < topk; ++k) hw[t * topk + k] = source_weight(g_rank, t, k, epoch, repeat);
         }
         ASSERT_NO_FATAL_FAILURE(tokens.upload(ht));
@@ -264,7 +271,7 @@ struct State {
         // Leave unused capacity, EM alignment pads and FLAT tail columns
         // nonzero so stale/uninitialized saved map entries cannot false-pass.
         output.gradients.assign(recv_weights.size, 12345.0f);
-        std::vector<int> seen(g_nranks * kTokens * topk, 0);
+        std::vector<int> seen(g_nranks * token_capacity * topk, 0);
         output.token_gradients.assign(recv_tokens.size, __float2bfloat16(0));
         for (int s = 0; s < output.total; ++s) {
             SCOPED_TRACE(::testing::Message() << "rank=" << g_rank << " epoch=" << epoch << " recv_slot=" << s);
@@ -275,9 +282,10 @@ struct State {
                 EXPECT_EQ(bits(output.recv_w[s]), bits(0.0f));
                 continue;
             }
-            int identity = static_cast<int>(token_id) - 1;
-            ASSERT_EQ(token_id, static_cast<float>(identity + 1));
-            int source = identity / kTokens, token = identity % kTokens;
+            uint16_t identity_bits;
+            std::memcpy(&identity_bits, &output.recv_x[s * kWidth], sizeof(identity_bits));
+            const int identity = static_cast<int>(identity_bits) - 0x3f80;
+            int source = identity / token_capacity, token = identity % token_capacity;
             ASSERT_GE(source, 0); ASSERT_LT(source, g_nranks); ASSERT_LT(token, source_tokens[source]);
             for (int d = 0; d < kWidth; ++d) {
                 EXPECT_EQ(__bfloat162float(output.recv_x[s * kWidth + d]), token_id);
@@ -305,7 +313,7 @@ struct State {
                 int k = hit->second;
                 EXPECT_EQ(bits(output.recv_w[s]), bits(source_weight(source, token, k, epoch, repeat)));
                 output.gradients[s] = independent_gradient(source, token, hit->first, epoch);
-                ++seen[(source * kTokens + token) * topk + k];
+                ++seen[(source * token_capacity + token) * topk + k];
             } else {
                 for (int j = 0; j < topk; ++j) {
                     if (j >= static_cast<int>(local.size())) {
@@ -318,7 +326,7 @@ struct State {
                     EXPECT_EQ(output.recv_idx[s * topk + j], expected_id);
                     EXPECT_EQ(bits(output.recv_w[s * topk + j]), bits(source_weight(source, token, k, epoch, repeat)));
                     output.gradients[s * topk + j] = independent_gradient(source, token, e, epoch);
-                    ++seen[(source * kTokens + token) * topk + k];
+                    ++seen[(source * token_capacity + token) * topk + k];
                 }
             }
         }
@@ -328,7 +336,7 @@ struct State {
                 for (int k = 0; k < topk; ++k) {
                     int64_t e = route(r, t, k, topk, experts, epoch);
                     int expected = e >= g_rank * epr && e < (g_rank + 1) * epr ? 1 : 0;
-                    EXPECT_EQ(seen[(r * kTokens + t) * topk + k], expected)
+                    EXPECT_EQ(seen[(r * token_capacity + t) * topk + k], expected)
                         << "source=" << r << " token=" << t << " k=" << k;
                 }
             }
@@ -398,6 +406,9 @@ protected:
         cfg.num_topk = topk;
         cfg.max_dispatch_tokens_per_rank = max_tokens;
         cfg.max_recv_tokens_per_rank = capacity;
+        if (max_tokens > kTokens) {
+            cfg.max_num_sms = 8;
+        }
         cfg.max_token_bytes = kWidth * sizeof(nv_bfloat16);
         cfg.rdma_buffer_size = cfg.num_qp_per_rank = cfg.num_channels = NCCL_EP_AUTO;
         if (drop) {
@@ -409,13 +420,19 @@ protected:
     void run(bool em, bool int64_ids, int topk, int experts = 0) {
         if (!experts) experts = topk == 8 ? 256 : 512;
         ASSERT_EQ(experts % g_nranks, 0);
-        const int cap = (g_nranks * kTokens * topk + (experts / g_nranks) * (kAlignment - 1) + 127) & ~63;
-        ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, cap, false, kTokens, &group_));
+        // Cross live chunk boundaries while retaining empty capacity tails.
+        const bool overlap_case = !em && int64_ids && topk == 10;
+        const int live_tokens = overlap_case ? 513 : kTokens;
+        const int max_tokens = overlap_case ? 2048 : kTokens;
+        const int cap = std::max(max_tokens,
+            (g_nranks * live_tokens * topk + (experts / g_nranks) * (kAlignment - 1) + 127) & ~63);
+        ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, cap, false, max_tokens, &group_));
         State a, b;
+        a.token_capacity = b.token_capacity = live_tokens;
         ASSERT_NO_FATAL_FAILURE(a.initialize(group_, em, int64_ids, topk, experts, cap));
         ASSERT_NO_FATAL_FAILURE(b.initialize(group_, em, int64_ids, topk, experts, cap));
-        ASSERT_NO_FATAL_FAILURE(a.update(4, 0, false));
-        ASSERT_NO_FATAL_FAILURE(b.update(4, 7, false));
+        ASSERT_NO_FATAL_FAILURE(a.update(live_tokens, 0, false));
+        ASSERT_NO_FATAL_FAILURE(b.update(live_tokens, 7, false));
 
         // A's private receive outputs and saved positions survive B using
         // the same group's staging buffers. Every BWD follows that handle's FWD.
@@ -429,14 +446,14 @@ protected:
         // no source tokens in the smaller step but still receives peer rows.
         // Change routing and LOCAL/GLOBAL output IDs at the same time.
         for (int epoch = 1; epoch <= 2; ++epoch) {
-            ASSERT_NO_FATAL_FAILURE(a.update(epoch == 1 ? 2 : 4, epoch, /*empty_last_rank=*/epoch == 1));
+            ASSERT_NO_FATAL_FAILURE(a.update(epoch == 1 ? 2 : live_tokens, epoch, /*empty_last_rank=*/epoch == 1));
             ASSERT_NO_FATAL_FAILURE(a.dispatch(epoch, false));
             ASSERT_NO_FATAL_FAILURE(a.backward());
         }
         // Reverse caller K order without changing its selected-expert bitmap.
         // A bitmap-only/stale position map must not pass this sequence.
         for (int generation : {0, 8}) {
-            ASSERT_NO_FATAL_FAILURE(a.update(4, generation, false));
+            ASSERT_NO_FATAL_FAILURE(a.update(live_tokens, generation, false));
             ASSERT_NO_FATAL_FAILURE(a.dispatch(3, false));
             ASSERT_NO_FATAL_FAILURE(b.dispatch(3, false));
             ASSERT_NO_FATAL_FAILURE(a.backward());

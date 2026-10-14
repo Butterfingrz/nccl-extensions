@@ -576,8 +576,12 @@ inline int pull_dispatch_warps(int hidden_int4, int scale_tma_row_bytes, size_t 
         ? (::ht_ep::kPullDispatchMapWarps + 1) * sizeof(unsigned) : 0;
     for (int warps = ::ht_ep::kPullDispatchMaxPullWarps; warps > map_only_warps; --warps) {
         const int payload_warps = warps - map_only_warps;
-        const size_t static_bytes = nccl_ep::align<size_t>(
-            (flat ? 0 : payload_warps * pull_static_smem_bytes_per_warp()) + counter_bytes, 16);
+        size_t static_bytes = payload_warps * pull_static_smem_bytes_per_warp() + counter_bytes;
+        if (flat) {
+            const int scratch_warps = map_only_warps > 0 ? map_only_warps : payload_warps;
+            static_bytes = (scratch_warps + 4) * sizeof(int);
+        }
+        static_bytes = nccl_ep::align<size_t>(static_bytes, 16);
         const size_t dynamic_bytes = payload_warps * pull_smem_bytes_per_warp(hidden_int4, scale_tma_row_bytes) +
                                       map_smem_bytes;
         if (static_bytes + dynamic_bytes <= total_budget) return warps;
@@ -644,7 +648,8 @@ inline int pull_scale_tma_row_bytes(int hidden_int4, ncclEpDispQuant_t recipe, i
 inline std::string dispatch_pull_jit_source(int hidden_int4, int blocks_per_sm, ncclEpDispQuant_t recipe,
                                                int scale_int4_per_lane, int scale_tma_row_bytes,
                                                int pull_warps, bool fused_map,
-                                               int top_k, int nRanks, int experts_per_rank, bool flat) {
+                                               int top_k, int nRanks, int experts_per_rank, bool flat,
+                                               bool overlap_map) {
     std::ostringstream src;
     const int threads = flat ? pull_warps * 32 : ::ht_ep::pull_dispatch_threads(pull_warps);
     src << "#include \"device/ht_ep.cuh\"\n"
@@ -657,7 +662,7 @@ inline std::string dispatch_pull_jit_source(int hidden_int4, int blocks_per_sm, 
             << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ", " << scale_int4_per_lane
             << ", " << scale_tma_row_bytes << ", " << pull_warps << ", "
             << ::nccl_ep::jit::bool_literal(fused_map) << ", " << top_k << ", "
-            << kFlatMetadataChunkTokens << ">(p);\n}\n";
+            << kFlatMetadataChunkTokens << ", " << ::nccl_ep::jit::bool_literal(overlap_map) << ">(p);\n}\n";
         return src.str();
     }
     src << "  ::ht_ep::dispatch_pull<" << hidden_int4 << ", " << pull_stage_literal(hidden_int4)
@@ -691,17 +696,20 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
     // layout_ready != nullptr is what selects the fused pull-count MAP-warp-group variant;
     // the adapter (launch_dispatch_pull) sets every fused-count field together with it.
     const bool fused_map = param.layout_ready != nullptr;
-    const int map_warps = fused_map && !param.flat ? ::ht_ep::kPullDispatchMapWarps : 0;
-    size_t map_smem_bytes = 0;
-    if (param.flat) {
-        // Fused flat metadata uses per-warp counts and shared row bounds.
-        const int map_ints = fused_map ? ::ht_ep::kPullDispatchMaxPullWarps + 2 : 2;
-        map_smem_bytes = map_ints * sizeof(int);
-    } else if (fused_map) {
-        map_smem_bytes = ::ht_ep::dispatch_pull_map_smem_ints(
-            param.lsa_team_size, param.experts_per_rank) * sizeof(std::int32_t);
-    }
-    if (fused_map && !param.flat) {
+    const size_t blocks = static_cast<size_t>(num_blocks) * blocks_per_sm;
+    const size_t flat_chunks = static_cast<size_t>(param.lsa_team_size) *
+        nccl_ep::ceil_div(param.tokens_per_rank, ::nccl_ep::ht::kFlatMetadataChunkTokens);
+    // A single wave of flat chunks favors cooperative mapping. With more work,
+    // dedicated producers hide map construction behind the payload transfers.
+    bool overlap_map = fused_map && param.flat && flat_chunks > blocks;
+    int map_warps = fused_map && (!param.flat || overlap_map) ? ::ht_ep::kPullDispatchMapWarps : 0;
+    size_t map_smem_bytes = fused_map && !param.flat
+        ? ::ht_ep::dispatch_pull_map_smem_ints(param.lsa_team_size, param.experts_per_rank) * sizeof(std::int32_t)
+        : 0;
+    if (overlap_map) {
+        const size_t tiles_per_chunk = ::nccl_ep::ht::kFlatMetadataChunkTokens / (map_warps * 32);
+        map_smem_bytes = nccl_ep::ceil_div(flat_chunks, blocks) * tiles_per_chunk * sizeof(int2);
+    } else if (fused_map && !param.flat) {
         // CTA0's per-chunk (int2 range) buffer sits after the layout scratch; sized for the
         // worst-case per-CTA chunk count so every MAP warp's chunk_ranges write stays in bounds.
         // Folded into map_smem_bytes before the warp-count search below, or that search would
@@ -713,8 +721,15 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
         map_smem_bytes = ((map_smem_bytes + alignof(int2) - 1) & ~size_t(alignof(int2) - 1)) +
             max_cta_chunks * sizeof(int2);
     }
-    const int pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm,
+    int pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm,
                                               map_smem_bytes, map_warps, param.flat);
+    if (pull_warps == 0 && overlap_map) {
+        overlap_map = false;
+        map_warps = 0;
+        map_smem_bytes = 0;
+        pull_warps = pull_dispatch_warps(hidden_int4, scale_tma_row_bytes, smem_optin, blocks_per_sm,
+                                         map_smem_bytes, map_warps, param.flat);
+    }
     if (pull_warps == 0) {
         std::fprintf(stderr, "[nccl_ep jit] dispatch-pull shared memory exceeds the device budget\n");
         return ncclInvalidArgument;
@@ -732,12 +747,17 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
         if (fused_map && !param.flat) {
             name << "_nr" << param.lsa_team_size << "_e" << param.experts_per_rank;
         }
-        if (fused_map) name << "_cm" << map_smem_bytes;
+        if (fused_map) {
+            name << "_cm" << map_smem_bytes;
+        }
+        if (param.flat) {
+            name << "_om" << overlap_map;
+        }
         return name.str();
     }();
     const std::string source = dispatch_pull_jit_source(hidden_int4, blocks_per_sm, recipe, scale_int4_per_lane,
                                                         scale_tma_row_bytes, pull_warps, fused_map, param.top_k,
-                                                        param.lsa_team_size, param.experts_per_rank, param.flat);
+                                                        param.lsa_team_size, param.experts_per_rank, param.flat, overlap_map);
 
     ::nccl_ep::jit::JitKernelVariant variant;
     variant.kernel_family = "ht_dispatch_pull";
@@ -753,7 +773,7 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
     variant.block_dim = param.flat ? pull_warps * 32 : ::ht_ep::pull_dispatch_threads(pull_warps);
     const int payload_warps = pull_warps - map_warps;
     variant.dynamic_smem_bytes = pull_dynamic_smem_bytes(hidden_int4, scale_tma_row_bytes, payload_warps) +
-        static_cast<int>(param.flat ? 0 : map_smem_bytes);
+        static_cast<int>(map_smem_bytes);
     variant.nucs = nucs;
 
     std::string error;

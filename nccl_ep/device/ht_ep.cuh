@@ -8547,6 +8547,13 @@ __device__ __forceinline__ int flat_chunk_base(
     return __shfl_sync(0xffffffffu, prefix, 0);
 }
 
+template <int Warps>
+__device__ __forceinline__ void flat_map_barrier() {
+    // Only MAP threads participate. Order both shared prefix scratch and global
+    // routing writes before the leader publishes readiness to payload warps.
+    nccl_ep::named_barrier_sync(kPullMapBarrierId, Warps * 32);
+}
+
 // Preserve local-expert order and original top-k positions in one pass.
 template <int TopK, bool Receiver>
 __device__ __forceinline__ int flat_token_routes(
@@ -8578,13 +8585,15 @@ __device__ __forceinline__ int flat_token_routes(
     return count;
 }
 
-// All CTA threads build one deterministic source chunk. Receiver=true writes
+// The MAP warp group builds one deterministic source chunk. Receiver=true writes
 // the receive maps; false builds this source's retained destination slots for
 // DROP combine. Both use exactly the same slot arithmetic.
-template <int TopK, int ChunkTokens, int Warps, bool Receiver>
+template <int TopK, int ChunkTokens, int Warps, bool Receiver, bool Publish>
 __device__ __forceinline__ int2 flat_build_chunk(
     const dispatch_pull_param_t& p, int source, int chunk, int destination,
-    int* warp_counts, int* shared_base) {
+    int* warp_counts, int* shared_base,
+    int2* tile_ranges, unsigned* tiles_ready, unsigned first_tile) {
+    static_assert(!Publish || ChunkTokens % (Warps * 32) == 0);
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
     if (warp == 0) {
@@ -8593,14 +8602,16 @@ __device__ __forceinline__ int2 flat_build_chunk(
             *shared_base = base;
         }
     }
-    __syncthreads();
+    flat_map_barrier<Warps>();
     const int base = *shared_base;
     int consumed = 0;
-    const int end = min((chunk + 1) * ChunkTokens, p.tokens_per_rank);
+    const int chunk_end = (chunk + 1) * ChunkTokens;
+    const int end = min(chunk_end, p.tokens_per_rank);
     const int first_expert = destination * p.experts_per_rank;
     const uint16_t* routes = reinterpret_cast<const uint16_t*>(p.own_meta_staging +
         static_cast<size_t>(source) * pull_meta_stride(p.topk_off_bytes, p.tokens_per_rank) + p.topk_off_bytes);
-    for (int tile = chunk * ChunkTokens; tile < end; tile += Warps * 32) {
+    const int loop_end = Publish ? chunk_end : end;
+    for (int tile = chunk * ChunkTokens; tile < loop_end; tile += Warps * 32) {
         const int token = tile + threadIdx.x;
         int hits[Receiver ? TopK : 1];
         const int count = token < end
@@ -8609,7 +8620,7 @@ __device__ __forceinline__ int2 flat_build_chunk(
         if (lane == 0) {
             warp_counts[warp] = __popc(mask);
         }
-        __syncthreads();
+        flat_map_barrier<Warps>();
         int prefix = consumed;
         for (int w = 0; w < warp; ++w) {
             prefix += warp_counts[w];
@@ -8632,14 +8643,24 @@ __device__ __forceinline__ int2 flat_build_chunk(
                 count > 0 && slot < p.flat_recv_capacity ? slot : -1;
             }
         }
+        const int tile_base = base + consumed;
+        int tile_count = 0;
         for (int w = 0; w < Warps; ++w) {
-            consumed += warp_counts[w];
+            tile_count += warp_counts[w];
         }
-        // All readers must finish before the next tile overwrites warp_counts.
-        __syncthreads();
+        consumed += tile_count;
+        // Order routing writes before publication and finish all scratch reads
+        // before the next tile. Empty tail tiles also publish a zero-sized range.
+        flat_map_barrier<Warps>();
+        if constexpr (Publish) {
+            if (threadIdx.x == 0) {
+                const unsigned unit = first_tile + (tile - chunk * ChunkTokens) / (Warps * 32);
+                tile_ranges[unit] = make_int2(tile_base, max(0, min(tile_count, p.flat_recv_capacity - tile_base)));
+                nccl_ep::st_release_block_shared(tiles_ready, unit + 1);
+            }
+        }
     }
-    const int kept = max(0, min(consumed, p.flat_recv_capacity - base));
-    return make_int2(base, kept);
+    return make_int2(base, max(0, min(consumed, p.flat_recv_capacity - base)));
 }
 
 template <int HiddenInt4, bool Scales, bool ScaleTma, int ScaleInt4PerLane,
@@ -8698,12 +8719,96 @@ __device__ __forceinline__ void dispatch_pull_flat_row(
     bulk_wait_reads(lane);
 }
 
+template <int TopK, int ChunkTokens, int kMapWarps>
+__device__ __forceinline__ void flat_produce_maps(
+    const dispatch_pull_param_t& p, int* warp_counts, int* shared_base,
+    int2* tile_ranges, unsigned* tiles_ready) {
+    constexpr unsigned kTilesPerChunk = ChunkTokens / (kMapWarps * 32);
+    const int total_chunks = nccl_ep::ceil_div(p.tokens_per_rank, ChunkTokens) * p.lsa_team_size;
+    unsigned built = 0;
+    for (int work = blockIdx.x; work < total_chunks; work += gridDim.x) {
+        const int source = work % p.lsa_team_size;
+        const int chunk = work / p.lsa_team_size;
+        flat_build_chunk<TopK, ChunkTokens, kMapWarps, true, true>(
+            p, source, chunk, p.my_rank, warp_counts, shared_base,
+            tile_ranges, tiles_ready, built * kTilesPerChunk);
+        ++built;
+        if (p.retained_slots != nullptr) {
+            flat_build_chunk<TopK, ChunkTokens, kMapWarps, false, false>(
+                p, p.my_rank, chunk, source, warp_counts, shared_base, nullptr, nullptr, 0);
+        }
+    }
+}
+
+template <int ChunkTokens, int kMapWarps, typename ProcessSlot>
+__device__ __forceinline__ void flat_consume_maps(
+    const dispatch_pull_param_t& p, int lane, int2* tile_ranges,
+    unsigned* tiles_ready, unsigned* next_ticket, ProcessSlot process_slot) {
+    constexpr unsigned kTileTokens = kMapWarps * 32;
+    constexpr unsigned kTilesPerChunk = ChunkTokens / kTileTokens;
+    const int total_chunks = nccl_ep::ceil_div(p.tokens_per_rank, ChunkTokens) * p.lsa_team_size;
+    // Match EM's small work claims; deterministic prefixes fix output order
+    // independently of which payload warp handles each ready row.
+    constexpr unsigned kSlotBatch = 4;
+    static_assert(kTileTokens % kSlotBatch == 0);
+    for (;;) {
+        unsigned ticket = 0;
+        if (lane == 0) {
+            ticket = atomicAdd(next_ticket, kSlotBatch);
+        }
+        ticket = __shfl_sync(0xffffffffu, ticket, 0);
+        const unsigned unit = ticket / kTileTokens;
+        if (blockIdx.x + (unit / kTilesPerChunk) * gridDim.x >= total_chunks) {
+            break;
+        }
+        int first_slot = 0, count = 0;
+        if (lane == 0) {
+            nccl_ep::wait_acquire_block_shared(tiles_ready, unit + 1);
+            const int2 range = tile_ranges[unit];
+            first_slot = range.x;
+            count = range.y;
+        }
+        first_slot = __shfl_sync(0xffffffffu, first_slot, 0);
+        count = __shfl_sync(0xffffffffu, count, 0);
+        const int offset = ticket % kTileTokens;
+        const int end = min(offset + static_cast<int>(kSlotBatch), count);
+        for (int i = offset; i < end; ++i) {
+            process_slot(first_slot + i);
+        }
+    }
+}
+
+template <int TopK, int ChunkTokens, int PullWarps, typename ProcessSlot>
+__device__ __forceinline__ void flat_map_and_transfer(
+    const dispatch_pull_param_t& p, int warp, int* warp_counts, int* shared_base, ProcessSlot process_slot) {
+    // With few chunks, use the whole CTA to build a map quickly rather than
+    // reserving producers that cannot overlap enough subsequent work.
+    const int total_chunks = nccl_ep::ceil_div(p.tokens_per_rank, ChunkTokens) * p.lsa_team_size;
+    for (int work = blockIdx.x; work < total_chunks; work += gridDim.x) {
+        const int source = work % p.lsa_team_size;
+        const int chunk = work / p.lsa_team_size;
+        const int2 range = flat_build_chunk<TopK, ChunkTokens, PullWarps, true, false>(
+            p, source, chunk, p.my_rank, warp_counts, shared_base, nullptr, nullptr, 0);
+        for (int i = warp; i < range.y; i += PullWarps) {
+            process_slot(range.x + i);
+        }
+        __syncthreads();
+        if (p.retained_slots != nullptr) {
+            flat_build_chunk<TopK, ChunkTokens, PullWarps, false, false>(
+                p, p.my_rank, chunk, source, warp_counts, shared_base, nullptr, nullptr, 0);
+        }
+    }
+}
+
 // One warp transfers a receive row. Unlike EM, no output fan-out or padding is
 // needed. Metadata and scale loads overlap the outstanding token-row load.
 template <int HiddenInt4, ncclEpDispQuant_t Recipe, int ScaleInt4PerLane,
-          int ScaleTmaRowBytes, int PullWarps, bool FusedMap, int TopK, int ChunkTokens>
+          int ScaleTmaRowBytes, int PullWarps, bool FusedMap, int TopK, int ChunkTokens, bool OverlapMap>
 __device__ __forceinline__ void dispatch_pull_flat(const dispatch_pull_param_t& p) {
     static_assert(Recipe == NCCL_EP_DISP_QUANT_NONE || Recipe == NCCL_EP_DISP_QUANT_FWD);
+    constexpr int kMapWarps = FusedMap && OverlapMap ? kPullDispatchMapWarps : 0;
+    constexpr int kPayloadWarps = PullWarps - kMapWarps;
+    static_assert(kPayloadWarps > 0);
     constexpr bool kScales = Recipe == NCCL_EP_DISP_QUANT_FWD;
     constexpr bool kScaleTma = kScales && ScaleTmaRowBytes > 0;
     using TokenStage = PullTmaStage<HiddenInt4 * 16>;
@@ -8713,54 +8818,63 @@ __device__ __forceinline__ void dispatch_pull_flat(const dispatch_pull_param_t& 
     extern __shared__ uint8_t smem[];
     TokenStage token_stage;
     ScaleStage scale_stage;
-    token_stage.init(lane, smem + warp * TokenStage::smem_bytes_per_warp);
-    if constexpr (kScaleTma) {
-        scale_stage.init(lane, smem + PullWarps * TokenStage::smem_bytes_per_warp +
-                                   warp * ScaleStage::smem_bytes_per_warp);
+    const bool is_map = warp < kMapWarps;
+    const int payload_warp = warp - kMapWarps;
+    if (!is_map) {
+        token_stage.init(lane, smem + payload_warp * TokenStage::smem_bytes_per_warp);
+        if constexpr (kScaleTma) {
+            scale_stage.init(lane, smem + kPayloadWarps * TokenStage::smem_bytes_per_warp +
+                                       payload_warp * ScaleStage::smem_bytes_per_warp);
+        }
     }
     TokenStage::block_init_fence();
     flat_dispatch_head<FusedMap>(p);
 
-    __shared__ int warp_counts[FusedMap ? PullWarps : 1];
+    constexpr size_t kPayloadBytes = kPayloadWarps * (TokenStage::smem_bytes_per_warp +
+        (kScaleTma ? ScaleStage::smem_bytes_per_warp : 0));
+    int2* tile_ranges = reinterpret_cast<int2*>(smem + kPayloadBytes);
+    __shared__ unsigned tiles_ready;
+    __shared__ unsigned next_ticket;
+    constexpr int kScratchWarps = OverlapMap ? kMapWarps : PullWarps;
+    __shared__ int warp_counts[FusedMap ? kScratchWarps : 1];
     __shared__ int shared_base;
     __shared__ int shared_total;
     int num_recv;
     if constexpr (FusedMap) {
+        if (threadIdx.x == 0) {
+            tiles_ready = 0;
+            next_ticket = 0;
+        }
         num_recv = flat_receive_count(p, &shared_total);
     } else {
         num_recv = *p.num_recv_tokens_dev;
     }
     EP_DEVICE_ASSERT(num_recv <= p.caller_num_recv_tokens);
-    const int total_warps = gridDim.x * PullWarps;
+    const int total_warps = gridDim.x * kPayloadWarps;
     const int rows_per_warp = nccl_ep::ceil_div(num_recv, total_warps);
-    const int first = (blockIdx.x * PullWarps + warp) * rows_per_warp;
+    const int first = (blockIdx.x * kPayloadWarps + payload_warp) * rows_per_warp;
     auto process_slot = [&](int slot) {
         dispatch_pull_flat_row<HiddenInt4, kScales, kScaleTma, ScaleInt4PerLane>(
             p, slot, lane, token_stage, scale_stage);
     };
-    if constexpr (FusedMap) {
-        const int chunks = nccl_ep::ceil_div(p.tokens_per_rank, ChunkTokens);
-        for (int work = blockIdx.x; work < chunks * p.lsa_team_size; work += gridDim.x) {
-            const int source = work % p.lsa_team_size;
-            const int chunk = work / p.lsa_team_size;
-            const int2 range = flat_build_chunk<TopK, ChunkTokens, PullWarps, true>(
-                p, source, chunk, p.my_rank, warp_counts, &shared_base);
-            for (int i = warp; i < range.y; i += PullWarps) {
-                process_slot(range.x + i);
-            }
-            // All row reads finish before scratch is reused for the next map.
-            __syncthreads();
-            if (p.retained_slots != nullptr) {
-                flat_build_chunk<TopK, ChunkTokens, PullWarps, false>(
-                    p, p.my_rank, chunk, source, warp_counts, &shared_base);
-            }
+    if constexpr (FusedMap && OverlapMap) {
+        if (is_map) {
+            flat_produce_maps<TopK, ChunkTokens, kMapWarps>(
+                p, warp_counts, &shared_base, tile_ranges, &tiles_ready);
+        } else {
+            flat_consume_maps<ChunkTokens, kMapWarps>(
+                p, lane, tile_ranges, &tiles_ready, &next_ticket, process_slot);
         }
+    } else if constexpr (FusedMap) {
+        flat_map_and_transfer<TopK, ChunkTokens, PullWarps>(p, warp, warp_counts, &shared_base, process_slot);
     } else {
         for (int slot = first; slot < min(first + rows_per_warp, num_recv); ++slot) {
             process_slot(slot);
         }
     }
-    bulk_drain(lane);
+    if (!is_map) {
+        bulk_drain(lane);
+    }
     __syncthreads();
     if (!p.unfused_sync) {
         lsa_grid_tail_barrier(p.dcomm, p.grid_barrier_counter, p.head_sync_flag);
