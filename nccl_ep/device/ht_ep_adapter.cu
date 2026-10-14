@@ -2674,7 +2674,8 @@ ncclResult_t launch_combine_push(
     const int32_t* srcpos_map,
     bool backward,
     bool unfused_sync,
-    bool nucs) {
+    bool nucs,
+    bool flat) {
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
     assert(sm_count > 0);
@@ -2689,6 +2690,7 @@ ncclResult_t launch_combine_push(
     const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
 
     ::ht_ep::combine_push_param_t p{};
+    p.flat = flat;
     assert(lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
     for (int i = 0; i < lsa_team_size; i++) {
         p.peer_staging_ptrs[i] = peer_staging_ptrs[i];
@@ -2736,15 +2738,23 @@ ncclResult_t launch_combine_reduce_stage(
     ncclDataType_t token_dtype,
     float* combined_topk_weights,
     int top_k,
-    bool backward) {
+    bool backward,
+    const int32_t* retained_slots,
+    bool flat) {
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(sm_count > 0);
     assert(lsa_team_size > 0);
+    // The collective push has already completed. A rank with no source
+    // tokens has no local reduction work and may have null output storage.
+    if (num_combined_tokens == 0) {
+        return ncclSuccess;
+    }
     assert(!backward || (combined_topk_weights != nullptr && top_k > 0));
 
     const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
 
     ::ht_ep::combine_reduce_param_t p{};
+    p.retained_slots = retained_slots;
     p.attn_output = attn_output;
     p.staging = staging;
     p.topk_idx = topk_idx;
@@ -2758,7 +2768,7 @@ ncclResult_t launch_combine_reduce_stage(
     p.top_k = top_k;
 
     return ::nccl_ep::ht::jit::launch_combine_reduce_stage(
-        row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward);
+        row_bytes, static_cast<int>(grid), p, stream, token_dtype, backward, flat);
 }
 
 } // namespace ht

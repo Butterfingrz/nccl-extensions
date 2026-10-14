@@ -6961,7 +6961,7 @@ ncclResult_t ncclEpCombine(
                 backward_combine ? handle->ht.srcpos_map : nullptr,
                 backward_combine,
                 nccl_ep_env_flag_on(group->env.ht_unfused_sync),
-                nccl_ep_env_flag_on(group->env.nucs)));
+                nccl_ep_env_flag_on(group->env.nucs), false));
             NCCLCHECK(nccl_ep::ht::launch_combine_reduce_stage(
                 combined_x->data,
                 staging,
@@ -6978,7 +6978,7 @@ ncclResult_t ncclEpCombine(
                 x->datatype,
                 backward_combine ? static_cast<float*>(combined_topk_weights->data) : nullptr,
                 backward_combine ? handle->num_topk : 0,
-                backward_combine));
+                backward_combine, nullptr, false));
         } else {
             if (em_permute_combine) {
                 // MXFP8: app provides BF16; local_permute_reduce accumulates and quantizes to

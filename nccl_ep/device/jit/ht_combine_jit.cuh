@@ -545,6 +545,11 @@ inline ncclResult_t launch_combine_push(
     // small EP but not large). 0 forces the whole row; other values round up to whole tiles,
     // clamped to the row.
     const int requested_int4 = [&] {
+        // Flat relays the row without EM gather/reduction accumulators. Use a
+        // full-row TMA stage and size the warp count to its shared-memory cost.
+        if (param.flat) {
+            return 0;
+        }
         constexpr int kOneTile = 1;  // rounds up to one tile in combine_push_chunk_size
         constexpr int kAutoNoChunkEpSize = 16;  // EP >= this uses the whole row by default
         const int auto_default = ep_size >= kAutoNoChunkEpSize ? 0 : kOneTile;
@@ -577,11 +582,17 @@ inline ncclResult_t launch_combine_push(
         return int4s;
     }();
     const int chunk_size = ::ht_ep::combine_push_chunk_size(hidden_int4, requested_int4);
-    const int slots =
-        ::ht_ep::combine_push_slots_per_block(hidden_int4, smem_cap, chunk_size);
+    const int slots = param.flat
+        ? std::min(::ht_ep::kCombinePushMaxSlots, smem_cap / (row_bytes + 16))
+        : ::ht_ep::combine_push_slots_per_block(hidden_int4, smem_cap, chunk_size);
+    if (slots == 0) {
+        std::fprintf(stderr, "[nccl_ep] combine push: a %d-byte row exceeds the %d-byte shared memory budget\n",
+                     row_bytes, smem_cap);
+        return ncclInvalidArgument;
+    }
     const int block_dim = slots * 32;
     const int chunk_bytes = ::ht_ep::combine_push_buf_int4(hidden_int4, chunk_size) * 16;
-    if (chunk_bytes > smem_cap - ::ht_ep::combine_push_meta_reserve_bytes()) {
+    if (!param.flat && chunk_bytes > smem_cap - ::ht_ep::combine_push_meta_reserve_bytes()) {
         std::fprintf(stderr,
                      "[nccl_ep] combine push: a %d-byte chunk does not fit the %d-byte shared memory cap; "
                      "set NCCL_EP_HT_COMBINE_PUSH_CHUNK_SIZE to a smaller chunk\n",
@@ -595,7 +606,7 @@ inline ncclResult_t launch_combine_push(
         std::ostringstream name;
         name << "combine_push_topk" << top_k << "_h" << hidden_int4
              << ::nccl_ep::jit::token_dtype_name_tag(token_dtype) << (backward ? "_bwd" : "")
-             << "_c" << chunk_size;
+             << "_c" << chunk_size << (param.flat ? "_flat" : "") << "_w" << slots;
         return name.str();
     }();
     const std::string source = [&] {
@@ -604,8 +615,13 @@ inline ncclResult_t launch_combine_push(
             << "\n"
             << "extern \"C\" __launch_bounds__(" << block_dim << ", 1)\n"
             << "__global__ void " << kCombinePushJitEntryName << "(\n"
-            << "    const __grid_constant__ ::ht_ep::combine_push_param_t p) {\n"
-            << "  extern __shared__ uint8_t smem_bytes[];\n"
+            << "    const __grid_constant__ ::ht_ep::combine_push_param_t p) {\n";
+        if (param.flat) {
+            src << "  ::ht_ep::combine_push_flat<" << hidden_int4 << ", " << slots << ", "
+                << backward_literal << ">(p);\n}\n";
+            return src.str();
+        }
+        src << "  extern __shared__ uint8_t smem_bytes[];\n"
             << "  ::ht_ep::combine_push<" << top_k << ", " << hidden_int4 << ", " << token_dtype_literal
             << ", " << backward_literal << ", " << chunk_size << ">(\n"
             << "      p.peer_staging_ptrs,\n"
@@ -642,7 +658,7 @@ inline ncclResult_t launch_combine_push(
     variant.runtime_key = static_cast<std::uint64_t>(std::hash<std::string>{}(variant_name));
     variant.num_blocks = num_blocks;
     variant.block_dim = block_dim;
-    variant.dynamic_smem_bytes = static_cast<int>(
+    variant.dynamic_smem_bytes = param.flat ? slots * (row_bytes + 16) : static_cast<int>(
         ::ht_ep::combine_push_dynamic_smem_bytes(hidden_int4, slots, chunk_size));
     variant.nucs = nucs;
 
@@ -663,8 +679,9 @@ inline ncclResult_t launch_combine_reduce_stage(
     int num_blocks,
     ::ht_ep::combine_reduce_param_t& param,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16,
-    bool backward = false) {
+    ncclDataType_t token_dtype,
+    bool backward,
+    bool flat) {
     static const int variant_identity = 0;
     assert((row_bytes % 16) == 0);
     const int hidden_int4 = row_bytes / 16;
@@ -674,7 +691,11 @@ inline ncclResult_t launch_combine_reduce_stage(
     const std::string variant_name = [&] {
         std::ostringstream name;
         name << "combine_reduce_h" << hidden_int4 << ::nccl_ep::jit::token_dtype_name_tag(token_dtype)
-             << (backward ? "_bwd" : "");
+             << (backward ? "_bwd" : "") << (param.retained_slots ? "_drop" : "");
+        if (flat) {
+            name << "_flat_k" << param.num_topk << "_e" << param.experts_per_rank
+                 << "_n" << param.lsa_team_size;
+        }
         return name.str();
     }();
     const std::string source = [&] {
@@ -685,18 +706,18 @@ inline ncclResult_t launch_combine_reduce_stage(
             << "__global__ void " << kCombineReduceJitEntryName << "(\n"
             << "    const __grid_constant__ ::ht_ep::combine_reduce_param_t p) {\n"
             << "  ::ht_ep::combine_reduce<" << hidden_int4 << ", " << token_dtype_literal << ", "
-            << backward_literal << ">(\n"
+            << backward_literal << ", " << ::nccl_ep::jit::bool_literal(param.retained_slots != nullptr) << ">(\n"
             << "      reinterpret_cast<uint8_t*>(p.attn_output),\n"
             << "      reinterpret_cast<const uint8_t*>(p.staging),\n"
             << "      p.topk_idx,\n"
-            << "      p.num_topk,\n"
-            << "      p.experts_per_rank,\n"
-            << "      p.experts_per_lsa_team,\n"
+            << "      " << (flat ? std::to_string(param.num_topk) : "p.num_topk") << ",\n"
+            << "      " << (flat ? std::to_string(param.experts_per_rank) : "p.experts_per_rank") << ",\n"
+            << "      " << (flat ? std::to_string(param.experts_per_lsa_team) : "p.experts_per_lsa_team") << ",\n"
             << "      p.num_combined_tokens,\n"
-            << "      p.lsa_team_size,\n"
+            << "      " << (flat ? std::to_string(param.lsa_team_size) : "p.lsa_team_size") << ",\n"
             << "      p.row_bytes,\n"
             << "      p.combined_topk_weights,\n"
-            << "      p.top_k);\n"
+            << "      p.top_k, p.retained_slots);\n"
             << "}\n";
         return src.str();
     }();
@@ -708,7 +729,16 @@ inline ncclResult_t launch_combine_reduce_stage(
     variant.entry_name = kCombineReduceJitEntryName;
     variant.identity = &variant_identity;
     variant.runtime_key = (static_cast<std::uint64_t>(backward) << 63) |
+        (static_cast<std::uint64_t>(param.retained_slots != nullptr) << 62) |
         (static_cast<std::uint64_t>(token_dtype) << 48) | static_cast<std::uint64_t>(hidden_int4);
+    // Keep EM dimensions runtime-configurable; specialize only flat rank decoding.
+    if (flat) {
+        variant.runtime_key |= std::uint64_t{1} << 61;
+        for (int value : {param.num_topk, param.experts_per_rank,
+                          param.experts_per_lsa_team, param.lsa_team_size}) {
+            variant.runtime_key = ::nccl_ep::jit::runtime_key_mix(variant.runtime_key, value);
+        }
+    }
     variant.num_blocks = num_blocks;
     variant.block_dim = ::ht_ep::kLocalPermuteReduceThreads;
     variant.dynamic_smem_bytes = 0;

@@ -531,14 +531,15 @@ ncclResult_t launch_combine_push(
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16,
+    ncclDataType_t token_dtype,
     // Backward combine (sparse-direct prob scatter into the token staging pad); null/false on forward.
-    const float* topk_weights_em = nullptr,
-    const int32_t* srcpos_map = nullptr,
-    bool backward = false,
+    const float* topk_weights_em,
+    const int32_t* srcpos_map,
+    bool backward,
     // When true, run the intra-LSA head/tail sync as separate kernels around this launch.
-    bool unfused_sync = false,
-    bool nucs = false);
+    bool unfused_sync,
+    bool nucs,
+    bool flat);
 
 ncclResult_t launch_combine_reduce_stage(
     void* attn_output,
@@ -553,11 +554,13 @@ ncclResult_t launch_combine_reduce_stage(
     int sm_count,
     unsigned int shuffle_sms,
     cudaStream_t stream,
-    ncclDataType_t token_dtype = ncclBfloat16,
+    ncclDataType_t token_dtype,
     // Backward combine: gather each srcpos weight from the token staging pad into combined_topk_weights.
-    float* combined_topk_weights = nullptr,
-    int top_k = 0,
-    bool backward = false);
+    float* combined_topk_weights,
+    int top_k,
+    bool backward,
+    const int32_t* retained_slots,
+    bool flat);
 
 // Inverse of launch_dispatch_permute: gather caller EM combine input into
 // FLAT staging by summing the top_k EM rows per FLAT recv slot. Optional

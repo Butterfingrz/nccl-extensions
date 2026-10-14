@@ -7886,6 +7886,7 @@ __device__ __forceinline__ decoded_src_t decode_src_fast(int32_t g, const tokens
 }
 
 struct combine_push_param_t {
+    bool flat;
     // Output: per-attn-rank staging bases (peer-writable); reduced row lands at [t*team_size + R].
     void* peer_staging_ptrs[kPullMaxLsaRanks];   // [lsa_team_size]
     // Inputs
@@ -8245,6 +8246,9 @@ __device__ __forceinline__ void combine_push(
 }
 
 struct combine_reduce_param_t {
+    // Optional scan-built [source token, destination rank] map. Negative means
+    // the receiver dropped the contribution; never read its stale staging row.
+    const int32_t* retained_slots;
     // Outputs
     void* attn_output;                // [num_combined_tokens, hidden]
     float* combined_topk_weights;     // backward-only: [num_combined_tokens, top_k] gathered weights
@@ -8266,7 +8270,7 @@ struct combine_reduce_param_t {
 // [t*team_size + 0..team_size) into attn_output[t]. Which partials exist is derived from
 // this rank's own routing (topk_idx): token t has a partial from rank R iff one of its
 // top-k experts lives on R -- unwritten slots are skipped (no staging zero-init needed).
-template <int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE = false>
+template <int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE, bool CheckRetained>
 __device__ __forceinline__ void combine_reduce(
     uint8_t* __restrict__ attn_output,
     const uint8_t* __restrict__ staging,
@@ -8278,8 +8282,9 @@ __device__ __forceinline__ void combine_reduce(
     int lsa_team_size,
     int /*row_bytes*/,
     // Backward-only: gather each srcpos weight from the token staging pad into combined_topk_weights.
-    float* __restrict__ combined_topk_weights = nullptr,
-    int top_k = 0) {
+    float* __restrict__ combined_topk_weights,
+    int top_k,
+    const int32_t* retained_slots) {
     constexpr int kRowBytes = HiddenInt4 * 16;
     constexpr int kThreadsPerSlot = 128;
     constexpr int kSlotsPerBlock = kLocalPermuteReduceSlotsPerBlock;
@@ -8310,7 +8315,12 @@ __device__ __forceinline__ void combine_reduce(
         const int e_id = (wlane < num_topk)
                              ? static_cast<int>(topk_idx[static_cast<size_t>(t) * num_topk + wlane])
                              : -1;
-        const bool rank_valid = (e_id >= 0) && (e_id < experts_per_lsa_team);
+        const bool routed = (e_id >= 0) && (e_id < experts_per_lsa_team);
+        bool rank_valid = routed;
+        if constexpr (CheckRetained) {
+            rank_valid = routed &&
+                retained_slots[static_cast<size_t>(t) * lsa_team_size + e_id / experts_per_rank] >= 0;
+        }
         const int src_rank_of_lane = rank_valid ? (e_id / experts_per_rank) : -1;
         const unsigned same_rank = __match_any_sync(0xFFFFFFFFu, src_rank_of_lane);
         const bool rank_leader = rank_valid && ((__ffs(static_cast<int>(same_rank)) - 1) == wlane);
@@ -8496,6 +8506,67 @@ __device__ __forceinline__ void dispatch_pull_flat(const dispatch_pull_param_t& 
     for (int slot = first; slot < min(first + rows_per_warp, num_recv); ++slot) {
         dispatch_pull_flat_row<HiddenInt4, kScales, kScaleTma, ScaleInt4PerLane>(
             p, slot, lane, token_stage, scale_stage);
+    }
+    bulk_drain(lane);
+    __syncthreads();
+    if (!p.unfused_sync) {
+        lsa_grid_tail_barrier(p.dcomm, p.grid_barrier_counter, p.head_sync_flag);
+    }
+}
+
+// Flat expert outputs are already reduced locally by the caller. Relay each row
+// with TMA; neither floating-point accumulation nor EM gather metadata is needed.
+template <int HiddenInt4, int PushWarps, bool Backward>
+__device__ __forceinline__ void combine_push_flat(const combine_push_param_t& p) {
+    using Stage = PullTmaStage<HiddenInt4 * 16>;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    extern __shared__ uint8_t smem[];
+    Stage stage;
+    stage.init(lane, smem + warp * Stage::smem_bytes_per_warp);
+    Stage::block_init_fence();
+    if (!p.unfused_sync) {
+        lsa_grid_head_gate(p.dcomm, p.head_sync_flag);
+    }
+
+    const int num_recv = *p.num_recv_tokens_dev;
+    EP_DEVICE_ASSERT(num_recv <= p.caller_num_recv_tokens);
+    const int total_warps = gridDim.x * PushWarps;
+    // Match EM: spread consecutive row ranges across SMs before rotating peers.
+    const int global_warp = warp * gridDim.x + blockIdx.x;
+    const int rotated_warp = (global_warp +
+                             p.my_lsa_rank * (total_warps / p.lsa_team_size)) % total_warps;
+    const int rows_per_warp = nccl_ep::ceil_div(num_recv, total_warps);
+    const int first = rotated_warp * rows_per_warp;
+    const tokens_fast_div_t divisor = make_tokens_fast_div(p.tokens_per_rank);
+    constexpr int kRowBytes = HiddenInt4 * 16;
+    constexpr int kStride = comb_stage_stride_bytes(kRowBytes, Backward);
+    for (int slot = first; slot < min(first + rows_per_warp, num_recv); ++slot) {
+        stage.issue(static_cast<const int4*>(p.recv_x_em) + static_cast<size_t>(slot) * HiddenInt4);
+        const decoded_src_t dst = decode_src_fast(p.recv_slot_to_src[slot], divisor, p.lsa_team_size);
+        uint8_t* row = static_cast<uint8_t*>(p.peer_staging_ptrs[dst.rank]) +
+                       (static_cast<size_t>(dst.token) * p.lsa_team_size + p.my_lsa_rank) * kStride;
+        // Carry sparse backward weights while the token load is outstanding.
+        int source_pos = -1;
+        float weight = 0.0f;
+        if constexpr (Backward) {
+            if (lane < p.top_k) {
+                const size_t i = static_cast<size_t>(slot) * p.top_k + lane;
+                const int32_t route = p.srcpos_map[i];
+                if (route >= 0) {
+                    source_pos = flat_route_source_pos(route);
+                    weight = p.topk_weights_em[i];
+                }
+            }
+        }
+        stage.wait();
+        stage.store(row);
+        if constexpr (Backward) {
+            if (source_pos >= 0) {
+                reinterpret_cast<float*>(row + kRowBytes)[source_pos] = weight;
+            }
+        }
+        bulk_wait_reads(lane);
     }
     bulk_drain(lane);
     __syncthreads();
