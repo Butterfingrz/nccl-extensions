@@ -6345,7 +6345,8 @@ ncclResult_t ncclEpDispatch(
                     pull_caller_counts,
                     pull_caller_recv_total,
                     pull_caller_out_is_int64,
-                    nccl_ep_env_flag_on(group->env.nucs)));
+                    nccl_ep_env_flag_on(group->env.nucs),
+                    false, nullptr, 0));
             } else {
                 // Compact decode fills flat2em with packed local IDs. The permute
                 // replaces them with EM slots in the same weight order. Dense count

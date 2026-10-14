@@ -2476,7 +2476,7 @@ ncclResult_t launch_dispatch_pull(
     uint32_t* grid_barrier_counter,
     cudaStream_t stream,
     bool unfused_sync,
-    // Fused pull-count inputs; leave at defaults (layout_ready == nullptr) for the scan path.
+    // A null layout_ready selects the prebuilt scan maps.
     const uint8_t* const* meta_ptrs,
     int topk_off_bytes,
     int32_t* rank_cursor,
@@ -2497,7 +2497,10 @@ ncclResult_t launch_dispatch_pull(
     void* caller_counts,
     void* caller_recv_total,
     bool caller_out_is_int64,
-    bool nucs) {
+    bool nucs,
+    bool flat,
+    int64_t* recv_topk_idx,
+    int output_expert_base) {
     assert(experts_per_rank > 0 && top_k <= ::ht_ep::kPullDispatchMaxActive);
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
@@ -2512,6 +2515,9 @@ ncclResult_t launch_dispatch_pull(
     const unsigned int grid = local_permute_grid(sm_count, shuffle_sms);
 
     ::ht_ep::dispatch_pull_param_t p{};
+    p.flat = flat;
+    p.recv_topk_idx = recv_topk_idx;
+    p.output_expert_base = output_expert_base;
     p.recv_x_em = recv_x_em;
     p.recv_topk_weights_em = recv_topk_weights_em;
     p.recv_x_scale_em = fwd ? static_cast<uint8_t*>(recv_x_scale_em) : nullptr;

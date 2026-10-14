@@ -468,33 +468,34 @@ ncclResult_t launch_dispatch_pull(
     uint32_t* grid_barrier_counter,
     cudaStream_t stream,
     // When true, run the intra-LSA head/tail sync as separate kernels around this launch.
-    bool unfused_sync = false,
-    // Fused pull-count inputs; leave at defaults for the scan path. layout_ready != nullptr
-    // selects the MAP-warp-group kernel variant that builds flat2em_slot_map/srcpos_map/
-    // recv_slot_to_src in-kernel instead of reading them prebuilt by the scan.
-    const uint8_t* const* meta_ptrs = nullptr,
-    int topk_off_bytes = 0,
-    int32_t* rank_cursor = nullptr,
-    int32_t* expert_cursor = nullptr,
-    int32_t* layout_ready = nullptr,
-    int my_rank = 0,
-    int max_recv_tokens_per_rank = 0,
-    int flat_recv_capacity = 0,
-    int em_alignment = 1,
-    bool allow_overflow_drop = false,
-    const int32_t* own_row = nullptr,
-    const uint16_t* own_topk_snapshot = nullptr,
-    uint8_t* own_meta_staging = nullptr,
-    int32_t* layout_slot_base = nullptr,
-    int32_t* layout_expert_base = nullptr,
-    const int32_t* cached_cnt_rows = nullptr,
+    bool unfused_sync,
+    // A null layout_ready selects the prebuilt scan maps.
+    const uint8_t* const* meta_ptrs,
+    int topk_off_bytes,
+    int32_t* rank_cursor,
+    int32_t* expert_cursor,
+    int32_t* layout_ready,
+    int my_rank,
+    int max_recv_tokens_per_rank,
+    int flat_recv_capacity,
+    int em_alignment,
+    bool allow_overflow_drop,
+    const int32_t* own_row,
+    const uint16_t* own_topk_snapshot,
+    uint8_t* own_meta_staging,
+    int32_t* layout_slot_base,
+    int32_t* layout_expert_base,
+    const int32_t* cached_cnt_rows,
     // Caller's dispatch-time layout_info outputs (mirrors dispatch_push_count's caller_offsets/
     // caller_counts/caller_recv_total); null when the caller didn't request them.
-    void* caller_offsets = nullptr,
-    void* caller_counts = nullptr,
-    void* caller_recv_total = nullptr,
-    bool caller_out_is_int64 = false,
-    bool nucs = false);
+    void* caller_offsets,
+    void* caller_counts,
+    void* caller_recv_total,
+    bool caller_out_is_int64,
+    bool nucs,
+    bool flat,
+    int64_t* recv_topk_idx,
+    int output_expert_base);
 
 // Minimum shared-memory bytes launch_dispatch_pull requires for a given row width
 // (int4 units): what a single pull warp needs, static and dynamic. Callers compare this

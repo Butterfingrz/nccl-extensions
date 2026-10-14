@@ -6838,6 +6838,11 @@ __device__ __forceinline__ void lsa_grid_tail_barrier(
 }
 
 struct dispatch_pull_param_t {
+    // Flat specialization: packed local-expert/source-position entries in srcpos_map.
+    // These fields are unused by EM; layout is specialized in the JIT entry.
+    bool flat;
+    int64_t* recv_topk_idx;
+    int output_expert_base; // 0 for LOCAL IDs, this rank's first global expert for GLOBAL
     void* recv_x_em;                            // EM output token buffer
     float* recv_topk_weights_em;                // EM 1D weights out (null if not delivered)
     uint8_t* recv_x_scale_em;                   // QUANT_FWD: EM output scale buffer (null for NONE)
@@ -8400,6 +8405,103 @@ __host__ __device__ constexpr int flat_route_expert(int32_t route) {
 }
 __host__ __device__ constexpr int flat_route_source_pos(int32_t route) {
     return route % MAX_NUM_TOPK;
+}
+
+template <int HiddenInt4, bool Scales, bool ScaleTma, int ScaleInt4PerLane,
+          typename TokenStage, typename ScaleStage>
+__device__ __forceinline__ void dispatch_pull_flat_row(
+    const dispatch_pull_param_t& p, int slot, int lane,
+    TokenStage& token_stage, ScaleStage& scale_stage) {
+    const int scale_int4 = p.scale_row_bytes / 16;
+    const decoded_src_t src = decode_src(p.recv_slot_to_src[slot], p.tokens_per_rank, p.lsa_team_size);
+    token_stage.issue(static_cast<const int4*>(p.peer_input_ptrs[src.rank]) +
+                      static_cast<size_t>(src.token) * HiddenInt4);
+    int4 scale_regs[ScaleTma ? 1 : ScaleInt4PerLane];
+    if constexpr (Scales) {
+        const uint8_t* scales = static_cast<const uint8_t*>(p.peer_scale_ptrs[src.rank]) +
+                                static_cast<size_t>(src.token) * p.scale_row_bytes;
+        if constexpr (ScaleTma) {
+            scale_stage.issue(scales);
+        } else {
+#pragma unroll
+            for (int i = 0; i < ScaleInt4PerLane; ++i) {
+                const int j = lane + i * 32;
+                if (j < scale_int4) {
+                    scale_regs[i] = reinterpret_cast<const int4*>(scales)[j];
+                }
+            }
+        }
+    }
+    if (p.recv_topk_weights_em != nullptr && lane < p.top_k) {
+        const size_t out = static_cast<size_t>(slot) * p.top_k + lane;
+        const int32_t route = p.srcpos_map[out];
+        const bool valid = route >= 0;
+        p.recv_topk_weights_em[out] = valid
+            ? p.peer_weight_ptrs[src.rank][static_cast<size_t>(src.token) * p.top_k +
+                                           flat_route_source_pos(route)] : 0.0f;
+        if (p.recv_topk_idx != nullptr) {
+            p.recv_topk_idx[out] = valid ? flat_route_expert(route) + p.output_expert_base : -1;
+        }
+    }
+    token_stage.wait();
+    token_stage.store(static_cast<int4*>(p.recv_x_em) + static_cast<size_t>(slot) * HiddenInt4);
+    if constexpr (Scales) {
+        uint8_t* scales = p.recv_x_scale_em + static_cast<size_t>(slot) * p.scale_row_bytes;
+        if constexpr (ScaleTma) {
+            scale_stage.wait();
+            scale_stage.store(scales);
+        } else {
+#pragma unroll
+            for (int i = 0; i < ScaleInt4PerLane; ++i) {
+                const int j = lane + i * 32;
+                if (j < scale_int4) {
+                    reinterpret_cast<int4*>(scales)[j] = scale_regs[i];
+                }
+            }
+        }
+    }
+    bulk_wait_reads(lane);
+}
+
+// One warp transfers a receive row. Unlike EM, no output fan-out or padding is
+// needed. Metadata and scale loads overlap the outstanding token-row load.
+template <int HiddenInt4, ncclEpDispQuant_t Recipe, int ScaleInt4PerLane,
+          int ScaleTmaRowBytes, int PullWarps>
+__device__ __forceinline__ void dispatch_pull_flat(const dispatch_pull_param_t& p) {
+    static_assert(Recipe == NCCL_EP_DISP_QUANT_NONE || Recipe == NCCL_EP_DISP_QUANT_FWD);
+    constexpr bool kScales = Recipe == NCCL_EP_DISP_QUANT_FWD;
+    constexpr bool kScaleTma = kScales && ScaleTmaRowBytes > 0;
+    using TokenStage = PullTmaStage<HiddenInt4 * 16>;
+    using ScaleStage = PullTmaStage<kScaleTma ? ScaleTmaRowBytes : 16>;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    extern __shared__ uint8_t smem[];
+    TokenStage token_stage;
+    ScaleStage scale_stage;
+    token_stage.init(lane, smem + warp * TokenStage::smem_bytes_per_warp);
+    if constexpr (kScaleTma) {
+        scale_stage.init(lane, smem + PullWarps * TokenStage::smem_bytes_per_warp +
+                                   warp * ScaleStage::smem_bytes_per_warp);
+    }
+    TokenStage::block_init_fence();
+    if (!p.unfused_sync) {
+        lsa_grid_head_gate(p.dcomm, p.head_sync_flag);
+    }
+    const int num_recv = *p.num_recv_tokens_dev;
+    EP_DEVICE_ASSERT(num_recv <= p.caller_num_recv_tokens);
+    const int total_warps = gridDim.x * PullWarps;
+    const int rows_per_warp = nccl_ep::ceil_div(num_recv, total_warps);
+    const int first = (blockIdx.x * PullWarps + warp) * rows_per_warp;
+
+    for (int slot = first; slot < min(first + rows_per_warp, num_recv); ++slot) {
+        dispatch_pull_flat_row<HiddenInt4, kScales, kScaleTma, ScaleInt4PerLane>(
+            p, slot, lane, token_stage, scale_stage);
+    }
+    bulk_drain(lane);
+    __syncthreads();
+    if (!p.unfused_sync) {
+        lsa_grid_tail_barrier(p.dcomm, p.grid_barrier_counter, p.head_sync_flag);
+    }
 }
 
 } // namespace ht_ep
