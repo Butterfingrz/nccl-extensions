@@ -411,7 +411,7 @@ TEST_F(HandleMapsTest, S2DExpertMajorPermute) {
     }
     // Count mode builds the FLAT s2d during dispatch, not UpdateHandle, so there is nothing to
     // inspect here; only scan mode fills it at UpdateHandle.
-    if (!ht_em_ag_scan_mode_active()) {
+    if (!ht_ag_scan_mode_active()) {
         GTEST_SKIP() << "count mode defers FLAT s2d to post-dispatch";
     }
 
@@ -449,6 +449,8 @@ TEST_F(HandleMapsTest, S2DExpertMajorPermute) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    // These tests inspect scan-produced maps before any dispatch runs.
+    setenv("NCCL_EP_HT_AG_SCAN_MODE", "1", 1);
     if (!ep_bootstrap(argc, argv, "te_ep_hmaps_uid")) return 0;
     int ret = RUN_ALL_TESTS();
     ep_teardown();

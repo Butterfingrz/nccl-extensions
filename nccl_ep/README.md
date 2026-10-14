@@ -571,17 +571,48 @@ locally reduced row to the source rank, where contributions from destination
 ranks are summed. Forward and backward operations use handle-owned routing
 maps, including the original top-k positions needed for backward weights.
 
-Flat pull/push uses routing-map exchange and scan during handle update,
-regardless of `NCCL_EP_HT_EM_AG_SCAN_MODE`.
-`NCCL_EP_HT_UNFUSED_SYNC=1` selects standalone head/tail synchronization;
-otherwise synchronization runs inside the payload kernels.
+Measure transport choices over the full update, dispatch, and combine sequence.
+Expert-major pull/push also eliminates separate expert-layout permutation and
+gather work; flat rows are already locally reduced by the caller. Flat push
+still writes peer staging before the final reduction, so wider rows can favor
+the existing transport even when fused metadata reduces dispatch overhead.
+
+Transport, metadata preparation, and synchronization are separate choices:
+
+| Control | Effect for HT flat layout |
+| --- | --- |
+| `NCCL_EP_HT_PULL_PUSH=1` | Select pull dispatch and push combine. |
+| `NCCL_EP_HT_AG_SCAN_MODE=1` | Force routing-map exchange and scan instead of fused metadata for pull/push. |
+| `NCCL_EP_HT_COUNT_UNFUSED=1` | Retain the scan path for flat metadata preparation. |
+| `NCCL_EP_HT_UNFUSED_SYNC=1` | With pull/push, run head/tail synchronization in standalone kernels instead of inside the payload kernels. Does not disable fused metadata. |
+
+The metadata controls now use the `NCCL_EP_HT_` prefix instead of
+`NCCL_EP_HT_EM_`. Update existing environment settings; the old names are
+no longer parsed.
+
+`NCCL_EP_HT_COUNT_UNFUSED=1` selects unfused count exchange for EM default
+transport and scan metadata for flat pull/push. EM pull/push does not use
+this override; use `NCCL_EP_HT_AG_SCAN_MODE=1` to force its scan path.
+
+When eligible, fused metadata stages local routing information during
+`ncclEpUpdateHandle` and builds receive maps during dispatch. It is supported with pull/push within one LSA team. Eager sizing, explicit update-time layout outputs, and unsupported
+metadata configurations retain the scan path. Enabling fused metadata alone
+does not select pull/push.
+
+To use fused metadata with a fixed receive budget, omit count/offset outputs
+from `ncclEpUpdateHandle`; request needed counters through the dispatch
+`layout_info` argument and consume them after that dispatch completes on the
+stream. All ranks must agree whether early layout outputs are requested.
+Flat expert counters use `ncclInt32`; the total receive counter accepts
+`ncclInt32` or `ncclInt64`. Flat layout does not provide expert offsets.
 
 Pull/push currently requires one LSA team, top-k at most 32, and at most 65535
 experts, with at most 128 ranks in the LSA team. It cannot be combined with the
 `NCCL_EP_HT_EM_LOCAL_DUP` or `NCCL_EP_HT_EM_NVLINK_DUP` overrides. Dispatch
 supports `NCCL_EP_DISP_QUANT_NONE` and `NCCL_EP_DISP_QUANT_FWD` (forwarded
 scales). Group-level transport and synchronization settings must match across
-ranks. Imported handles retain the scan-built routing maps.
+ranks. For imported backward handles, snapshot handle memory after forward
+dispatch has completed so the snapshot includes dispatch-built routing maps.
 
 Combine supports `NCCL_EP_COMB_QUANT_NONE`; MXFP8 combine is not supported.
 Backward weight tensors use the handle's top-k width. Each token's nonnegative

@@ -290,6 +290,8 @@ TEST_F(HtStaleRoutingMapTest, StaleTailTriggersIllegalAddress) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    // This regression specifically checks the bitmap AllGather tail clear.
+    setenv("NCCL_EP_HT_AG_SCAN_MODE", "1", 1);
     if (!ep_bootstrap(argc, argv, "te_ep_ht_stale_routing_map_uid")) return 0;
     int ret = RUN_ALL_TESTS();
     ep_teardown();

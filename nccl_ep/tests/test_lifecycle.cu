@@ -582,8 +582,8 @@ TEST_F(LifecycleTest, ScanWorkspaceSharedAcrossHandles) {
     NCCL_ASSERT(ncclEpHandleDestroy(h1));
 
     // The scan-mode EM local-permute path additionally shares its token-to-slot bridge.
-    // This branch runs in the suite's NCCL_EP_HT_EM_AG_SCAN_MODE rerun.
-    if (ht_em_ag_scan_mode_active()) {
+    // This branch runs in the suite's NCCL_EP_HT_AG_SCAN_MODE rerun.
+    if (ht_ag_scan_mode_active()) {
         ncclEpHandle_t em1 = nullptr;
         ncclEpHandle_t em2 = nullptr;
         NCCL_ASSERT(ncclEpInitHandle(

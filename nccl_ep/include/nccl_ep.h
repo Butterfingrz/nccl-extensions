@@ -408,6 +408,11 @@ ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group);
 // Tensor-descriptor fields are optional (NULL = not provided). Each tensor
 // field is a pointer to a caller-owned descriptor (stack/static/struct-embedded
 // or from ncclEpTensorAlloc).
+// HT count mode can publish expert_counters and recv_total_counter during
+// Dispatch instead of UpdateHandle. Requesting either output (or EM offsets)
+// at UpdateHandle selects early metadata production: all ranks must agree on
+// whether any such update-time output is requested. Output buffers are local
+// and may differ across ranks. recv_topk_idx_kind alone does not request counts.
 typedef struct {
     unsigned int size;                // = sizeof(this struct); first field, never moves
     unsigned int magic;               // = NCCL_EP_MAGIC; second field, never moves
@@ -990,7 +995,7 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //                                (they are then written there, before dispatch); omitting them keeps
 //                                the fused exchange, in which the recv count is known only after the
 //                                first forward dispatch. Outside count mode (multiple LSA teams,
-//                                NCCL_EP_HT_EM_AG_SCAN_MODE, EM duplication modes) dispatch leaves
+//                                NCCL_EP_HT_AG_SCAN_MODE, EM duplication modes) dispatch leaves
 //                                these tensors untouched; request them from ncclEpUpdateHandle there.
 //                              * For LL mode, layout-specific counter tensors must be provided (see ncclEpLayoutInfo_t doc).
 //                                * Expert-major layout: expert_counters tensor is required.

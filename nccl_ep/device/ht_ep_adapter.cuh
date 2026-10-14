@@ -24,6 +24,10 @@
 namespace nccl_ep {
 namespace ht {
 
+// Source-token granularity of flat fused metadata. Each chunk carries one
+// deduplicated count per destination rank; payload width does not affect it.
+constexpr int kFlatMetadataChunkTokens = 256;
+
 // Count-mode receiver-table row width cap (fixed [flat2em|weights] row stride in the group
 // IPC tables). Also caps HT EM local-permute num_topk (local_permute_reduce packs in
 // ceil(kEpCountMaxTopk/32) warp chunks).
@@ -155,7 +159,8 @@ void pack_topk_and_count_row(
     int32_t* cnt_rank,
     int32_t* cnt_expert,
     int num_sms,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int32_t* chunk_counts);
 
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob (for dispatch input)
@@ -514,7 +519,8 @@ ncclResult_t launch_dispatch_pull(
     bool nucs,
     bool flat,
     int64_t* recv_topk_idx,
-    int output_expert_base);
+    int output_expert_base,
+    int32_t* retained_slots);
 
 // Minimum shared-memory bytes launch_dispatch_pull requires for a given row width
 // (int4 units): what a single pull warp needs, static and dynamic. Callers compare this

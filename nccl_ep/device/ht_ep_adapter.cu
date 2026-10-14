@@ -424,7 +424,7 @@ template void pack_topk_idx<int32_t>(const int32_t*, uint16_t*, uint16_t*, int, 
 template void pack_topk_idx<int64_t>(const int64_t*, uint16_t*, uint16_t*, int, int, int, cudaStream_t);
 
 // ============================================================================
-// Pull-native metadata (gated by NCCL_EP_HT_EM_AG_SCAN_MODE, see dispatch_pull_count_capable):
+// Pull-native metadata (gated by NCCL_EP_HT_AG_SCAN_MODE, see dispatch_pull_count_capable):
 // count-row histogram + map build
 // ============================================================================
 // Shared-memory histogram budget of pack_topk_and_count_row_kernel.
@@ -436,11 +436,12 @@ __host__ __device__ inline bool s_hist_ints_fit(int num_experts, int n_ranks) {
 }
 
 // Pack the handle-local top-k snapshot and accumulate its send-count histogram.
-template <typename TopkIdxT>
+template <typename TopkIdxT, bool FlatChunks>
 __global__ void pack_topk_and_count_row_kernel(
     const TopkIdxT* __restrict__ topk_idx, uint16_t* __restrict__ topk_idx_u16, int num_tokens,
     int max_tokens, int num_topk, int experts_per_rank, int num_experts,
-    int32_t* __restrict__ cnt_rank, int32_t* __restrict__ cnt_expert) {
+    int32_t* __restrict__ cnt_rank, int32_t* __restrict__ cnt_expert,
+    int32_t* __restrict__ chunk_counts) {
     // Per-CTA histogram in shared memory ([cnt_expert(num_experts) | cnt_rank(nRanks)], sized by the launcher; empty
     // when it does not fit, then the counts go straight to global memory as before), flushed once per CTA.
     extern __shared__ int32_t s_hist[];
@@ -474,6 +475,9 @@ __global__ void pack_topk_and_count_row_kernel(
             if (nccl_ep::test_bit(seen, dr)) continue;
             nccl_ep::set_bit(seen, dr);
             atomicAdd(&h_rank[dr], 1);
+            if constexpr (FlatChunks) {
+                atomicAdd(chunk_counts + static_cast<size_t>(token / kFlatMetadataChunkTokens) * n_ranks + dr, 1);
+            }
         }
     }
     if (use_smem) {
@@ -489,7 +493,7 @@ template <typename TopkIdxT>
 void pack_topk_and_count_row(
     const TopkIdxT* topk_idx, uint16_t* topk_idx_u16, int num_tokens, int max_tokens, int num_topk,
     int experts_per_rank, int num_experts, int32_t* cnt_rank, int32_t* cnt_expert, int num_sms,
-    cudaStream_t stream) {
+    cudaStream_t stream, int32_t* chunk_counts) {
     // Dynamic shared memory: one per-CTA histogram of num_experts + nRanks ints when it fits, else none.
     const int n_ranks = (num_experts + experts_per_rank - 1) / experts_per_rank;
     const bool use_smem_hist = s_hist_ints_fit(num_experts, n_ranks);
@@ -501,15 +505,21 @@ void pack_topk_and_count_row(
     int grid = nccl_ep::ceil_div(max_tokens, block);
     if (grid < 1) grid = 1;
     if (num_sms > 0 && grid > num_sms) grid = num_sms;
-    pack_topk_and_count_row_kernel<<<grid, block, smem, stream>>>(
-        topk_idx, topk_idx_u16, num_tokens, max_tokens, num_topk, experts_per_rank, num_experts,
-        cnt_rank, cnt_expert);
+    if (chunk_counts != nullptr) {
+        pack_topk_and_count_row_kernel<TopkIdxT, true><<<grid, block, smem, stream>>>(
+            topk_idx, topk_idx_u16, num_tokens, max_tokens, num_topk, experts_per_rank, num_experts,
+            cnt_rank, cnt_expert, chunk_counts);
+    } else {
+        pack_topk_and_count_row_kernel<TopkIdxT, false><<<grid, block, smem, stream>>>(
+            topk_idx, topk_idx_u16, num_tokens, max_tokens, num_topk, experts_per_rank, num_experts,
+            cnt_rank, cnt_expert, nullptr);
+    }
 }
 
 template void pack_topk_and_count_row<int32_t>(
-    const int32_t*, uint16_t*, int, int, int, int, int, int32_t*, int32_t*, int, cudaStream_t);
+    const int32_t*, uint16_t*, int, int, int, int, int, int32_t*, int32_t*, int, cudaStream_t, int32_t*);
 template void pack_topk_and_count_row<int64_t>(
-    const int64_t*, uint16_t*, int, int, int, int, int, int32_t*, int32_t*, int, cudaStream_t);
+    const int64_t*, uint16_t*, int, int, int, int, int, int32_t*, int32_t*, int, cudaStream_t, int32_t*);
 
 // ============================================================================
 // Kernel: Convert sparse topk_weights to dense prob
@@ -2580,7 +2590,8 @@ ncclResult_t launch_dispatch_pull(
     bool nucs,
     bool flat,
     int64_t* recv_topk_idx,
-    int output_expert_base) {
+    int output_expert_base,
+    int32_t* retained_slots) {
     assert(experts_per_rank > 0 && top_k <= ::ht_ep::kPullDispatchMaxActive);
     assert(row_bytes > 0 && (row_bytes % 16) == 0);
     assert(top_k > 0);
@@ -2598,6 +2609,7 @@ ncclResult_t launch_dispatch_pull(
     p.flat = flat;
     p.recv_topk_idx = recv_topk_idx;
     p.output_expert_base = output_expert_base;
+    p.retained_slots = retained_slots;
     p.recv_x_em = recv_x_em;
     p.recv_topk_weights_em = recv_topk_weights_em;
     p.recv_x_scale_em = fwd ? static_cast<uint8_t*>(recv_x_scale_em) : nullptr;

@@ -207,7 +207,7 @@ done
 
 # Scan mode (routing-map AllGather): re-run the EM output-layout suites here for
 # count-vs-scan layout coverage.
-export NCCL_EP_HT_EM_AG_SCAN_MODE=1
+export NCCL_EP_HT_AG_SCAN_MODE=1
 for entry in "${SUITES[@]}"; do
     IFS='|' read -r bin desc em <<<"${entry}"
     [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${bin}" ]] || continue
@@ -222,11 +222,11 @@ done
 # default (count-mode) pass's only DROP coverage, and scan mode's overflow/drop clamp otherwise
 # goes untested.
 [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_overflow_drop" ]] && run_suite "test_ht_overflow_drop" "EP HT Overflow Drop Tests (Scan)"
-unset NCCL_EP_HT_EM_AG_SCAN_MODE
+unset NCCL_EP_HT_AG_SCAN_MODE
 
 # Unfused count mode: publishes the EM recv-count tables at UpdateHandle time like scan,
 # so gets the same em_affected rerun plus test_elastic_buffer's explicit one.
-export NCCL_EP_HT_EM_COUNT_UNFUSED=1
+export NCCL_EP_HT_COUNT_UNFUSED=1
 for entry in "${SUITES[@]}"; do
     IFS='|' read -r bin desc em <<<"${entry}"
     [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "${bin}" ]] || continue
@@ -234,12 +234,12 @@ for entry in "${SUITES[@]}"; do
     run_suite "${bin}" "${desc} (Unfused Count)"
 done
 [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_elastic_buffer" ]] && run_suite "test_elastic_buffer" "EP Elastic Buffer Tests (Unfused Count)"
-unset NCCL_EP_HT_EM_COUNT_UNFUSED
+unset NCCL_EP_HT_COUNT_UNFUSED
 
 # Pull-dispatch / push-combine for EM and FLAT within one NVLink LSA team.
 # Reuse the existing layout, backward, quantization, and handle-interleaving suites.
 # Pull-count (receiver-pull map build, no AllGather/scan) is the default fused path here, same
-# NCCL_EP_HT_EM_AG_SCAN_MODE fallback gate as EM local-permute. Also exercises the DROP/
+# NCCL_EP_HT_AG_SCAN_MODE fallback gate as EM local-permute. Also exercises the DROP/
 # phantom-row overflow path via the local-permute tests, plus the flat prefix-DROP case.
 # Other overflow tests exercise specific transports or early layout-query contracts and
 # are excluded from this focused rerun.
@@ -261,10 +261,10 @@ OVERFLOW_DROP_PULL_COUNT_FILTER="HtOverflowDropTest.DispatchCombineContinueOnOve
 unset NCCL_EP_HT_PULL_PUSH
 unset NCCL_LSA_TEAM_SIZE
 
-# Pull-push scan rerun: same NCCL_EP_HT_EM_AG_SCAN_MODE fallback that forces EM local-permute
+# Pull-push scan rerun: same NCCL_EP_HT_AG_SCAN_MODE fallback that forces EM local-permute
 # back to scan, applied here to confirm pull-push's scan path still matches.
 export NCCL_EP_HT_PULL_PUSH=1
-export NCCL_EP_HT_EM_AG_SCAN_MODE=1
+export NCCL_EP_HT_AG_SCAN_MODE=1
 export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
 for entry in "${SUITES[@]}"; do
     IFS='|' read -r bin desc _ <<<"${entry}"
@@ -276,7 +276,7 @@ done
     run_suite "test_ht_overflow_drop" "EP HT Flat Overflow Drop (Pull-Push, Scan)" 4 \
         "HtOverflowDropTest.DispatchCombineContinueOnOverflow"
 unset NCCL_EP_HT_PULL_PUSH
-unset NCCL_EP_HT_EM_AG_SCAN_MODE
+unset NCCL_EP_HT_AG_SCAN_MODE
 unset NCCL_LSA_TEAM_SIZE
 
 # Pull-push unfused-sync rerun: same suites, pull-count default (no AG_SCAN_MODE), with the

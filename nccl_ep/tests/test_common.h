@@ -45,15 +45,15 @@ static inline bool ht_pull_push_active() {
     return env_flag_active("NCCL_EP_HT_PULL_PUSH");
 }
 
-// True when the scan (routing-map AllGather) fallback is active (NCCL_EP_HT_EM_AG_SCAN_MODE).
-static inline bool ht_em_ag_scan_mode_active() {
-    return env_flag_active("NCCL_EP_HT_EM_AG_SCAN_MODE");
+// True when the scan (routing-map AllGather) fallback is active (NCCL_EP_HT_AG_SCAN_MODE).
+static inline bool ht_ag_scan_mode_active() {
+    return env_flag_active("NCCL_EP_HT_AG_SCAN_MODE");
 }
 
-// True when count mode is forced unfused (NCCL_EP_HT_EM_COUNT_UNFUSED); like scan mode,
+// True when count mode is forced unfused (NCCL_EP_HT_COUNT_UNFUSED); like scan mode,
 // it publishes the EM recv-count tables at UpdateHandle time.
-static inline bool ht_em_count_unfused_active() {
-    return env_flag_active("NCCL_EP_HT_EM_COUNT_UNFUSED");
+static inline bool ht_count_unfused_active() {
+    return env_flag_active("NCCL_EP_HT_COUNT_UNFUSED");
 }
 
 // True when HT EM nvlink-dup mode is active (NCCL_EP_HT_EM_NVLINK_DUP).
@@ -68,11 +68,11 @@ static inline bool ht_em_local_dup_active() {
 
 // True when count mode is active (fused or unfused) for EM local-permute and FLAT handles: the
 // recv map (s2d) is built inside dispatch, not at UpdateHandle. The EM duplication modes,
-// pull-push and NCCL_EP_HT_EM_AG_SCAN_MODE keep the scan path. Env-only: assumes a single LSA
+// pull-push and NCCL_EP_HT_AG_SCAN_MODE keep the scan path. Env-only: assumes a single LSA
 // team, a non-eager group and zero_copy != ON (each of which also falls back to scan); prefer
 // the handle overload where a handle exists.
 static inline bool ht_count_mode_active() {
-    return !ht_em_ag_scan_mode_active() && !ht_em_nvlink_dup_active() &&
+    return !ht_ag_scan_mode_active() && !ht_em_nvlink_dup_active() &&
            !ht_em_local_dup_active() && !ht_pull_push_active();
 }
 
@@ -80,7 +80,7 @@ static inline bool ht_count_mode_active() {
 // ncclEpHandle_test_getNumRecvTokens() is not valid until after the first dispatch. Unfused
 // count mode wires it at UpdateHandle time, like scan.
 static inline bool ht_count_fused_active() {
-    return ht_count_mode_active() && !ht_em_count_unfused_active();
+    return ht_count_mode_active() && !ht_count_unfused_active();
 }
 
 // Allocate a tensor descriptor and bind it to a caller-owned device buffer.
@@ -107,7 +107,7 @@ static inline bool ht_count_mode_active(ncclEpHandle_t handle) {
 }
 
 static inline bool ht_count_fused_active(ncclEpHandle_t handle) {
-    return ht_count_mode_active(handle) && !ht_em_count_unfused_active();
+    return ht_count_mode_active(handle) && !ht_count_unfused_active();
 }
 
 static ncclComm_t g_comm = nullptr;

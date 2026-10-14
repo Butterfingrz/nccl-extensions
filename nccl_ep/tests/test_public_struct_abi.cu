@@ -330,8 +330,8 @@ TEST_F(PublicStructAbiRuntimeTest, ExplicitPushPullOverridesEnvironment) {
 }
 
 TEST_F(PublicStructAbiRuntimeTest, ExplicitMetaPolicyOverridesLegacyEnvironment) {
-    ScopedHtFlowEnv scan_env("NCCL_EP_HT_EM_AG_SCAN_MODE", "1");
-    ScopedHtFlowEnv unfused_env("NCCL_EP_HT_EM_COUNT_UNFUSED", "1");
+    ScopedHtFlowEnv scan_env("NCCL_EP_HT_AG_SCAN_MODE", "1");
+    ScopedHtFlowEnv unfused_env("NCCL_EP_HT_COUNT_UNFUSED", "1");
     ncclEpGroupConfig_t config = htFlowTestConfig();
     config.ht_flow = NCCL_EP_HT_FLOW_PUSH_PULL;
     config.meta_exchange_policy = NCCL_EP_META_EXCHANGE_REQUIRE_FUSED;

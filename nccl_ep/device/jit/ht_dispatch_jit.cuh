@@ -610,6 +610,25 @@ inline size_t pull_device_smem_optin() {
     return cached_cap;
 }
 
+// Grid-wide gates require the requested blocks to fit the resident-thread budget.
+inline int pull_device_max_threads_per_sm() {
+    static thread_local int cached_dev = -1;
+    static thread_local int cached_cap = 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        return 1024;
+    }
+    if (dev != cached_dev) {
+        int cap = 0;
+        if (cudaDeviceGetAttribute(&cap, cudaDevAttrMaxThreadsPerMultiProcessor, dev) != cudaSuccess || cap <= 0) {
+            return 1024;
+        }
+        cached_cap = cap;
+        cached_dev = dev;
+    }
+    return cached_cap;
+}
+
 // Non-zero => move the QUANT_FWD scale row by TMA through smem instead of a register-held
 // ld/st pair. Requires a 16B-multiple row (cp.async.bulk granularity) and enough smem.
 inline int pull_scale_tma_row_bytes(int hidden_int4, ncclEpDispQuant_t recipe, int scale_row_bytes,
@@ -636,7 +655,9 @@ inline std::string dispatch_pull_jit_source(int hidden_int4, int blocks_per_sm, 
     if (flat) {
         src << "  ::ht_ep::dispatch_pull_flat<" << hidden_int4 << ", "
             << ::nccl_ep::jit::dispatch_recipe_literal(recipe) << ", " << scale_int4_per_lane
-            << ", " << scale_tma_row_bytes << ", " << pull_warps << ">(p);\n}\n";
+            << ", " << scale_tma_row_bytes << ", " << pull_warps << ", "
+            << ::nccl_ep::jit::bool_literal(fused_map) << ", " << top_k << ", "
+            << kFlatMetadataChunkTokens << ">(p);\n}\n";
         return src.str();
     }
     src << "  ::ht_ep::dispatch_pull<" << hidden_int4 << ", " << pull_stage_literal(hidden_int4)
@@ -657,7 +678,10 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
-    const int blocks_per_sm = pick_pull_blocks_per_sm(hidden_int4);
+    const int max_cta_threads = param.flat ? ::ht_ep::kPullDispatchMaxPullWarps * 32
+        : ::ht_ep::pull_dispatch_threads(::ht_ep::kPullDispatchMaxPullWarps);
+    const int blocks_per_sm = std::max(1, std::min(pick_pull_blocks_per_sm(hidden_int4),
+        pull_device_max_threads_per_sm() / max_cta_threads));
     // Per-lane int4 capacity for the FWD scale row, sized from the actual scale row so
     // any scale dtype / quantization block size fits (1 for NONE, where scale_row_bytes==0).
     const int scale_int4_per_lane = std::max(1, ((param.scale_row_bytes / 16) + 31) / 32);
@@ -670,8 +694,9 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
     const int map_warps = fused_map && !param.flat ? ::ht_ep::kPullDispatchMapWarps : 0;
     size_t map_smem_bytes = 0;
     if (param.flat) {
-        // Preserve the existing warp budget; flat scan uses no map scratch.
-        map_smem_bytes = 2 * sizeof(int);
+        // Fused flat metadata uses per-warp counts and shared row bounds.
+        const int map_ints = fused_map ? ::ht_ep::kPullDispatchMaxPullWarps + 2 : 2;
+        map_smem_bytes = map_ints * sizeof(int);
     } else if (fused_map) {
         map_smem_bytes = ::ht_ep::dispatch_pull_map_smem_ints(
             param.lsa_team_size, param.experts_per_rank) * sizeof(std::int32_t);
@@ -701,8 +726,11 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
              << "_r" << static_cast<int>(recipe) << "_s" << scale_int4_per_lane
              << "_st" << scale_tma_row_bytes << "_w" << pull_warps
              << "_fm" << (fused_map ? 1 : 0) << (param.flat ? "_flat" : "");
-        if (fused_map) {
-            name << "_k" << param.top_k << "_nr" << param.lsa_team_size << "_e" << param.experts_per_rank;
+        if (fused_map || param.flat) {
+            name << "_k" << param.top_k;
+        }
+        if (fused_map && !param.flat) {
+            name << "_nr" << param.lsa_team_size << "_e" << param.experts_per_rank;
         }
         if (fused_map) name << "_cm" << map_smem_bytes;
         return name.str();

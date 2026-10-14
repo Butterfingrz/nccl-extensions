@@ -68,7 +68,7 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
     ASSERT_NE(h, nullptr);
 
     // recv_total_counter: true (pre-drop) per-rank recv total, written by the
-    // preprocessing scan in ncclEpUpdateHandle.
+    // scan at handle update, or fused metadata at dispatch.
     int32_t* d_recv_total = nullptr;
     CUDA_ASSERT(cudaMalloc(&d_recv_total, sizeof(int32_t)));
     CUDA_ASSERT(cudaMemset(d_recv_total, 0, sizeof(int32_t)));
@@ -88,8 +88,11 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
     li.recv_total_counter = t_recv_total;
     li.expert_counters = t_expert_cnt;
 
-    // UpdateHandle runs the scan; with DROP it must not trap on overflow.
-    NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_, &li, g_stream));
+    // Use the same case for scan and fused metadata, without duplicating the test.
+    const bool fused = ht_pull_push_active() && !ht_em_local_dup_active() && !ht_em_nvlink_dup_active() &&
+                       !ht_ag_scan_mode_active() && !ht_count_unfused_active() &&
+                       ncclEpHandle_test_getNRanksPerNode(h) == g_nranks;
+    NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_, fused ? nullptr : &li, g_stream));
     ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
         << "Rank " << g_rank << ": ncclEpUpdateHandle trapped on recv overflow; "
            "NCCL_EP_OVERFLOW_DROP should drop tokens instead of __trap().";
@@ -107,18 +110,21 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
             ? static_cast<int32_t>(kDropRecvBudget)
             : expected_true_total;
 
-    int32_t h_recv_total = -1;
-    CUDA_ASSERT(cudaMemcpy(&h_recv_total, d_recv_total, sizeof(int32_t), cudaMemcpyDeviceToHost));
-    EXPECT_EQ(h_recv_total, expected_true_total)
-        << "Rank " << g_rank << ": recv_total_counter should report the true "
-           "pre-drop recv total so callers can detect dropped tokens.";
+    if (!fused) {
+        int32_t h_recv_total = -1;
+        CUDA_ASSERT(cudaMemcpy(&h_recv_total, d_recv_total, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        EXPECT_EQ(h_recv_total, expected_true_total)
+            << "Rank " << g_rank << ": recv_total_counter should report the true "
+               "pre-drop recv total so callers can detect dropped tokens.";
 
-    // Internal recv count is clamped to the budget (overflow tokens dropped).
-    unsigned int num_recv = 0;
-    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
-    EXPECT_EQ(num_recv, static_cast<unsigned int>(expected_kept))
-        << "Rank " << g_rank << ": internal recv count must be clamped to "
-           "max_recv_tokens_per_rank on overflow.";
+        // Internal recv count is clamped to the budget (overflow tokens dropped).
+        unsigned int num_recv = 0;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+        EXPECT_EQ(num_recv, static_cast<unsigned int>(expected_kept))
+            << "Rank " << g_rank << ": internal recv count must be clamped to "
+               "max_recv_tokens_per_rank on overflow.";
+
+    }
 
     // Every token hits local expert 0 of rank 0 only. The handle-time Flat count is pre-drop on
     // every path (see ncclEpLayoutInfo_t::expert_counters); the dispatch-time count is delivered.
@@ -131,8 +137,10 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
                 << "Rank " << g_rank << " local expert " << e << " expert_counters at " << stage;
         }
     };
-    expect_expert_counts(expected_true_total, "UpdateHandle");
-    CUDA_ASSERT(cudaMemset(d_expert_cnt, 0xA5, E_local * sizeof(int32_t)));
+    if (!fused) {
+        expect_expert_counts(expected_true_total, "UpdateHandle");
+        CUDA_ASSERT(cudaMemset(d_expert_cnt, 0xA5, E_local * sizeof(int32_t)));
+    }
 
     // ── Forward dispatch ──────────────────────────────────────────────────────
     std::vector<nv_bfloat16> h_tok(kNumTokens * kHidden);
@@ -182,9 +190,22 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
         << "Rank " << g_rank << ": dispatch must complete cleanly after dropping "
            "overflow tokens (got CUDA error "
         << cudaGetErrorName(cudaGetLastError()) << ").";
-    if (ht_count_mode_active(h)) {
+    if (fused || ht_count_mode_active(h)) {
         expect_expert_counts(expected_kept, "dispatch");
     }
+
+    int32_t h_recv_total = -1;
+    CUDA_ASSERT(cudaMemcpy(&h_recv_total, d_recv_total, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(h_recv_total, expected_true_total)
+        << "Rank " << g_rank << ": recv_total_counter should report the true "
+           "pre-drop recv total so callers can detect dropped tokens.";
+
+    // Internal recv count is clamped to the budget (overflow tokens dropped).
+    unsigned int num_recv = 0;
+    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+    EXPECT_EQ(num_recv, static_cast<unsigned int>(expected_kept))
+        << "Rank " << g_rank << ": internal recv count must be clamped to "
+           "max_recv_tokens_per_rank on overflow.";
 
     // ── Forward combine (round-trip back to the senders) ──────────────────────
     nv_bfloat16* d_combined = nullptr;
