@@ -230,15 +230,13 @@ done
 [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_elastic_buffer" ]] && run_suite "test_elastic_buffer" "EP Elastic Buffer Tests (Unfused Count)"
 unset NCCL_EP_HT_EM_COUNT_UNFUSED
 
-# Pull-dispatch / push-combine (single NVLink LSA team, expert-major only). Restricted to the
-# suites with expert-major dispatch/combine coverage; the non-expert-major cases in them skip
-# via SKIP_IF_PULL_PUSH. All ranks form one LSA team so the push combine's single-team path runs.
+# Pull-dispatch / push-combine for EM and FLAT within one NVLink LSA team.
+# Reuse the existing layout, backward, quantization, and handle-interleaving suites.
 # Pull-count (receiver-pull map build, no AllGather/scan) is the default fused path here, same
 # NCCL_EP_HT_EM_AG_SCAN_MODE fallback gate as EM local-permute. Also exercises the DROP/
-# phantom-row overflow path via test_ht_overflow_drop's local-permute tests, which build their
-# own expert-major group with no zero_copy override (the other tests in that binary force FLAT
-# layout or nvlink_dup, neither of which pull-count supports, so they're filtered out here
-# rather than run unguarded).
+# phantom-row overflow path via the local-permute tests, plus the flat prefix-DROP case.
+# Other overflow tests exercise specific transports or early layout-query contracts and
+# are excluded from this focused rerun.
 PULL_PUSH_SUITES="test_output_layout test_ht_bwd test_quantization_recipe test_ht_combine_pp_interleave test_ht_dispatch_pp_interleave test_ht_compact_prob"
 export NCCL_EP_HT_EM_PULL_PUSH=1
 export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
@@ -248,7 +246,10 @@ for entry in "${SUITES[@]}"; do
     [[ " ${PULL_PUSH_SUITES} " == *" ${bin} "* ]] || continue
     run_suite "${bin}" "${desc} (Pull-Push)"
 done
-OVERFLOW_DROP_PULL_COUNT_FILTER="HtOverflowDropTest.EmLocalPermuteAlignedDropNoOob:HtOverflowDropTest.EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed"
+OVERFLOW_DROP_PULL_COUNT_FILTER="HtOverflowDropTest.DispatchCombineContinueOnOverflow:HtOverflowDropTest.EmLocalPermuteAlignedDropNoOob:HtOverflowDropTest.EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed"
+[[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_lifecycle" ]] && \
+    run_suite "test_lifecycle" "EP HT Imported Handles (Pull-Count)" 4 \
+        "LifecycleTest.ImportsRelocatedPreparedHandleMem:LifecycleTest.ImportedHandleSelectsDispatchChunkFromNumTokens"
 [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_overflow_drop" ]] && \
     run_suite "test_ht_overflow_drop" "EP HT Overflow Drop Tests (Pull-Count)" 4 "${OVERFLOW_DROP_PULL_COUNT_FILTER}"
 unset NCCL_EP_HT_EM_PULL_PUSH
@@ -265,6 +266,9 @@ for entry in "${SUITES[@]}"; do
     [[ " ${PULL_PUSH_SUITES} " == *" ${bin} "* ]] || continue
     run_suite "${bin}" "${desc} (Pull-Push, Scan)"
 done
+[[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_overflow_drop" ]] && \
+    run_suite "test_ht_overflow_drop" "EP HT Flat Overflow Drop (Pull-Push, Scan)" 4 \
+        "HtOverflowDropTest.DispatchCombineContinueOnOverflow"
 unset NCCL_EP_HT_EM_PULL_PUSH
 unset NCCL_EP_HT_EM_AG_SCAN_MODE
 unset NCCL_LSA_TEAM_SIZE

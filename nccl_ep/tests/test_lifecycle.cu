@@ -564,7 +564,6 @@ TEST_F(LifecycleTest, CallerOwnedHandleMem) {
 // topk_idx_datatype recovery).
 
 TEST_F(LifecycleTest, ImportsRelocatedPreparedHandleMem) {
-    SKIP_IF_PULL_PUSH();
 
     auto make_handle_mem = [&](size_t bytes, void** d_mem, ncclEpTensor_t** t) {
         CUDA_ASSERT(cudaMalloc(d_mem, bytes));
@@ -639,7 +638,6 @@ TEST_F(LifecycleTest, ImportsRelocatedPreparedHandleMem) {
 // group default regardless, and the test still verifies UpdateHandle and Import
 // agree.
 TEST_F(LifecycleTest, ImportedHandleSelectsDispatchChunkFromNumTokens) {
-    SKIP_IF_PULL_PUSH();
 
     constexpr int kLargeTokens = 48;
     constexpr int kLargeRecvSlots = 4 * kLargeTokens;

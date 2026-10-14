@@ -20,7 +20,7 @@
  *                          handle_mem post-forward, mutate the original buffer,
  *                          ncclEpImportHandle from the snapshot, then BWD dispatch +
  *                          BWD combine on the imported handle must reproduce the
- *                          forward routing and topk-weight grads (EM only).
+ *                          forward routing and topk-weight grads for both layouts.
  */
 
 #include "test_common.h"
@@ -41,6 +41,7 @@ static float weight_for(int rank, int token, int k) {
 
 class HtBwdTest : public EpTestBase {
 protected:
+    void run_imported_backward(bool expert_major);
     // Forward dispatch on the given handle. Inputs: tokens + topk_weights.
     // Outputs (RM): recv_x, recv_topk_weights, recv_topk_idx.
     // Outputs (EM): recv_x, recv_topk_weights (1D).
@@ -135,7 +136,6 @@ protected:
 // round-trip recovers the original source-side topk_weights.
 
 TEST_F(HtBwdTest, CombineWithGradRankMajor) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t h = make_handle(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -241,7 +241,6 @@ TEST_F(HtBwdTest, CombineWithGradExpertMajor) {
 // values with no topk_idx; verify the recv set under the same routing.
 
 TEST_F(HtBwdTest, DispatchScatterRankMajor) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t h = make_handle(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -376,10 +375,13 @@ TEST_F(HtBwdTest, DispatchScatterExpertMajor) {
 // (topk-weight grad) on that imported handle must reproduce the routing and weights
 // the original forward pass established.
 
-TEST_F(HtBwdTest, ImportedHandleSupportsBackwardExpertMajor) {
+void HtBwdTest::run_imported_backward(bool expert_major) {
+    const auto group = expert_major ? g_ep_group_em : g_ep_group;
+    const auto layout = expert_major ? NCCL_EP_LAYOUT_EXPERT_MAJOR : NCCL_EP_LAYOUT_FLAT;
+    auto* topk_idx = expert_major ? topk_idx_em_ : topk_idx_;
     size_t handle_mem_bytes = 0;
     NCCL_ASSERT(
-        ncclEpHandleMemSize(g_ep_group_em, NCCL_EP_LAYOUT_EXPERT_MAJOR, nullptr, &handle_mem_bytes, kTopK));
+        ncclEpHandleMemSize(group, layout, nullptr, &handle_mem_bytes, kTopK));
 
     auto make_handle_mem = [&](void** d_mem, ncclEpTensor_t** t) {
         CUDA_ASSERT(cudaMalloc(d_mem, handle_mem_bytes));
@@ -394,12 +396,12 @@ TEST_F(HtBwdTest, ImportedHandleSupportsBackwardExpertMajor) {
 
     ncclEpHandle_t fwd_handle = nullptr;
     NCCL_ASSERT(
-        ncclEpInitHandle(&fwd_handle, g_ep_group_em, NCCL_EP_LAYOUT_EXPERT_MAJOR, nullptr, kTopK, t_fwd_mem));
-    NCCL_ASSERT(ncclEpUpdateHandle(fwd_handle, topk_idx_em_, nullptr, g_stream));
+        ncclEpInitHandle(&fwd_handle, group, layout, nullptr, kTopK, t_fwd_mem));
+    NCCL_ASSERT(ncclEpUpdateHandle(fwd_handle, topk_idx, nullptr, g_stream));
     CUDA_ASSERT(cudaStreamSynchronize(g_stream));
 
     FwdState fwd;
-    run_forward_dispatch(fwd_handle, /*expert_major=*/true, fwd);
+    run_forward_dispatch(fwd_handle, expert_major, fwd);
 
     // Snapshot the prepared handle_mem at the post-forward point.
     CUDA_ASSERT(cudaMemcpyAsync(d_snap_mem, d_fwd_mem, handle_mem_bytes, cudaMemcpyDeviceToDevice, g_stream));
@@ -429,7 +431,7 @@ TEST_F(HtBwdTest, ImportedHandleSupportsBackwardExpertMajor) {
     state.topk_idx_datatype = ncclInt64;
     ncclEpHandle_t bwd_handle = nullptr;
     NCCL_ASSERT(ncclEpImportHandle(
-        &bwd_handle, g_ep_group_em, NCCL_EP_LAYOUT_EXPERT_MAJOR, nullptr, &state, t_snap_mem));
+        &bwd_handle, group, layout, nullptr, &state, t_snap_mem));
 
     unsigned int num_recv = 0;
     NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(bwd_handle, &num_recv));
@@ -523,6 +525,14 @@ TEST_F(HtBwdTest, ImportedHandleSupportsBackwardExpertMajor) {
     NCCL_ASSERT(ncclEpHandleDestroy(bwd_handle));
     ncclEpTensorDestroy(t_snap_mem);
     CUDA_ASSERT(cudaFree(d_snap_mem));
+}
+
+TEST_F(HtBwdTest, ImportedHandleSupportsBackwardExpertMajor) {
+    run_imported_backward(/*expert_major=*/true);
+}
+
+TEST_F(HtBwdTest, ImportedHandleSupportsBackwardRankMajor) {
+    run_imported_backward(/*expert_major=*/false);
 }
 
 // ── top-k=2 fixture (routing identical to TopK2MixedRoutingTest) ─────────────
@@ -712,13 +722,11 @@ protected:
 // CombineWithGrad + RM, top-k=2.
 // Expect: combined_topk_weights[t, k] == source-side weight w2(g_rank, t, k).
 TEST_F(HtBwdTopK2Test, CombineWithGradRankMajor) {
-    SKIP_IF_PULL_PUSH();
     run_combine_with_grad_rm(ncclInt64);
 }
 
 // Same round-trip with an int32 cached topk_idx (HT int32 support).
 TEST_F(HtBwdTopK2Test, CombineWithGradRankMajorInt32) {
-    SKIP_IF_PULL_PUSH();
     run_combine_with_grad_rm(ncclInt32);
 }
 

@@ -66,13 +66,6 @@ static inline bool ht_em_local_dup_active() {
     return env_flag_active("NCCL_EP_HT_EM_LOCAL_DUP");
 }
 
-// Skip the current test under NCCL_EP_HT_EM_PULL_PUSH, which supports expert-major only.
-#define SKIP_IF_PULL_PUSH()                                                              \
-    do {                                                                                \
-        if (ht_em_pull_push_active())                                                   \
-            GTEST_SKIP() << "NCCL_EP_HT_EM_PULL_PUSH supports expert-major layout only"; \
-    } while (0)
-
 // Allocate a tensor descriptor and bind it to a caller-owned device buffer.
 template <typename... Dims>
 static inline ncclResult_t

@@ -23,6 +23,7 @@
 #define MAX_NUM_TOPK 32
 // Sentinel for empty/padding slots in the uint16 topk routing map (pull dispatch).
 static constexpr uint16_t kTopkIdxInvalid = 0xFFFFu;
+static constexpr int kPullMaxLsaRanks = 128;
 #define MAX_NCCL_GIN_CTX_PER_COMM 4
 #define NUM_WAIT_NANOSECONDS 500
 #define MAX_SUPPORTED_TOKENS_PER_RANK 8192  // Must match kernel template in ht_ep_adapter.cu

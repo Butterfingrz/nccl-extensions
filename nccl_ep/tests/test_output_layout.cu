@@ -7,10 +7,10 @@
  *   NCCL_EP_LAYOUT_EXPERT_MAJOR — tokens grouped by local expert
  *
  * Tests (OutputLayoutTest fixture — top-k=1, each token targets one expert):
- *   RankMajorLayout           — dispatch output slot order (rank-major)
+ *   FlatLayout           — dispatch output slot order (rank-major)
  *   ExpertMajorLayout        — dispatch output slot order (expert-major)
  *   ExpertMajorWithAlignment — dispatch output with per-expert zone alignment
- *   CombineRankMajor          — dispatch + identity expert + combine recovers original values (rank-major)
+ *   CombineFlat          — dispatch + identity expert + combine recovers original values (rank-major)
  *   CombineExpertMajor       — dispatch + identity expert + combine recovers original values (expert-major)
  *   DispatchMeta             — expert_token_counts_padded and expert_token_offsets
  *   EagerRecvSizeFromLayoutInfo — query-then-allocate through the public recv_total_counter
@@ -19,7 +19,7 @@
  *                              and dispatched slot content (count-mode only)
  *
  * Tests (TopK2MixedRoutingTest fixture — top-k=2, mixed same-rank and cross-rank routing):
- *   RankMajorLayout              — correct recv counts and no duplication for same-rank pairs
+ *   FlatLayout              — correct recv counts and no duplication for same-rank pairs
  *   ExpertMajorNoAlign          — E1 duplicated from E0 for same-rank pairs; both zones distinct for cross-rank
  *   ExpertMajorAlignZeroPadding — E1 duplicated+padded for same-rank pairs; E1 filled for cross-rank
  *   ExpertMajorDupTokens        — slot-by-slot equality of E0/E1 zones for same-rank pairs (expanded em_s2d entries)
@@ -247,8 +247,7 @@ protected:
 
 // ── Test: rank-major layout ────────────────────────────────────────────────────
 
-TEST_F(OutputLayoutTest, RankMajorLayout) {
-    SKIP_IF_PULL_PUSH();
+TEST_F(OutputLayoutTest, FlatLayout) {
     ncclEpHandle_t h = make_handle(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -263,20 +262,14 @@ TEST_F(OutputLayoutTest, RankMajorLayout) {
     // rank-major: tokens from the lower-numbered contributing rank in [0,1],
     //            tokens from the higher-numbered rank in [2,3].
     // Ranks 0,2 contribute to experts 0-3; ranks 1,3 contribute to experts 4-7.
-    std::set<float> first_half(slots.begin(), slots.begin() + 2);
-    std::set<float> second_half(slots.begin() + 2, slots.end());
     if (g_rank == 0) {        // E0,E1 ← ranks 0,2
-        EXPECT_EQ(first_half, (std::set<float>{1.f, 2.f}));
-        EXPECT_EQ(second_half, (std::set<float>{9.f, 10.f}));
+        EXPECT_EQ(slots, (std::vector<float>{1.f, 2.f, 9.f, 10.f}));
     } else if (g_rank == 1) { // E2,E3 ← ranks 0,2
-        EXPECT_EQ(first_half, (std::set<float>{3.f, 4.f}));
-        EXPECT_EQ(second_half, (std::set<float>{11.f, 12.f}));
+        EXPECT_EQ(slots, (std::vector<float>{3.f, 4.f, 11.f, 12.f}));
     } else if (g_rank == 2) { // E4,E5 ← ranks 1,3
-        EXPECT_EQ(first_half, (std::set<float>{5.f, 6.f}));
-        EXPECT_EQ(second_half, (std::set<float>{13.f, 14.f}));
+        EXPECT_EQ(slots, (std::vector<float>{5.f, 6.f, 13.f, 14.f}));
     } else {                  // E6,E7 ← ranks 1,3
-        EXPECT_EQ(first_half, (std::set<float>{7.f, 8.f}));
-        EXPECT_EQ(second_half, (std::set<float>{15.f, 16.f}));
+        EXPECT_EQ(slots, (std::vector<float>{7.f, 8.f, 15.f, 16.f}));
     }
     NCCL_ASSERT(ncclEpHandleDestroy(h));
 }
@@ -367,8 +360,7 @@ TEST_F(OutputLayoutTest, ExpertMajorWithAlignment) {
 // ── Test: combine round-trip (rank-major) ─────────────────────────────────────
 // dispatch + identity expert + combine must recover the original token values.
 
-TEST_F(OutputLayoutTest, CombineRankMajor) {
-    SKIP_IF_PULL_PUSH();
+TEST_F(OutputLayoutTest, CombineFlat) {
     ncclEpHandle_t h = make_handle(nullptr);
     ASSERT_NE(h, nullptr);
 
@@ -503,7 +495,6 @@ TEST_F(OutputLayoutTest, TotalCounterDeviceEM) {
 
 // FLAT: unpadded total = sum of per-expert recv counts (kNumTokens for our routing).
 TEST_F(OutputLayoutTest, TotalCounterDeviceFLAT) {
-    SKIP_IF_PULL_PUSH();
     int32_t* d_total;
     CUDA_ASSERT(cudaMalloc(&d_total, sizeof(int32_t)));
     CUDA_ASSERT(cudaMemset(d_total, 0, sizeof(int32_t)));
@@ -666,7 +657,6 @@ TEST_F(OutputLayoutTest, FusedDispatchRecvTotalInt32Standalone) {
 // rejects undersized recv buffers before any kernel writes caller memory.
 
 TEST_F(OutputLayoutTest, EagerRecvSize) {
-    SKIP_IF_PULL_PUSH();  // exercises the FLAT sub-case
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
     gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
     gcfg.num_experts = kNumExperts;
@@ -771,7 +761,6 @@ TEST_F(OutputLayoutTest, EagerRecvSize) {
 // handle time, read it back on the host, size the dispatch outputs to it, dispatch.
 // Covers FLAT and EM -- for EM the counter reports the padded total.
 TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
-    SKIP_IF_PULL_PUSH();  // exercises the FLAT sub-case
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
     gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
     gcfg.num_experts = kNumExperts;
@@ -900,7 +889,6 @@ TEST_F(OutputLayoutTest, EagerRecvSizeFromLayoutInfo) {
 // Routing: every token on every rank → expert 0 (hosted on rank 0), top-k 1.
 // Rank 0 receives g_nranks * kNumTokens tokens; all other ranks receive zero.
 TEST_F(OutputLayoutTest, EagerZeroRecv) {
-    SKIP_IF_PULL_PUSH();  // exercises the FLAT sub-case
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
     gcfg.algorithm = NCCL_EP_ALGO_HIGH_THROUGHPUT;
     gcfg.num_experts = kNumExperts;
@@ -1534,19 +1522,19 @@ protected:
 
 // ── Test: rank-major — correct recv counts; no duplication for same-rank pairs ─
 
-TEST_F(TopK2MixedRoutingTest, RankMajorLayout) {
-    SKIP_IF_PULL_PUSH();
+TEST_F(TopK2MixedRoutingTest, FlatLayout) {
     ncclEpHandle_t h = make_handle2(nullptr);
     ASSERT_NE(h, nullptr);
 
-    unsigned int num_recv = 0;
-    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
     // Same-rank pair (ranks 0,1): token sent once despite 2 local experts targeted.
     // Cross-rank pair (ranks 2,3): T2 and T3 each from 4 sources = 8 tokens.
     const unsigned int expected = (g_rank <= 1) ? 4u : 8u;
+    unsigned int num_recv = 0;
+    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
     EXPECT_EQ(num_recv, expected);
 
     auto slots = run_dispatch2(h, static_cast<int>(num_recv), /*expert_major=*/false);
+
     std::set<float> got(slots.begin(), slots.end());
     EXPECT_EQ(got, expected_recv_set());
     NCCL_ASSERT(ncclEpHandleDestroy(h));

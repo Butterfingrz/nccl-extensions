@@ -2434,7 +2434,7 @@ void launch_lsa_map_publish(
     int32_t* layout_ready,
     int num_blocks,
     cudaStream_t stream) {
-    assert(lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
+    EP_HOST_ASSERT(lsa_team_size > 0 && lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
     ::ht_ep::lsa_map_publish_param_t p{};
     p.own_row = own_row;
     p.own_topk_snapshot = own_topk_snapshot;
@@ -2524,7 +2524,7 @@ ncclResult_t launch_dispatch_pull(
     p.flat2em_slot_map = flat2em_slot_map;
     p.srcpos_map = srcpos_map;
     p.recv_slot_to_src = recv_slot_to_src;
-    assert(lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
+    EP_HOST_ASSERT(lsa_team_size > 0 && lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
     for (int i = 0; i < lsa_team_size; i++) {
         p.peer_input_ptrs[i] = peer_input_ptrs[i];
         if (peer_weight_ptrs != nullptr) p.peer_weight_ptrs[i] = peer_weight_ptrs[i];
@@ -2691,7 +2691,7 @@ ncclResult_t launch_combine_push(
 
     ::ht_ep::combine_push_param_t p{};
     p.flat = flat;
-    assert(lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
+    EP_HOST_ASSERT(lsa_team_size > 0 && lsa_team_size <= ::ht_ep::kPullMaxLsaRanks);
     for (int i = 0; i < lsa_team_size; i++) {
         p.peer_staging_ptrs[i] = peer_staging_ptrs[i];
     }

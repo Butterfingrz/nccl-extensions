@@ -6744,7 +6744,7 @@ constexpr int kPullMapBarrierId = 1;
 // Max NVLink single-LSA-team ranks. The peer-pointer arrays live inline in the kernel
 // param struct so they ride the stream-ordered launch marshaling; a persistent host
 // staging + async H2D would race across back-to-back calls.
-constexpr int kPullMaxLsaRanks = 128;
+using ::kPullMaxLsaRanks;
 
 // Per-rank stride of a peer's published metadata row (counts + topk snapshot).
 __device__ __forceinline__ size_t pull_meta_stride(int topk_off_bytes, int tokens_per_rank) {

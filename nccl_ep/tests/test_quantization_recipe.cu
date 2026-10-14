@@ -225,7 +225,6 @@ TEST_F(QuantizationRecipeTest, HtGroupRejectsUnalignedMaxTokenBytes) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardDispatchCompletes) {
-    SKIP_IF_PULL_PUSH();
     uint8_t *d_tokens = nullptr, *d_recv_tokens = nullptr;
     float *d_scales = nullptr, *d_recv_scales = nullptr;
     float *d_topk_weights = nullptr, *d_recv_topk_weights = nullptr;
@@ -1442,7 +1441,6 @@ TEST_F(QuantizationRecipeTest, HtExpertMajorScalesForwardEagerAcceptsZeroRecvOut
 }
 
 TEST_F(QuantizationRecipeTest, DispatchNoneRejectsScaleTensors) {
-    SKIP_IF_PULL_PUSH();
     RecipeTensor tokens(ncclBfloat16);
     RecipeTensor output_tokens(ncclBfloat16);
     RecipeTensor scales(ncclFloat32, kNumTokens, kScalesPerToken);
@@ -1459,7 +1457,6 @@ TEST_F(QuantizationRecipeTest, DispatchNoneRejectsScaleTensors) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRequiresInputAndOutputScales) {
-    SKIP_IF_PULL_PUSH();
     RecipeTensor tokens(ncclFloat8e4m3);
     ncclEpDispatchInputs_t inputs = NCCL_EP_DISPATCH_INPUTS_INIT;
     ncclEpDispatchOutputs_t outputs = NCCL_EP_DISPATCH_OUTPUTS_INIT;
@@ -1472,7 +1469,6 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRequiresInputAndOutputScales) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUint8TokenDtype) {
-    SKIP_IF_PULL_PUSH();
     RecipeTensor tokens(ncclUint8, kNumTokens, 16);
     RecipeTensor output_tokens(ncclUint8, kMaxRecvSlots, 16);
     RecipeTensor input_scales(ncclUint8, kNumTokens, 16);
@@ -1491,7 +1487,6 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUint8TokenDtype) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsMismatchedScaleDtype) {
-    SKIP_IF_PULL_PUSH();
     RecipeTensor tokens(ncclFloat8e4m3);
     RecipeTensor output_tokens(ncclFloat8e4m3, kMaxRecvSlots, kHidden);
     RecipeTensor input_scales(ncclUint8, kNumTokens, 16);
@@ -1512,7 +1507,6 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsMismatchedScaleDtype) {
 // These are host-side contract tests: validation rejects the malformed byte
 // strides before dispatch can enqueue or launch a device kernel.
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedTokenRow) {
-    SKIP_IF_PULL_PUSH();
     RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, 15);
     RecipeTensor output_tokens(ncclFloat8e4m3);
     RecipeTensor input_scales(ncclUint8, kNumTokens, 16);
@@ -1531,7 +1525,6 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedTokenRow) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedScaleRow) {
-    SKIP_IF_PULL_PUSH();
     RecipeTensor tokens(ncclFloat8e4m3);
     RecipeTensor output_tokens(ncclFloat8e4m3);
     RecipeTensor input_scales(ncclUint8, kNumTokens, 15);
@@ -1550,7 +1543,6 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsUnalignedScaleRow) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsPayloadAboveGroupByteLimit) {
-    SKIP_IF_PULL_PUSH();
     RecipeTensor tokens(ncclFloat8e4m3, kNumTokens, 16);
     RecipeTensor input_scales(ncclUint8, kNumTokens, 32);
     RecipeTensor output_tokens(ncclFloat8e4m3, kMaxRecvSlots, 16);
@@ -1569,35 +1561,30 @@ TEST_F(QuantizationRecipeTest, ScalesForwardRejectsPayloadAboveGroupByteLimit) {
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsMisalignedTokenStorage) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t handle = make_handle(nullptr);
     expect_invalid_misaligned_recipe_storage(handle, MisalignedRecipeStorage::InputTokens);
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsMisalignedScaleStorage) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t handle = make_handle(nullptr);
     expect_invalid_misaligned_recipe_storage(handle, MisalignedRecipeStorage::InputScales);
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsMisalignedOutputTokenStorage) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t handle = make_handle(nullptr);
     expect_invalid_misaligned_recipe_storage(handle, MisalignedRecipeStorage::OutputTokens);
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
 }
 
 TEST_F(QuantizationRecipeTest, ScalesForwardRejectsMisalignedOutputScaleStorage) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t handle = make_handle(nullptr);
     expect_invalid_misaligned_recipe_storage(handle, MisalignedRecipeStorage::OutputScales);
     NCCL_ASSERT(ncclEpHandleDestroy(handle));
 }
 
 TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputTokenWidth) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t handle = make_handle(nullptr);
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
@@ -1611,7 +1598,6 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputTokenWidth)
 }
 
 TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsShortOutputCapacity) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t handle = make_handle(nullptr);
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
@@ -1625,7 +1611,6 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsShortOutputCapacity) {
 }
 
 TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputRowCapacities) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t handle = make_handle(nullptr);
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
@@ -1639,7 +1624,6 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputRowCapaciti
 }
 
 TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputScaleWidth) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t handle = make_handle(nullptr);
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
@@ -1653,7 +1637,6 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputScaleWidth)
 }
 
 TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputTokenDtype) {
-    SKIP_IF_PULL_PUSH();
     ncclEpHandle_t handle = make_handle(nullptr);
     ASSERT_NE(handle, nullptr);
     expect_invalid_ht_scales_forward_output(
@@ -1667,7 +1650,6 @@ TEST_F(QuantizationRecipeTest, HtScalesForwardRejectsMismatchedOutputTokenDtype)
 }
 
 TEST_F(QuantizationRecipeTest, CombineNoneRejectsDispatchWireDtype) {
-    SKIP_IF_PULL_PUSH();
     RecipeTensor tokens(ncclFloat8e4m3);
     ncclEpCombineInputs_t inputs = NCCL_EP_COMBINE_INPUTS_INIT;
     ncclEpCombineOutputs_t outputs = NCCL_EP_COMBINE_OUTPUTS_INIT;
@@ -1678,7 +1660,6 @@ TEST_F(QuantizationRecipeTest, CombineNoneRejectsDispatchWireDtype) {
 }
 
 TEST_F(QuantizationRecipeTest, NvFp4CombineRejectsUnsupportedDeviceBeforeJit) {
-    SKIP_IF_PULL_PUSH();
     if (nvfp4_supported()) GTEST_SKIP() << "requires a GPU without E2M1 FP4 support";
     // The device gate is only reachable through an otherwise-valid NVFP4 call, so this needs
     // an LL handle: NVFP4 combine is LL-only, and on the fixture's HT group the algorithm
@@ -1715,7 +1696,6 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineRejectsUnsupportedDeviceBeforeJit) {
 }
 
 TEST_F(QuantizationRecipeTest, NvFp4CombineRejectsHighThroughput) {
-    SKIP_IF_PULL_PUSH();
     // NVFP4 has no HT combine_recipe_traits specialization, so HT must be rejected up front
     // rather than at JIT time -- on every GPU, FP4-capable or not.
     RecipeTensor tokens(ncclBfloat16);
@@ -1812,7 +1792,6 @@ TEST_F(QuantizationRecipeTest, NvFp4CombineExpertMajorProducesWeightedBf16) {
 }
 
 TEST_F(QuantizationRecipeTest, NvFp4CombineRankMajorProducesBf16) {
-    SKIP_IF_PULL_PUSH();
     if (!nvfp4_supported()) GTEST_SKIP() << "NVFP4 combine requires E2M1 FP4 support";
     constexpr int kNvFp4Hidden = 4096;
     constexpr int kRmTopK = 2;

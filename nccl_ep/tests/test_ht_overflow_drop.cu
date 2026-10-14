@@ -176,6 +176,21 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
            "dispatch (got CUDA error "
         << cudaGetErrorName(cudaGetLastError()) << ").";
 
+    // Rank-major DROP retains a prefix of source rows. Checking every output
+    // catches stale staging reads for dropped tokens as well as missing survivors.
+    std::vector<nv_bfloat16> combined(kNumTokens * kHidden);
+    CUDA_ASSERT(cudaMemcpy(combined.data(), d_combined,
+                           combined.size() * sizeof(nv_bfloat16), cudaMemcpyDeviceToHost));
+    for (int t = 0; t < kNumTokens; ++t) {
+        const int source_row = g_rank * kNumTokens + t;
+        const float expected = source_row < static_cast<int>(kDropRecvBudget)
+                                   ? static_cast<float>(source_row + 1) : 0.0f;
+        for (int d = 0; d < kHidden; ++d) {
+            EXPECT_EQ(__bfloat162float(combined[t * kHidden + d]), expected)
+                << "source rank " << g_rank << " token " << t << " column " << d;
+        }
+    }
+
     // ── Cleanup ───────────────────────────────────────────────────────────────
     ncclEpTensorDestroy(t_combined);
     cudaFree(d_combined);

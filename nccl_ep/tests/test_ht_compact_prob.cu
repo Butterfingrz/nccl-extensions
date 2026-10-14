@@ -105,6 +105,7 @@ struct State {
     ncclEpLayoutInfo_t info = NCCL_EP_LAYOUT_INFO_INIT;
     bool em = false, use_i64 = false, topk_order = false;
     int topk = 0, experts = 0, capacity = 0, ntokens = 0, epoch = 0;
+    std::vector<int> source_tokens;
     Snapshot output;
 
     ~State() {
@@ -166,9 +167,18 @@ struct State {
         topk_order = inline_wire && !(order && strcasecmp(order, "expert-ascend") == 0);
     }
 
-    void update(int n, int generation) {
+    void update(int n, int generation, bool empty_last_rank) {
+        source_tokens.assign(g_nranks, n);
+        if (empty_last_rank) {
+            source_tokens.back() = 0;
+        }
+        n = source_tokens[g_rank];
         ntokens = n; epoch = generation;
         ids->sizes[0] = x->sizes[0] = w->sizes[0] = cx->sizes[0] = cw->sizes[0] = n;
+        // Empty outputs may have no storage, even though the allocation is
+        // retained here for the next nonempty update and guard checks.
+        cx->data = n ? combined_tokens.p : nullptr;
+        cw->data = n ? combined_weights.p : nullptr;
         std::vector<int64_t> host64(n * topk);
         std::vector<int32_t> host32(n * topk);
         for (int t = 0; t < n; ++t) for (int k = 0; k < topk; ++k) {
@@ -261,7 +271,7 @@ struct State {
             int identity = static_cast<int>(token_id) - 1;
             ASSERT_EQ(token_id, static_cast<float>(identity + 1));
             int source = identity / kTokens, token = identity % kTokens;
-            ASSERT_GE(source, 0); ASSERT_LT(source, g_nranks); ASSERT_LT(token, ntokens);
+            ASSERT_GE(source, 0); ASSERT_LT(source, g_nranks); ASSERT_LT(token, source_tokens[source]);
             for (int d = 0; d < kWidth; ++d) {
                 EXPECT_EQ(__bfloat162float(output.recv_x[s * kWidth + d]), token_id);
                 output.token_gradients[s * kWidth + d] = __float2bfloat16(1);
@@ -306,11 +316,15 @@ struct State {
             }
         }
         // Prove no expert contribution was silently omitted or duplicated.
-        for (int r = 0; r < g_nranks; ++r) for (int t = 0; t < ntokens; ++t) for (int k = 0; k < topk; ++k) {
-            int64_t e = route(r, t, k, topk, experts, epoch);
-            int expected = e >= g_rank * epr && e < (g_rank + 1) * epr ? 1 : 0;
-            EXPECT_EQ(seen[(r * kTokens + t) * topk + k], expected)
-                << "source=" << r << " token=" << t << " k=" << k;
+        for (int r = 0; r < g_nranks; ++r) {
+            for (int t = 0; t < source_tokens[r]; ++t) {
+                for (int k = 0; k < topk; ++k) {
+                    int64_t e = route(r, t, k, topk, experts, epoch);
+                    int expected = e >= g_rank * epr && e < (g_rank + 1) * epr ? 1 : 0;
+                    EXPECT_EQ(seen[(r * kTokens + t) * topk + k], expected)
+                        << "source=" << r << " token=" << t << " k=" << k;
+                }
+            }
         }
     }
 
@@ -386,7 +400,6 @@ protected:
     }
 
     void run(bool em, bool int64_ids, int topk, int experts = 0) {
-        if (!em) { SKIP_IF_PULL_PUSH(); }
         if (!experts) experts = topk == 8 ? 256 : 512;
         ASSERT_EQ(experts % g_nranks, 0);
         const int cap = (g_nranks * kTokens * topk + (experts / g_nranks) * (kAlignment - 1) + 127) & ~63;
@@ -394,8 +407,8 @@ protected:
         State a, b;
         ASSERT_NO_FATAL_FAILURE(a.initialize(group_, em, int64_ids, topk, experts, cap));
         ASSERT_NO_FATAL_FAILURE(b.initialize(group_, em, int64_ids, topk, experts, cap));
-        ASSERT_NO_FATAL_FAILURE(a.update(4, 0));
-        ASSERT_NO_FATAL_FAILURE(b.update(4, 7));
+        ASSERT_NO_FATAL_FAILURE(a.update(4, 0, false));
+        ASSERT_NO_FATAL_FAILURE(b.update(4, 7, false));
 
         // A's private receive outputs and saved positions survive B using
         // the same group's staging buffers. Every BWD follows that handle's FWD.
@@ -405,23 +418,80 @@ protected:
         ASSERT_NO_FATAL_FAILURE(a.backward());
         ASSERT_NO_FATAL_FAILURE(b.backward());
 
-        // Reuse the handle with fewer and then more tokens; change routing
-        // and LOCAL/GLOBAL output IDs at the same time.
+        // Reuse the handle with fewer and then more tokens; the last rank has
+        // no source tokens in the smaller step but still receives peer rows.
+        // Change routing and LOCAL/GLOBAL output IDs at the same time.
         for (int epoch = 1; epoch <= 2; ++epoch) {
-            ASSERT_NO_FATAL_FAILURE(a.update(epoch == 1 ? 2 : 4, epoch));
+            ASSERT_NO_FATAL_FAILURE(a.update(epoch == 1 ? 2 : 4, epoch, /*empty_last_rank=*/epoch == 1));
             ASSERT_NO_FATAL_FAILURE(a.dispatch(epoch, false));
             ASSERT_NO_FATAL_FAILURE(a.backward());
         }
         // Reverse caller K order without changing its selected-expert bitmap.
         // A bitmap-only/stale position map must not pass this sequence.
         for (int generation : {0, 8}) {
-            ASSERT_NO_FATAL_FAILURE(a.update(4, generation));
+            ASSERT_NO_FATAL_FAILURE(a.update(4, generation, false));
             ASSERT_NO_FATAL_FAILURE(a.dispatch(3, false));
             ASSERT_NO_FATAL_FAILURE(b.dispatch(3, false));
             ASSERT_NO_FATAL_FAILURE(a.backward());
         }
     }
 };
+
+TEST_F(HtCompactProbTest, RejectsInvalidFlatMetadata) {
+    constexpr int topk = 8, experts = 256;
+    const int capacity = g_nranks * kTokens;
+    ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, capacity, false, kTokens, &group_));
+    State s;
+    ASSERT_NO_FATAL_FAILURE(s.initialize(group_, false, false, topk, experts, capacity, kAlignment, false));
+    ASSERT_NO_FATAL_FAILURE(s.update(kTokens, 0, false));
+    ncclEpTensor_t* invalid_counts = nullptr;
+    ASSERT_NO_FATAL_FAILURE(s.tensor(&invalid_counts, 1, ncclInt64, s.counts.p, experts / g_nranks));
+    ncclEpLayoutInfo_t info = NCCL_EP_LAYOUT_INFO_INIT;
+    info.expert_counters = invalid_counts;
+    EXPECT_EQ(ncclEpUpdateHandle(s.handle, s.ids, &info, g_stream), ncclInvalidArgument);
+
+    ncclEpDispatchInputs_t input = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t output = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    input.tokens = s.x;
+    input.topk_weights = s.w;
+    output.tokens = s.rx;
+    output.topk_weights = s.rw;
+    output.topk_idx = s.ri;
+    s.ri->datatype = ncclInt32;
+    EXPECT_EQ(ncclEpDispatch(s.handle, &input, &output, nullptr, &config, g_stream), ncclInvalidArgument);
+    s.ri->datatype = ncclInt64;
+    s.ri->sizes[1] = topk - 1;
+    EXPECT_EQ(ncclEpDispatch(s.handle, &input, &output, nullptr, &config, g_stream), ncclInvalidArgument);
+    s.ri->sizes[1] = topk;
+    ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
+    ASSERT_NO_FATAL_FAILURE(s.backward());
+}
+
+TEST_F(HtCompactProbTest, RejectsBackwardWidthMismatch) {
+    constexpr int topk = 8, experts = 256;
+    const int capacity = g_nranks * kTokens;
+    ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, capacity, false, kTokens, &group_));
+    State s;
+    ASSERT_NO_FATAL_FAILURE(s.initialize(group_, false, false, topk, experts, capacity, kAlignment, false));
+    ASSERT_NO_FATAL_FAILURE(s.update(kTokens, 0, false));
+    ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
+    ncclEpCombineInputs_t input = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t output = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    ncclEpCombineConfig_t config = NCCL_EP_COMBINE_CONFIG_INIT;
+    config.pass_direction = NCCL_EP_BWD_PASS;
+    input.tokens = s.rx;
+    input.topk_weights = s.rw;
+    output.tokens = s.cx;
+    output.topk_weights = s.cw;
+    s.rw->sizes[1] = topk - 1;
+    EXPECT_EQ(ncclEpCombine(s.handle, &input, &output, &config, g_stream), ncclInvalidArgument);
+    s.rw->sizes[1] = topk;
+    s.cw->sizes[1] = topk - 1;
+    EXPECT_EQ(ncclEpCombine(s.handle, &input, &output, &config, g_stream), ncclInvalidArgument);
+    s.cw->sizes[1] = topk;
+    ASSERT_NO_FATAL_FAILURE(s.backward());
+}
 
 // Retain the process setting: this test creates differently configured groups
 // in one process to catch JIT fast-cache aliasing as well as late getenv reads.
@@ -449,7 +519,9 @@ struct ScopedGroup {
 class HtCompactProbOrderGate : public HtCompactProbTest, public ::testing::WithParamInterface<bool> {};
 
 TEST_P(HtCompactProbOrderGate, CapturedPerGroupAndGraphReplay) {
-    SKIP_IF_PULL_PUSH();
+    if (ht_em_pull_push_active()) {
+        GTEST_SKIP() << "This case exercises the native compact decoder";
+    }
     const bool em = GetParam();
     constexpr int topk = 8, experts = 256;
     const int capacity = (g_nranks * kTokens * topk + (experts / g_nranks) * 7 + 127) & ~63;
@@ -474,7 +546,7 @@ TEST_P(HtCompactProbOrderGate, CapturedPerGroupAndGraphReplay) {
     // permutation choices must remain distinct, including under graph replay.
     setenv("NCCL_EP_HT_RECV_TOPK_ORDER", "expert-ascend", 1);
     for (State* state : {&default_state, &expert, &source}) {
-        ASSERT_NO_FATAL_FAILURE(state->update(4, 0));
+        ASSERT_NO_FATAL_FAILURE(state->update(4, 0, false));
         ASSERT_NO_FATAL_FAILURE(state->dispatch(0, false));
     }
     for (State* state : {&expert, &default_state, &source, &expert}) {
@@ -603,7 +675,9 @@ TEST_F(HtCompactProbTest, DenseFallbackExpertMajor) {
 // capacity used to corrupt the compact rows immediately following staging.
 TEST_F(HtCompactProbTest, PartialZoneDrop) {
     if (g_nranks != 4 && g_nranks != 8) GTEST_SKIP() << "Partial-zone fixture requires EP4 or EP8";
-    SKIP_IF_PULL_PUSH();
+    if (ht_em_pull_push_active()) {
+        GTEST_SKIP() << "This case exercises the native compact decoder";
+    }
 
     constexpr int topk = 10, capacity = 160, alignment = 64;
     const int experts = 128 * g_nranks, tokens = 16 / g_nranks;

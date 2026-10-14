@@ -840,7 +840,7 @@ struct ncclEpGroup {
         kLocalPermute = 0, // FLAT-dispatch + local_permute kernels
         kLocalDup = 1, // dispatch dedup + local_dup/local_reduce
         kNvlinkDup = 2, // in-kernel Expert-major scatter (sender duplicates over NVLink)
-        kPullPush = 3, // NVLink pull-dispatch + push-combine (single LSA team, expert-major only)
+        kPullPush = 3, // NVLink pull-dispatch + push-combine (single LSA team, EM or FLAT)
     };
     HtEmMode ht_em_mode;
 
@@ -1238,7 +1238,7 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
         token_staging_slots = ht_max_flat_recv_tokens(ep_group);
     }
     ep_group->ht_buffers.token_staging_slots = token_staging_slots;
-    // kPullPush (expert-major only) sizes the dispatch token + prob staging to just per-rank
+    // kPullPush sizes the dispatch token + prob staging to just per-rank
     // capacity: both back the non-window pull fallback (token rows and forward topk_weights that
     // peers pull from). The combine prob region is unused (presence derived locally).
     const bool pull_push = ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush;
@@ -2599,7 +2599,12 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         } else {
             ep_group->ht_em_mode = ncclEpGroup::HtEmMode::kLocalPermute;
         }
-        // Unfused head/tail sync is only wired for the pull-push EM path.
+        if (ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush &&
+            ep_group->lsa_team_size > kPullMaxLsaRanks) {
+            fprintf(stderr, "NCCL EP: pull/push supports at most %d ranks in one LSA team\n", kPullMaxLsaRanks);
+            return ncclInvalidUsage;
+        }
+        // Unfused head/tail sync is only wired for the pull-push paths.
         if (nccl_ep_env_flag_on(ep_group->env.ht_unfused_sync) &&
             ep_group->ht_em_mode != ncclEpGroup::HtEmMode::kPullPush) {
             fprintf(stderr, "NCCL EP: NCCL_EP_HT_UNFUSED_SYNC is only supported with "
@@ -3247,7 +3252,7 @@ struct ncclEpHandle {
             // to populate the recv-indexed em_slot table.
             int32_t* token_to_recv_slot;
             // [max_recv_tokens] recv slot -> global source token id; inverse of
-            // token_to_recv_slot. Null unless em_pull_enabled(). Consumed by the
+            // token_to_recv_slot. Null unless ht_pull_enabled(). Consumed by the
             // pull dispatch kernel to read each source row over NVLink.
             int32_t* recv_slot_to_src;
             // [max_recv_tokens, num_topk] source top-k position of each flat2em hit
@@ -3301,18 +3306,18 @@ static inline bool dispatch_push_count_active(ncclEpGroup_t group, ncclEpHandle_
     return dispatch_push_count_capable(group, handle->layout);
 }
 
-// Pull EM dispatch: a variant of em_permute that pulls source rows over NVLink
-// instead of push + FLAT staging. Part of the kPullPush recipe (pull dispatch +
-// push combine); pull dispatch is never used on its own.
-static bool em_pull_enabled(ncclEpGroup_t group, ncclEpLayout_t layout) {
-    return layout == NCCL_EP_LAYOUT_EXPERT_MAJOR &&
+// Pull dispatch writes the requested layout directly from peer source rows.
+// EM scatters each pulled row to its local experts; FLAT writes one row.
+// Both are paired with push combine under the explicit kPullPush recipe.
+static bool ht_pull_enabled(ncclEpGroup_t group, ncclEpLayout_t layout) {
+    return (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR || layout == NCCL_EP_LAYOUT_FLAT) &&
            group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush;
 }
-static inline bool em_pull_enabled(ncclEpGroup_t group, ncclEpHandle_t handle) {
-    return em_pull_enabled(group, handle->layout);
+static inline bool ht_pull_enabled(ncclEpGroup_t group, ncclEpHandle_t handle) {
+    return ht_pull_enabled(group, handle->layout);
 }
 
-// Fused pull-count gate: receiver-side MAP warps build the recv-slot/EM maps in-kernel from a
+// Fused pull-count gate: receivers build the recv-slot/layout maps in-kernel from a
 // pulled count+topk row, replacing the scan (routing-map AllGather + host-side map build) that
 // pull dispatch otherwise depends on. Fused count stages per-handle metadata during UpdateHandle,
 // then pushes it to receiver inboxes and builds maps during dispatch. Eager mode needs maps
@@ -3326,22 +3331,21 @@ static inline bool dispatch_pull_count_capable(ncclEpGroup_t group, ncclEpLayout
     return !nccl_ep_env_flag_on(group->env.ht_em_ag_scan_mode) &&
            !is_internode_available(group) &&
            !group->eager_mode &&
-           group->num_local_experts <= kPullCountMaxLocalExperts &&
-           em_pull_enabled(group, layout);
+           (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR && group->num_local_experts <= kPullCountMaxLocalExperts) &&
+           ht_pull_enabled(group, layout);
 }
 static inline bool dispatch_pull_count_active(ncclEpGroup_t group, ncclEpHandle_t handle) {
     return dispatch_pull_count_capable(group, handle->layout);
 }
 
-// Push EM combine: a variant of em_permute that pushes each expert rank's locally
-// reduced token rows into the destination attn-ranks over NVLink instead of the
-// attn-ranks pulling from peer expert buffers. Part of the kPullPush recipe.
-static bool em_comb_push_enabled(ncclEpGroup_t group, ncclEpLayout_t layout) {
-    return layout == NCCL_EP_LAYOUT_EXPERT_MAJOR &&
+// Push combine returns one contribution per source token and expert rank.
+// EM first reduces local expert copies; FLAT relays the caller's reduced row.
+static bool ht_comb_push_enabled(ncclEpGroup_t group, ncclEpLayout_t layout) {
+    return (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR || layout == NCCL_EP_LAYOUT_FLAT) &&
            group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush;
 }
-static inline bool em_comb_push_enabled(ncclEpGroup_t group, ncclEpHandle_t handle) {
-    return em_comb_push_enabled(group, handle->layout);
+static inline bool ht_comb_push_enabled(ncclEpGroup_t group, ncclEpHandle_t handle) {
+    return ht_comb_push_enabled(group, handle->layout);
 }
 
 // EM + mode == kLocalDup. HT-only by design.
@@ -3449,7 +3453,7 @@ struct HtBlockLayout {
         // Pull recipe (dispatch + push combine). Adds recv_slot_to_src / srcpos_map,
         // and drops the FLAT prob_buffer / recv_topk_weights_flat scratch the push
         // path needs but pull does not.
-        const bool needs_pull_buffers = em_pull_enabled(ep_group, layout);
+        const bool needs_pull_buffers = ht_pull_enabled(ep_group, layout);
 
         // Fused-meta-dispatch sizing gate (same helper the runtime path uses). When capable,
         // weights alias the own-rank IPC table region (see ht_init_handle) and flat2em/LERM live
@@ -3857,6 +3861,13 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
         return ncclInvalidUsage;
     }
 
+    if (ht_pull_enabled(ep_group, handle->layout) &&
+        (num_topk > MAX_NUM_TOPK || ep_group->config.num_experts > kTopkIdxInvalid)) {
+        fprintf(stderr, "NCCL EP: pull-push requires num_topk <= %d and num_experts <= %u\n",
+                MAX_NUM_TOPK, static_cast<unsigned>(kTopkIdxInvalid));
+        return ncclInvalidUsage;
+    }
+
     // Eager groups size internal buffers from config.num_topk; enforce it as the
     // per-handle upper bound, and require it for Expert-Major (per-expert slot
     // expansion is unbounded without it).
@@ -4002,8 +4013,9 @@ ht_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
     } else {
         // Single LSA team: point at the group-owned probability staging (rebuilt per
         // dispatch/combine). Pull dispatch + push combine derive prob presence locally.
-        if (!em_pull_enabled(ep_group, handle->layout))
+        if (!ht_pull_enabled(ep_group, handle->layout)) {
             handle->ht.prob_buffer = ep_group->ht_buffers.prob_buffer;
+        }
         handle->ht.token_staging_buffer = nullptr;
     }
     return ncclSuccess;
@@ -4035,13 +4047,6 @@ ncclResult_t ncclEpInitHandle(
         !(ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && layout != NCCL_EP_LAYOUT_FLAT &&
           layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
         "ncclEpInitHandle: HT mode supports flat and expert-major layouts");
-    // Pull dispatch + push combine only stages expert-major traffic; its shared
-    // intra-LSA buffers are sized for that path, so reject FLAT handles up-front.
-    EP_HOST_ASSERT(
-        !(ep_group->config.algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT &&
-          ep_group->ht_em_mode == ncclEpGroup::HtEmMode::kPullPush &&
-          layout != NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
-        "ncclEpInitHandle: NCCL_EP_HT_EM_PULL_PUSH requires expert-major layout");
     EP_HOST_ASSERT(
         !(ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY && layout != NCCL_EP_LAYOUT_EXPERT_MAJOR &&
           layout != NCCL_EP_LAYOUT_RANK_MAJOR) &&
@@ -4351,6 +4356,19 @@ ncclResult_t ncclEpImportHandle(
     return ncclSuccess;
 }
 
+static ncclResult_t validate_ht_flat_counters(const ncclEpTensor_t* counters, int num_local_experts) {
+    if (counters == nullptr) {
+        return ncclSuccess;
+    }
+    if (counters->ndim != 1 || counters->datatype != ncclInt32 ||
+        counters->sizes[0] < static_cast<size_t>(num_local_experts) ||
+        (counters->data == nullptr && counters->win_hdl == ncclWindow_t{})) {
+        fprintf(stderr, "NCCL EP: HT flat expert_counters must be int32 [num_local_experts] or larger\n");
+        return ncclInvalidArgument;
+    }
+    return ncclSuccess;
+}
+
 ncclResult_t ncclEpUpdateHandle(
     ncclEpHandle_t handle,
     const ncclEpTensor_t* topk_idx,
@@ -4414,6 +4432,9 @@ ncclResult_t ncclEpUpdateHandle(
     }
 
     const ncclEpTensor_t* recv_expert_counter = layout_info ? tensor_ptr(layout_info->expert_counters) : nullptr;
+    if (handle->layout == NCCL_EP_LAYOUT_FLAT) {
+        NCCLCHECK(validate_ht_flat_counters(recv_expert_counter, ep_group->num_local_experts));
+    }
 
     const int num_experts = ep_group->config.num_experts;
     const int max_tokens = ep_group->config.max_dispatch_tokens_per_rank;
@@ -4451,12 +4472,12 @@ ncclResult_t ncclEpUpdateHandle(
     }
     // Pull dispatch consumes the uint16 topk map (produced below) instead of the bitmap;
     // skip the bitmap convert + gather entirely when pull is enabled.
-    const bool em_pull = em_pull_enabled(ep_group, handle);
+    const bool pull = ht_pull_enabled(ep_group, handle);
     // S2D and the adjacent compact source-position map use all-ones sentinels.
     // Clearing the map also covers receiver-capacity rows outside the live FWD
     // decode range, so BWD skips their gradients and cannot reuse stale positions.
-    // Pull dispatch never reads the S2D map, so skip its init under pull.
-    if (!em_pull && handle->ht.preprocessing_s2d_size > 0) {
+    // Flat pull-push retains S2D for DROP combine; EM pull-push allocates none.
+    if (handle->ht.preprocessing_s2d_size > 0) {
         CUDA_CHECK(cudaMemsetAsync(
             handle->ht.sparse_to_dense_map,
             0xFF,
@@ -4465,7 +4486,7 @@ ncclResult_t ncclEpUpdateHandle(
     }
 
     // Fused pull-count pushes count + topk during dispatch and skips the AllGather-backed scan.
-    const bool use_topk_idx_scan = em_pull && !pull_count && ep_group->ht_buffers.global_topk_idx != nullptr;
+    const bool use_topk_idx_scan = pull && !pull_count && ep_group->ht_buffers.global_topk_idx != nullptr;
 
     // The routing bitmap is not allocated under pull (the scan reads global_topk_idx),
     // so resolve the send pointer only on the bitmap path.
@@ -4475,8 +4496,8 @@ ncclResult_t ncclEpUpdateHandle(
     // dispatch (which scans the order-preserving uint16 topk map).
     // ===== Step 1: Convert sparse topk_idx to bitmap routing map =====
     // Pull modes (scan-topk or pull-count) never build the bitmap and do not allocate
-    // global_routing_map, so skip it for any em_pull path.
-    if (!count_mode && !use_topk_idx_scan && !em_pull) {
+    // global_routing_map, so skip it for any pull path.
+    if (!count_mode && !use_topk_idx_scan && !pull) {
         uint8_t* local_routing_send_ptr = global_routing_map + (max_tokens * routing_row_bytes) * ep_group->rank;
         // Pass max_tokens so the kernel zeroes the tail rows in the local send slot;
         // ncclAllGather below ships max_tokens rows and stale tail bits would otherwise
@@ -4594,11 +4615,6 @@ ncclResult_t ncclEpUpdateHandle(
     if (expert_major) {
         per_expert_counts_device = handle->ht.per_expert_counts_active;
     } else if (recv_expert_counter != nullptr) {
-        assert(recv_expert_counter->ndim == 1 && "recv_expert_counter must be 1D");
-        assert(recv_expert_counter->datatype == ncclInt32 && "HT flat: recv_expert_counter must be ncclInt32");
-        assert(
-            recv_expert_counter->sizes[0] >= static_cast<unsigned int>(ep_group->num_local_experts) &&
-            "recv_expert_counter size must be >= num_local_experts");
         ncclEpTensor_t recv_expert_counter_local;
         const ncclEpTensor_t* resolved_recv_expert_counter;
         NCCLCHECK(resolveTensorWindowBinding(
@@ -4607,7 +4623,10 @@ ncclResult_t ncclEpUpdateHandle(
             &recv_expert_counter_local,
             0,
             &resolved_recv_expert_counter));
-        assert(resolved_recv_expert_counter->data != nullptr && "recv_expert_counter data must not be null");
+        if (resolved_recv_expert_counter->data == nullptr) {
+            fprintf(stderr, "NCCL EP: HT flat expert_counters data must not be null\n");
+            return ncclInvalidArgument;
+        }
         per_expert_counts_device = static_cast<int32_t*>(resolved_recv_expert_counter->data);
     }
     // ht.expert_token_offsets is already the handle_mem slot for EM; FLAT path never reads it.
@@ -4662,13 +4681,13 @@ ncclResult_t ncclEpUpdateHandle(
     NCCLCHECK(
         nccl_ep::ht::call_metadata_preprocessing(
             global_routing_map,
-            // Pull dispatch never reads S2D or LERM; skip these scan stores under pull.
-            em_pull ? nullptr : handle->ht.sparse_to_dense_map,
+            // S2D is retained for flat DROP combine; pull does not need LERM.
+            handle->ht.sparse_to_dense_map,
             handle->ht.rdma_to_attn_map,
             handle->ht.attn_to_rdma_map,
             handle->ht.token_rank_mask,
             handle->ht.num_tokens_for_experts,
-            em_pull ? nullptr : handle->ht.local_expert_routing_map,
+            pull ? nullptr : handle->ht.local_expert_routing_map,
             per_expert_counts_device,
             handle->ht.preprocessing_scan_tmp,
             ep_group->rdma_rank,
@@ -4704,16 +4723,16 @@ ncclResult_t ncclEpUpdateHandle(
             // populate the recv-indexed em_slot table.
             em_permute_active ? handle->ht.token_to_recv_slot : nullptr,
             em_permute_active ? handle->ht.flat2em_slot_map : nullptr,
-            em_permute_active ? handle->num_topk : 0,
+            (em_permute_active || pull) ? handle->num_topk : 0,
             ep_group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP,
             // Inverse recv-slot map: consumed by pull dispatch and push combine.
-            em_pull ? handle->ht.recv_slot_to_src : nullptr,
+            pull ? handle->ht.recv_slot_to_src : nullptr,
             // Pull dispatch: scan emits the source top-k position of each hit for weights.
-            em_pull ? handle->ht.srcpos_map : nullptr,
+            pull ? handle->ht.srcpos_map : nullptr,
             // Pull dispatch: order-preserving uint16 topk map consumed by the scan instead
             // of the bitmap. Both gated on pull (em-permute single-team path).
             ep_group->ht_buffers.global_topk_idx,
-            em_pull,
+            pull,
             stream));
 
     return ncclSuccess;
@@ -4831,6 +4850,39 @@ ll::LlCombineKernel resolve_combine_enforced_kernel(const ncclEpEnvConfig& env) 
 }
 
 } // namespace
+
+static ncclResult_t validate_ht_flat_dispatch_outputs(
+    const ncclEpTensor_t* weights, const ncclEpTensor_t* indices, int top_k) {
+    if (weights == nullptr || indices == nullptr || weights->ndim != 2 || indices->ndim != 2 ||
+        weights->datatype != ncclFloat32 || indices->datatype != ncclInt64 ||
+        weights->sizes[1] != static_cast<size_t>(top_k) || indices->sizes[1] != static_cast<size_t>(top_k) ||
+        weights->sizes[0] != indices->sizes[0]) {
+        fprintf(stderr, "NCCL EP: HT flat forward dispatch requires float32 weights and int64 indices "
+                        "with matching [num_recv_slots, handle top_k] shapes\n");
+        return ncclInvalidArgument;
+    }
+    return ncclSuccess;
+}
+
+static ncclResult_t validate_ht_backward_weights(
+    const ncclEpTensor_t* input, const ncclEpTensor_t* output, bool expert_major,
+    int num_tokens, int top_k) {
+    if (input == nullptr || output == nullptr || input->datatype != ncclFloat32 ||
+        output->datatype != ncclFloat32 || output->ndim != 2 ||
+        output->sizes[0] != static_cast<size_t>(num_tokens) ||
+        output->sizes[1] != static_cast<size_t>(top_k)) {
+        fprintf(stderr, "NCCL EP: HT backward combine requires float32 weights and "
+                        "output shape [num_tokens, handle top_k]\n");
+        return ncclInvalidArgument;
+    }
+    const bool valid_input = expert_major ? input->ndim == 1
+        : input->ndim == 2 && input->sizes[1] == static_cast<size_t>(top_k);
+    if (!valid_input) {
+        fprintf(stderr, "NCCL EP: HT backward combine weights must match the forward output layout\n");
+        return ncclInvalidArgument;
+    }
+    return ncclSuccess;
+}
 
 ncclResult_t ncclEpDispatch(
     ncclEpHandle_t handle,
@@ -5404,6 +5456,9 @@ ncclResult_t ncclEpDispatch(
         const ncclEpTensor_t* recv_x = tensor_required(outputs->tokens);
         const ncclEpTensor_t* recv_topk_weights = tensor_ptr(outputs->topk_weights);
         const ncclEpTensor_t* recv_topk_idx = tensor_ptr(outputs->topk_idx);
+        if (handle->layout == NCCL_EP_LAYOUT_FLAT && pass_direction == NCCL_EP_FWD_PASS) {
+            NCCLCHECK(validate_ht_flat_dispatch_outputs(recv_topk_weights, recv_topk_idx, handle->num_topk));
+        }
         const ncclEpTensor_t* recv_scales = nullptr;
         if (recv_x->ndim == 0) {
             return ncclInvalidArgument;
@@ -5469,13 +5524,12 @@ ncclResult_t ncclEpDispatch(
             }
         }
 
-        // Pull EM dispatch reads source tokens + weights over NVLink and writes EM
-        // directly, so it skips the push kernel, the FLAT staging, and the FLAT
-        // dense-prob / weight compute below (weights are pulled per source token).
-        const bool em_pull_active = em_pull_enabled(group, handle);
+        // Pull writes the caller's layout directly from peer tokens and sparse
+        // weights, skipping push dispatch, receive staging, and prob conversion.
+        const bool pull_active = ht_pull_enabled(group, handle);
 
         // Pull dispatch forwards per-token scales (NONE and FWD recipes only).
-        if (em_pull_active && recipe != NCCL_EP_DISP_QUANT_NONE &&
+        if (pull_active && recipe != NCCL_EP_DISP_QUANT_NONE &&
             recipe != NCCL_EP_DISP_QUANT_FWD) {
             fprintf(stderr,
                     "ncclEpDispatch: NCCL_EP_HT_EM_PULL_PUSH pull dispatch "
@@ -5495,7 +5549,7 @@ ncclResult_t ncclEpDispatch(
             (prob_wire == HtProbWire::kCompact) ? combine_compact_prob_row_floats(handle->num_topk) : 0;
         // FWD only: rebuild the wire prob rows from cached topk_idx + caller topk_weights.
         float* prob_buffer = handle->ht.prob_buffer;
-        if (forward_dispatch && !em_pull_active) {
+        if (forward_dispatch && !pull_active) {
             assert(
                 handle->ht.topk_idx != nullptr &&
                 "HT FWD dispatch: ht.topk_idx missing (ncclEpUpdateHandle not called?)");
@@ -5570,7 +5624,7 @@ ncclResult_t ncclEpDispatch(
         // same convention as count_lean_build below.
         const bool pull_count_rebuild = pull_count_dispatch && forward_dispatch;
 
-        if (rcv_x_zcopy && !em_permute_active) {
+        if (rcv_x_zcopy && !em_permute_active && !pull_active) {
             NCCLCHECK(buildIntranodePtrArray<void>(group, recv_x, dispatch_output_token_ptrs));
             params.expert_output_token_ptrs = dispatch_output_token_ptrs.data();
         } else {
@@ -5632,8 +5686,9 @@ ncclResult_t ncclEpDispatch(
                 static_cast<int>(rcv_scales_zcopy));
         }
 
-        const bool copy_tokens = !rcv_x_zcopy && !em_permute_active;
-        const bool copy_scales = recipe == NCCL_EP_DISP_QUANT_FWD && !rcv_scales_zcopy && !em_permute_active;
+        const bool copy_tokens = !rcv_x_zcopy && !em_permute_active && !pull_active;
+        const bool copy_scales = recipe == NCCL_EP_DISP_QUANT_FWD && !rcv_scales_zcopy &&
+                                 !em_permute_active && !pull_active;
         auto copy_mode = group->dispatch_copy_mode;
         if (!group->eager_mode && copy_mode == nccl_ep::ht::DispatchCopyMode::kTma) {
             const auto aligned = [](const void* src, const void* dst, size_t row_bytes) {
@@ -5653,8 +5708,8 @@ ncclResult_t ncclEpDispatch(
 
         // CE copies use actual rows outside capture and bounded capacity during capture.
         unsigned int recv_copy_rows = static_cast<unsigned int>(group->max_recv_tokens);
-        if (em_permute_active) {
-            // EM: kernels read the routed count from device, so recv_x's own row count is the
+        if (em_permute_active || (pull_active && !group->eager_mode)) {
+            // Direct kernels read the routed count from device, so recv_x's row count is the
             // caller capacity here and no device->host sync is needed.
             recv_copy_rows = static_cast<unsigned int>(recv_x->sizes[0]);
         } else if (group->eager_mode || need_recv_counts) {
@@ -5875,7 +5930,7 @@ ncclResult_t ncclEpDispatch(
         }
         // Pull writes EM directly from the source buffers; the push dispatch (FLAT
         // staging) is unused. Inputs are read straight from the source windows.
-        if (!em_pull_active) {
+        if (!pull_active) {
             NCCLCHECK(
                 nccl_ep::ht::call_dispatch(
                     params,
@@ -5987,14 +6042,6 @@ ncclResult_t ncclEpDispatch(
             assert(recv_topk_weights->datatype == ncclFloat32);
             if (em) {
                 assert(recv_topk_weights->ndim == 1 && "HT EM recv_topk_weights must be 1D [num_recv_tokens]");
-            } else {
-                assert(recv_topk_weights->ndim == 2 && "HT FLAT recv_topk_weights must be 2D [num_recv_tokens, top_k]");
-                assert(recv_topk_idx->ndim == 2);
-                // dense_to_sparse_prob writes recv_topk_idx as int64, so the caller buffer must be int64.
-                assert(recv_topk_idx->datatype == ncclInt64);
-                if (recv_topk_weights->sizes[0] != recv_topk_idx->sizes[0]) {
-                    return ncclInvalidArgument;
-                }
             }
             if (recv_topk_weights->sizes[0] < recv_copy_rows) {
                 return ncclInvalidArgument;
@@ -6033,10 +6080,9 @@ ncclResult_t ncclEpDispatch(
                                                               static_cast<float*>(recv_topk_weights->data);
                 int64_t* dsp_topk_idx =
                     em_permute_active ? nullptr : (recv_topk_idx ? static_cast<int64_t*>(recv_topk_idx->data) : nullptr);
-
                 // Pull relocates weights directly from the source topk_weights row, so it
                 // needs no FLAT weight staging (prob buffer is not populated under pull).
-                if (!em_pull_active && compact_dispatch_prob) {
+                if (!pull_active && compact_dispatch_prob) {
                     nccl_ep::ht::dispatch_prob_compact_to_output(
                         group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank],
                         count_mode ? handle->ht.dispatch_push_count.lerm_landing
@@ -6049,7 +6095,7 @@ ncclResult_t ncclEpDispatch(
                         handle->ht.expert_token_offsets, handle->ht.per_expert_counts_active,
                         em_permute_active && compact_topk_order ? handle->ht.flat2em_slot_map : nullptr,
                         compact_topk_order, stream);
-                } else if (!em_pull_active)
+                } else if (!pull_active) {
                     nccl_ep::ht::dense_to_sparse_prob(
                         group->ht_buffers.dispatch_expert_output_prob_buffer_ptrs[group->lsa_rank],
                         // Count mode reads the IPC LERM landing zone here (pre-permute); the
@@ -6069,6 +6115,7 @@ ncclResult_t ncclEpDispatch(
                         dsp_em,
                         count_mode, // count mode: LERM is a packed bitmap
                         stream);
+                }
             }
         }
 
@@ -6076,7 +6123,7 @@ ncclResult_t ncclEpDispatch(
         // FLAT scratch holds recv_topk_idx/weights. Run the local permute kernel
         // to write the caller's EM recv_x + EM 1D recv_topk_weights with the
         // correct per-expert zone offsets and zero-pad rows.
-        if (em_permute_active) {
+        if (em_permute_active || pull_active) {
             // BWD passes recv_topk_weights == nullptr (weights are FWD-only).
             assert(forward_dispatch ? (recv_topk_weights != nullptr) : (recv_topk_weights == nullptr));
             // Zero-recv FWD (eager): the caller's outputs are legally empty
@@ -6116,7 +6163,7 @@ ncclResult_t ncclEpDispatch(
                 perm_scale_row_bytes =
                     static_cast<int>(recv_scales->sizes[1]) * ncclTypeSize(recv_scales->datatype);
             }
-            if (em_pull_active) {
+            if (pull_active) {
                 // Pull staging holds one full smem row per warp. The launch already
                 // scales its warp count down to the device opt-in smem cap, so only a
                 // hidden size whose single row exceeds the cap is unsupported. Reject
@@ -6294,6 +6341,8 @@ ncclResult_t ncclEpDispatch(
                     }
                     pull_caller_recv_total = recv_total_tensor ? recv_total_tensor->data : nullptr;
                 }
+                const auto output_id_kind = resolveRecvTopkIdxKind(
+                    layout_info ? layout_info->recv_topk_idx_kind : NCCL_EP_EXPERT_ID_AUTO);
                 NCCLCHECK(nccl_ep::ht::launch_dispatch_pull(
                     recv_x->data,
                     deliver_weights ? static_cast<float*>(recv_topk_weights->data) : nullptr,
@@ -6346,7 +6395,9 @@ ncclResult_t ncclEpDispatch(
                     pull_caller_recv_total,
                     pull_caller_out_is_int64,
                     nccl_ep_env_flag_on(group->env.nucs),
-                    false, nullptr, 0));
+                    handle->layout == NCCL_EP_LAYOUT_FLAT,
+                    forward_dispatch && recv_topk_idx ? static_cast<int64_t*>(recv_topk_idx->data) : nullptr,
+                    output_id_kind == NCCL_EP_EXPERT_ID_GLOBAL ? group->rank * group->num_local_experts : 0));
             } else {
                 // Compact decode fills flat2em with packed local IDs. The permute
                 // replaces them with EM slots in the same weight order. Dense count
@@ -6770,36 +6821,16 @@ ncclResult_t ncclEpCombine(
         const bool expert_major_in = (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
 
         if (backward_combine) {
-            if (topk_weights == nullptr) {
-                return ncclInvalidArgument;
-            }
-            if (combined_topk_weights == nullptr) {
-                return ncclInvalidArgument;
-            }
-            assert(combined_topk_weights->ndim == 2);
-            assert(combined_topk_weights->sizes[0] == num_combined_tokens);
-            assert(combined_topk_weights->datatype == ncclFloat32);
-            num_topk = static_cast<int>(combined_topk_weights->sizes[1]);
-            // Input shape validation by layout — must match FWD recv_topk_weights.
-            assert(topk_weights->datatype == ncclFloat32);
+            NCCLCHECK(validate_ht_backward_weights(
+                topk_weights, combined_topk_weights, expert_major_in, num_combined_tokens, handle->num_topk));
+            num_topk = handle->num_topk;
             // Zero-recv BWD (eager): grad rows and their weight grads are rows of
             // the same recv set, so their emptiness must agree; a mismatch is a
             // malformed call, not a zero-work one.
             if (tensorIsEmpty(topk_weights) != tensorIsEmpty(x)) {
                 return ncclInvalidArgument;
             }
-            if (expert_major_in) {
-                assert(topk_weights->ndim == 1 && "HT EM BWD combine: input topk_weights must be 1D [num_recv_tokens]");
-                input_topk_stride = 1;
-            } else {
-                assert(
-                    topk_weights->ndim == 2 &&
-                    "HT FLAT/RM BWD combine: input topk_weights must be 2D [num_recv, top_k]");
-                assert(
-                    static_cast<int>(topk_weights->sizes[1]) == num_topk &&
-                    "HT FLAT/RM BWD combine: input top_k must equal output top_k");
-                input_topk_stride = num_topk;
-            }
+            input_topk_stride = expert_major_in ? 1 : num_topk;
             NCCLCHECK(resolveTensorWindowBinding(
                 group,
                 topk_weights,
@@ -6884,7 +6915,7 @@ ncclResult_t ncclEpCombine(
             assert(num_topk == handle->num_topk &&
                    "HT compact BWD combine: output width must match handle top-k");
         }
-        const bool comb_push = em_comb_push_enabled(group, handle);
+        const bool comb_push = ht_comb_push_enabled(group, handle);
         // Push combine is single-LSA-team only (kPullPush enforces this at group creation).
         // Fail loudly if a multi-team handle reaches here instead of silently running a
         // different combine path.
@@ -6929,11 +6960,6 @@ ncclResult_t ncclEpCombine(
             // this rank's slice of handle->ht.token_rank_mask and skip the per-lane topk
             // decode + __match_any_sync dedup entirely; backward still needs the per-lane
             // src_rank_of_lane for the srcpos pad lookup.
-            if (backward_combine) {
-                // The reduce writes combined_topk_weights with stride handle->num_topk.
-                assert(num_topk == handle->num_topk &&
-                       "push-combine backward: combined_topk_weights width must equal handle->num_topk");
-            }
             // Peer staging + flag (+ backward prob-staging) base pointers ride the kernel
             // launch arg (marshaled per call), so there is no shared host staging to race.
             NCCLCHECK(nccl_ep::ht::launch_combine_push(
@@ -6961,7 +6987,8 @@ ncclResult_t ncclEpCombine(
                 backward_combine ? handle->ht.srcpos_map : nullptr,
                 backward_combine,
                 nccl_ep_env_flag_on(group->env.ht_unfused_sync),
-                nccl_ep_env_flag_on(group->env.nucs), false));
+                nccl_ep_env_flag_on(group->env.nucs),
+                handle->layout == NCCL_EP_LAYOUT_FLAT));
             NCCLCHECK(nccl_ep::ht::launch_combine_reduce_stage(
                 combined_x->data,
                 staging,
@@ -6978,7 +7005,10 @@ ncclResult_t ncclEpCombine(
                 x->datatype,
                 backward_combine ? static_cast<float*>(combined_topk_weights->data) : nullptr,
                 backward_combine ? handle->num_topk : 0,
-                backward_combine, nullptr, false));
+                backward_combine,
+                handle->layout == NCCL_EP_LAYOUT_FLAT && group->config.overflow_policy == NCCL_EP_OVERFLOW_DROP
+                    ? handle->ht.sparse_to_dense_map : nullptr,
+                handle->layout == NCCL_EP_LAYOUT_FLAT));
         } else {
             if (em_permute_combine) {
                 // MXFP8: app provides BF16; local_permute_reduce accumulates and quantizes to
