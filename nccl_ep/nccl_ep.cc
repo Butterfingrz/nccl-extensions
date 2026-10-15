@@ -5088,10 +5088,6 @@ ncclResult_t ncclEpDispatch(
         // NcclEpDispatchLsaMode's doc comment), which has no dstInfo/max-token-count machinery at
         // all -- collecting it would be wasted work the general kernel never reads.
         const ll::NcclEpDispatchLsaMode dispatch_lsa_mode = resolve_dispatch_lsa_mode(group->env);
-        const bool want_1sided_combine =
-            (combine_enforced_kernel == ll::LlCombineKernel::kNone ||
-             combine_enforced_kernel == ll::LlCombineKernel::k1SidedRmLsa) &&
-            dispatch_lsa_mode != ll::NcclEpDispatchLsaMode::kUniversal;
         // Resolved here, at dispatch time, since dispatch itself now makes the want-1-sided
         // decision (see dispatch_kernel_args_t::combineLsaThreshold's doc comment). Default
         // resolved here, next to where it's used, rather than in nccl_ep_env.cc's parser (see
@@ -5111,6 +5107,14 @@ ncclResult_t ncclEpDispatch(
         const bool max_tokens_below_threshold =
             static_cast<int>(group->config.max_dispatch_tokens_per_rank) <= combine_lsa_threshold;
         handle->ll.dispatch_1sided_disqualified = max_tokens_below_threshold;
+        // In auto mode a call already disqualified from 1-sided (seeded just above) can never go
+        // 1-sided, so dispatch must not record dstInfo or publish want-1-sided for a combine that
+        // will never read them. A forced "1sided" request still records.
+        const bool want_1sided_combine =
+            ((combine_enforced_kernel == ll::LlCombineKernel::kNone &&
+              !handle->ll.dispatch_1sided_disqualified) ||
+             combine_enforced_kernel == ll::LlCombineKernel::k1SidedRmLsa) &&
+            dispatch_lsa_mode != ll::NcclEpDispatchLsaMode::kUniversal;
         auto dispatch_fn = [=](int phases) -> ncclResult_t {
             void* const rdma_buf = group->rdma_buffer;
             // Prepare data pointers
