@@ -432,7 +432,7 @@ TEST_P(HtDispatchAsyncTest, ExpertMajorMetadataPaddingAndTails) {
         ScopedEnv scan("NCCL_EP_HT_EM_AG_SCAN_MODE", mode == 0 ? "0" : "1");
         ScopedEnv local_dup("NCCL_EP_HT_EM_LOCAL_DUP", mode == 2 ? "1" : "0");
         ScopedEnv nvlink_dup("NCCL_EP_HT_EM_NVLINK_DUP", mode == 3 ? "1" : "0");
-        ScopedEnv pull("NCCL_EP_HT_EM_PULL_PUSH", "0");
+        ScopedEnv pull("NCCL_EP_HT_PULL_PUSH", "0");
         ScopedEnv unfused("NCCL_EP_HT_EM_COUNT_UNFUSED", "0");
         create_group();
 

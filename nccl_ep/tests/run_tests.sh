@@ -238,7 +238,7 @@ unset NCCL_EP_HT_EM_COUNT_UNFUSED
 # Other overflow tests exercise specific transports or early layout-query contracts and
 # are excluded from this focused rerun.
 PULL_PUSH_SUITES="test_output_layout test_ht_bwd test_quantization_recipe test_ht_combine_pp_interleave test_ht_dispatch_pp_interleave test_ht_compact_prob"
-export NCCL_EP_HT_EM_PULL_PUSH=1
+export NCCL_EP_HT_PULL_PUSH=1
 export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
 for entry in "${SUITES[@]}"; do
     IFS='|' read -r bin desc _ <<<"${entry}"
@@ -252,12 +252,12 @@ OVERFLOW_DROP_PULL_COUNT_FILTER="HtOverflowDropTest.DispatchCombineContinueOnOve
         "LifecycleTest.ImportsRelocatedPreparedHandleMem:LifecycleTest.ImportedHandleSelectsDispatchChunkFromNumTokens"
 [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_overflow_drop" ]] && \
     run_suite "test_ht_overflow_drop" "EP HT Overflow Drop Tests (Pull-Count)" 4 "${OVERFLOW_DROP_PULL_COUNT_FILTER}"
-unset NCCL_EP_HT_EM_PULL_PUSH
+unset NCCL_EP_HT_PULL_PUSH
 unset NCCL_LSA_TEAM_SIZE
 
 # Pull-push scan rerun: same NCCL_EP_HT_EM_AG_SCAN_MODE fallback that forces EM local-permute
 # back to scan, applied here to confirm pull-push's scan path still matches.
-export NCCL_EP_HT_EM_PULL_PUSH=1
+export NCCL_EP_HT_PULL_PUSH=1
 export NCCL_EP_HT_EM_AG_SCAN_MODE=1
 export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
 for entry in "${SUITES[@]}"; do
@@ -269,13 +269,13 @@ done
 [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ht_overflow_drop" ]] && \
     run_suite "test_ht_overflow_drop" "EP HT Flat Overflow Drop (Pull-Push, Scan)" 4 \
         "HtOverflowDropTest.DispatchCombineContinueOnOverflow"
-unset NCCL_EP_HT_EM_PULL_PUSH
+unset NCCL_EP_HT_PULL_PUSH
 unset NCCL_EP_HT_EM_AG_SCAN_MODE
 unset NCCL_LSA_TEAM_SIZE
 
 # Pull-push unfused-sync rerun: same suites, pull-count default (no AG_SCAN_MODE), with the
 # head/tail LSA sync split into standalone kernels instead of fused into dispatch/combine.
-export NCCL_EP_HT_EM_PULL_PUSH=1
+export NCCL_EP_HT_PULL_PUSH=1
 export NCCL_EP_HT_UNFUSED_SYNC=1
 export NCCL_LSA_TEAM_SIZE="${NUM_GPUS}"
 for entry in "${SUITES[@]}"; do
@@ -284,7 +284,7 @@ for entry in "${SUITES[@]}"; do
     [[ " ${PULL_PUSH_SUITES} " == *" ${bin} "* ]] || continue
     run_suite "${bin}" "${desc} (Pull-Push, Unfused Sync)"
 done
-unset NCCL_EP_HT_EM_PULL_PUSH
+unset NCCL_EP_HT_PULL_PUSH
 unset NCCL_EP_HT_UNFUSED_SYNC
 unset NCCL_LSA_TEAM_SIZE
 

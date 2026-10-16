@@ -143,7 +143,7 @@ TEST_F(ElasticBufferTest, DispatchCombineCrossBoundary) {
     if (!ht_em_ag_scan_mode_active() &&
         !ht_em_nvlink_dup_active() &&
         !ht_em_local_dup_active() &&
-        !ht_em_pull_push_active() &&
+        !ht_pull_push_active() &&
         !ht_em_count_unfused_active()) {
         GTEST_SKIP() << "fused count defers recv count to dispatch; getNumRecvTokens is 0 after UpdateHandle";
     }

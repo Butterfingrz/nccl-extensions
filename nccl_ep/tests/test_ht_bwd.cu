@@ -837,7 +837,7 @@ TEST_F(HtBwdTopK2Test, CombineWithGradExpertMajor) {
 // wide enough to actually split (kHiddenChunked=4096 -> hidden_int4=512 -> 4 tiles), through the same backward combine-with-grad round trip
 // CombineWithGradExpertMajor uses, and additionally checks combined_x's values (the row itself,
 // not just the co-located weight pad), since that's what the chunked TMA-store loop assembles.
-// Only meaningful under push-combine (NCCL_EP_HT_EM_PULL_PUSH); skips otherwise.
+// Only meaningful under push-combine (NCCL_EP_HT_PULL_PUSH); skips otherwise.
 
 static constexpr int kHiddenChunked = 4096;
 
@@ -867,8 +867,8 @@ protected:
     int64_t* d_topk_ = nullptr;
 
     void SetUp() override {
-        if (!ht_em_pull_push_active()) {
-            GTEST_SKIP() << "combine_push's chunked path only exists under NCCL_EP_HT_EM_PULL_PUSH";
+        if (!ht_pull_push_active()) {
+            GTEST_SKIP() << "combine_push's chunked path only exists under NCCL_EP_HT_PULL_PUSH";
             return;
         }
         ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;
@@ -897,7 +897,7 @@ protected:
 };
 
 TEST_P(HtBwdChunkedCombineTest, CombineWithGradExpertMajorChunked) {
-    if (!ht_em_pull_push_active()) return;  // SetUp already emitted GTEST_SKIP
+    if (!ht_pull_push_active()) return;  // SetUp already emitted GTEST_SKIP
 
     ncclEpHandle_t h = nullptr;
     NCCL_ASSERT(ncclEpCreateHandle(&h, group_, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk_idx_em_, nullptr, nullptr, g_stream));

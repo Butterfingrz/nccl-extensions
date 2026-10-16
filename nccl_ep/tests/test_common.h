@@ -39,10 +39,9 @@ static inline bool env_flag_active(const char* name) {
     return strcasecmp(v, "1") == 0 || strcasecmp(v, "on") == 0 || strcasecmp(v, "true") == 0;
 }
 
-// True when HT EM pull-dispatch/push-combine mode is active (NCCL_EP_HT_EM_PULL_PUSH).
-// The mode only supports the expert-major layout, so FLAT / rank-major cases skip.
-static inline bool ht_em_pull_push_active() {
-    return env_flag_active("NCCL_EP_HT_EM_PULL_PUSH");
+// True when HT pull-dispatch/push-combine mode is active (NCCL_EP_HT_PULL_PUSH).
+static inline bool ht_pull_push_active() {
+    return env_flag_active("NCCL_EP_HT_PULL_PUSH");
 }
 
 // True when the scan (routing-map AllGather) fallback is active (NCCL_EP_HT_EM_AG_SCAN_MODE).

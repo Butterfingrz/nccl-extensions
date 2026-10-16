@@ -528,7 +528,7 @@ TEST_F(OutputLayoutTest, FusedDispatchRecvTotalEM) {
     if (ht_em_ag_scan_mode_active() ||
         ht_em_nvlink_dup_active() ||
         ht_em_local_dup_active() ||
-        ht_em_pull_push_active()) {
+        ht_pull_push_active()) {
         GTEST_SKIP() << "fused dispatch layout applies only in count mode";
     }
     constexpr size_t kAlign = 4;
@@ -621,7 +621,7 @@ TEST_F(OutputLayoutTest, FusedDispatchRecvTotalInt32Standalone) {
     if (ht_em_ag_scan_mode_active() ||
         ht_em_nvlink_dup_active() ||
         ht_em_local_dup_active() ||
-        ht_em_pull_push_active()) {
+        ht_pull_push_active()) {
         GTEST_SKIP() << "fused dispatch layout applies only in count mode";
     }
     ncclEpHandle_t h = make_handle_em(nullptr);
@@ -1199,7 +1199,7 @@ TEST_F(OutputLayoutTest, EagerZeroRecv) {
 // recv_topk_weights before combine (the MoE combine input), so the value round trip
 // depends on the forwarded weights. Weights sum to 1 per token, so each rank's
 // combined[i] must equal its own source token. Under pull dispatch + push combine
-// (NCCL_EP_HT_EM_PULL_PUSH) a zero-recv rank is still a source, so its input weights
+// (NCCL_EP_HT_PULL_PUSH) a zero-recv rank is still a source, so its input weights
 // must reach the receiver.
 static void run_eager_zero_recv_fwd_combine(int top_k) {
     ncclEpGroupConfig_t gcfg = NCCL_EP_GROUP_CONFIG_INIT;

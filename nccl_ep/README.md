@@ -558,9 +558,10 @@ Maintains state for a sequence of related MoE operations, i.e. dispatch and comb
 ### Flat pull/push
 
 HT flat layout supports the same opt-in pull-dispatch / push-combine transport
-as expert-major layout. Set `NCCL_EP_HT_EM_PULL_PUSH=1` before group creation
-on every rank. The existing environment variable name applies to both layouts;
-leaving it unset preserves the existing transport selection.
+as expert-major layout. Set `NCCL_EP_HT_PULL_PUSH=1` before group creation
+on every rank. This replaces `NCCL_EP_HT_EM_PULL_PUSH` for both layouts; the
+old name is no longer recognized. Leaving the new flag unset preserves the
+existing transport selection.
 
 Pull dispatch writes one flat receive row per source token and destination
 rank, even when several selected experts belong to that rank. Within each
@@ -570,16 +571,22 @@ locally reduced row to the source rank, where contributions from destination
 ranks are summed. Forward and backward operations use handle-owned routing
 maps, including the original top-k positions needed for backward weights.
 
-Flat pull/push uses routing-map exchange and scan during handle update.
+Flat pull/push uses routing-map exchange and scan during handle update,
+regardless of `NCCL_EP_HT_EM_AG_SCAN_MODE`.
 `NCCL_EP_HT_UNFUSED_SYNC=1` selects standalone head/tail synchronization;
 otherwise synchronization runs inside the payload kernels.
 
 Pull/push currently requires one LSA team, top-k at most 32, and at most 65535
-experts. It cannot be combined with the
+experts, with at most 128 ranks in the LSA team. It cannot be combined with the
 `NCCL_EP_HT_EM_LOCAL_DUP` or `NCCL_EP_HT_EM_NVLINK_DUP` overrides. Dispatch
 supports `NCCL_EP_DISP_QUANT_NONE` and `NCCL_EP_DISP_QUANT_FWD` (forwarded
 scales). Group-level transport and synchronization settings must match across
 ranks. Imported handles retain the scan-built routing maps.
+
+Combine supports `NCCL_EP_COMB_QUANT_NONE`; MXFP8 combine is not supported.
+Backward weight tensors use the handle's top-k width. Each token's nonnegative
+expert IDs must be unique; duplicate-ID handling is tracked separately in #138.
+See [the flat pull/push design](docs/plc/310-flat-pull-push/README.md).
 
 ### Eager mode
 

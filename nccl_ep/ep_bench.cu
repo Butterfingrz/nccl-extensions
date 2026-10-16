@@ -234,9 +234,9 @@ static cudaError_t cudaFreeCallback(void* ptr, void* /*context*/) {
     return cudaFree(ptr);
 }
 
-// True iff HT EM pull-push dispatch/combine was requested via NCCL_EP_HT_EM_PULL_PUSH.
-static bool htEmPullPushEnabled() {
-    const char* v = std::getenv("NCCL_EP_HT_EM_PULL_PUSH");
+// True iff HT pull-push dispatch/combine was requested via NCCL_EP_HT_PULL_PUSH.
+static bool htPullPushEnabled() {
+    const char* v = std::getenv("NCCL_EP_HT_PULL_PUSH");
     return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
@@ -803,11 +803,11 @@ void setupHighThroughputTensors(
 
     // Pull EM dispatch reads the source token + topk-weight rows over NVLink, so the
     // dispatch inputs must be window-backed even though the group stays zero_copy=OFF
-    // (local_permute mode). Window the inputs when NCCL_EP_HT_EM_PULL_PUSH is set.
+    // (local_permute mode). Window the inputs when NCCL_EP_HT_PULL_PUSH is set.
     EpTensorAllocOptions zc_in = zc_comm;
     zc_in.use_nccl_mem = true;
     zc_in.use_window = true;
-    const bool pull_inputs = em && htEmPullPushEnabled();
+    const bool pull_inputs = em && htPullPushEnabled();
     const EpTensorAllocOptions* input_window_opts =
         (zcopy ? &zc_comm : (pull_inputs ? &zc_in : nullptr));
 
@@ -6336,7 +6336,7 @@ int main(int argc, char* argv[]) {
     // Pull EM dispatch reads each token's scale row over NVLink, so the FWD input
     // scales must be window-backed (like the token input) even when zero_copy is OFF.
     const bool sf_pull_inputs = !is_ll_mode && (layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) &&
-        dispatch_quantization == NCCL_EP_DISP_QUANT_FWD && htEmPullPushEnabled();
+        dispatch_quantization == NCCL_EP_DISP_QUANT_FWD && htPullPushEnabled();
     EpTensorAllocOptions ht_sf_zc_opts;
     const EpTensorAllocOptions* ht_sf_window_opts = nullptr;      // output scales (zero_copy only)
     const EpTensorAllocOptions* ht_sf_in_window_opts = nullptr;   // input scales (zero_copy or pull)

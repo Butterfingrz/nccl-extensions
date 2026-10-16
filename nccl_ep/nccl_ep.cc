@@ -2553,9 +2553,9 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         // Pull dispatch and push combine run over NVLink within a single LSA team for
         // now; multi-node (inter-LSA-team) support is a future extension. Fail fast at
         // group creation on an inter-LSA-team topology until then.
-        if (nccl_ep_env_flag_on(ep_group->env.ht_em_pull_push) && ep_group->rdma_team_size > 1) {
+        if (nccl_ep_env_flag_on(ep_group->env.ht_pull_push) && ep_group->rdma_team_size > 1) {
             fprintf(stderr,
-                    "ncclEpCreateGroup: NCCL_EP_HT_EM_PULL_PUSH is "
+                    "ncclEpCreateGroup: NCCL_EP_HT_PULL_PUSH is "
                     "single-LSA-team only for now; inter-LSA-team (rdma_team_size=%d > 1) is not yet supported.\n",
                     ep_group->rdma_team_size);
             return ncclInvalidUsage;
@@ -2571,7 +2571,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     if (ht_mode) {
         const bool want_local_dup = nccl_ep_env_flag_on(ep_group->env.ht_em_local_dup);
         const bool want_nvlink_dup = nccl_ep_env_flag_on(ep_group->env.ht_em_nvlink_dup);
-        const bool want_pull_push = nccl_ep_env_flag_on(ep_group->env.ht_em_pull_push);
+        const bool want_pull_push = nccl_ep_env_flag_on(ep_group->env.ht_pull_push);
         if (want_local_dup && want_nvlink_dup) {
             fprintf(stderr, "NCCL EP: NCCL_EP_HT_EM_LOCAL_DUP and NCCL_EP_HT_EM_NVLINK_DUP are mutually exclusive\n");
             return ncclInvalidUsage;
@@ -2579,7 +2579,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         // Pull-push and the dup modes are distinct EM recipes. Reject the explicit
         // conflict instead of silently dropping the pull-push request.
         if (want_pull_push && (want_local_dup || want_nvlink_dup)) {
-            fprintf(stderr, "NCCL EP: NCCL_EP_HT_EM_PULL_PUSH is mutually exclusive with "
+            fprintf(stderr, "NCCL EP: NCCL_EP_HT_PULL_PUSH is mutually exclusive with "
                             "NCCL_EP_HT_EM_LOCAL_DUP / NCCL_EP_HT_EM_NVLINK_DUP\n");
             return ncclInvalidUsage;
         }
@@ -2608,7 +2608,7 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         if (nccl_ep_env_flag_on(ep_group->env.ht_unfused_sync) &&
             ep_group->ht_em_mode != ncclEpGroup::HtEmMode::kPullPush) {
             fprintf(stderr, "NCCL EP: NCCL_EP_HT_UNFUSED_SYNC is only supported with "
-                            "NCCL_EP_HT_EM_PULL_PUSH\n");
+                            "NCCL_EP_HT_PULL_PUSH\n");
             return ncclInvalidUsage;
         }
     }
@@ -5532,7 +5532,7 @@ ncclResult_t ncclEpDispatch(
         if (pull_active && recipe != NCCL_EP_DISP_QUANT_NONE &&
             recipe != NCCL_EP_DISP_QUANT_FWD) {
             fprintf(stderr,
-                    "ncclEpDispatch: NCCL_EP_HT_EM_PULL_PUSH pull dispatch "
+                    "ncclEpDispatch: NCCL_EP_HT_PULL_PUSH pull dispatch "
                     "supports only NCCL_EP_DISP_QUANT_NONE and NCCL_EP_DISP_QUANT_FWD (recipe=%d unsupported).\n",
                     static_cast<int>(recipe));
             return ncclInvalidArgument;
@@ -6169,14 +6169,14 @@ ncclResult_t ncclEpDispatch(
                 // hidden size whose single row exceeds the cap is unsupported. Reject
                 // cleanly here rather than letting the JIT launch abort the process.
                 // TODO: fall back to the local-permute (kLocalPermute) dispatch path for
-                // this hidden size instead of failing the dispatch under NCCL_EP_HT_EM_PULL_PUSH.
+                // this hidden size instead of failing the dispatch under NCCL_EP_HT_PULL_PUSH.
                 const size_t pull_smem =
                     nccl_ep::ht::dispatch_pull_smem_bytes(row_bytes / 16);
                 if (pull_smem > group->device_smem_optin) {
                     fprintf(stderr,
-                            "ncclEpDispatch: NCCL_EP_HT_EM_PULL_PUSH pull dispatch needs %zu B "
+                            "ncclEpDispatch: NCCL_EP_HT_PULL_PUSH pull dispatch needs %zu B "
                             "shared memory for a single pull warp (hidden row = %d B) but the "
-                            "device opt-in cap is %zu B; disable NCCL_EP_HT_EM_PULL_PUSH for this "
+                            "device opt-in cap is %zu B; disable NCCL_EP_HT_PULL_PUSH for this "
                             "hidden size.\n",
                             pull_smem, row_bytes, group->device_smem_optin);
                     return ncclInvalidArgument;
@@ -6199,13 +6199,13 @@ ncclResult_t ncclEpDispatch(
                     // topk_weights/scales instead of reading a non-shared peer address.
                     if (deliver_weights && (topk_weights == nullptr || topk_weights->win_hdl == ncclWindow_t{})) {
                         fprintf(stderr,
-                                "ncclEpDispatch: NCCL_EP_HT_EM_PULL_PUSH needs topk_weights window-registered "
+                                "ncclEpDispatch: NCCL_EP_HT_PULL_PUSH needs topk_weights window-registered "
                                 "when tokens are (mixed windowed/non-windowed pull inputs are unsupported)\n");
                         return ncclInvalidArgument;
                     }
                     if (deliver_scales && (scales == nullptr || scales->win_hdl == ncclWindow_t{})) {
                         fprintf(stderr,
-                                "ncclEpDispatch: NCCL_EP_HT_EM_PULL_PUSH needs scales window-registered "
+                                "ncclEpDispatch: NCCL_EP_HT_PULL_PUSH needs scales window-registered "
                                 "when tokens are (mixed windowed/non-windowed pull inputs are unsupported)\n");
                         return ncclInvalidArgument;
                     }
@@ -6920,7 +6920,7 @@ ncclResult_t ncclEpCombine(
         // Fail loudly if a multi-team handle reaches here instead of silently running a
         // different combine path.
         if (comb_push && !is_lsa_only) {
-            fprintf(stderr, "ncclEpCombine: NCCL_EP_HT_EM_PULL_PUSH push combine is single-LSA-team only\n");
+            fprintf(stderr, "ncclEpCombine: NCCL_EP_HT_PULL_PUSH push combine is single-LSA-team only\n");
             return ncclInvalidUsage;
         }
         // MXFP8 quantization is fused into local_permute_reduce, which only runs in

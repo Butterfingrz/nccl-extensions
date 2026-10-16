@@ -160,7 +160,7 @@ struct State {
                                    &cfg, topk, nullptr));
         const int compact_floats = ((6 * topk + 15) & ~15) / 4;
         const int dense_floats = (experts / g_nranks) * ncclEpHandle_test_getNRanksPerNode(handle);
-        const bool inline_wire = compact_floats < dense_floats && !enabled("NCCL_EP_HT_EM_PULL_PUSH");
+        const bool inline_wire = compact_floats < dense_floats && !enabled("NCCL_EP_HT_PULL_PUSH");
         ASSERT_EQ(ncclEpHandle_test_getCompactProbWireFloats(handle), inline_wire ? compact_floats : 0)
             << "Compact is automatic when smaller; pull-push keeps its existing sparse-ID path";
         const char* order = std::getenv("NCCL_EP_HT_RECV_TOPK_ORDER");
@@ -519,7 +519,7 @@ struct ScopedGroup {
 class HtCompactProbOrderGate : public HtCompactProbTest, public ::testing::WithParamInterface<bool> {};
 
 TEST_P(HtCompactProbOrderGate, CapturedPerGroupAndGraphReplay) {
-    if (ht_em_pull_push_active()) {
+    if (ht_pull_push_active()) {
         GTEST_SKIP() << "This case exercises the native compact decoder";
     }
     const bool em = GetParam();
@@ -675,7 +675,7 @@ TEST_F(HtCompactProbTest, DenseFallbackExpertMajor) {
 // capacity used to corrupt the compact rows immediately following staging.
 TEST_F(HtCompactProbTest, PartialZoneDrop) {
     if (g_nranks != 4 && g_nranks != 8) GTEST_SKIP() << "Partial-zone fixture requires EP4 or EP8";
-    if (ht_em_pull_push_active()) {
+    if (ht_pull_push_active()) {
         GTEST_SKIP() << "This case exercises the native compact decoder";
     }
 
