@@ -541,7 +541,9 @@ TEST_F(OutputLayoutTest, TotalCounterDeviceFLAT) {
 // Count mode routes the Flat caller tensor separately from EM's, so it has to select the
 // unfused exchange on its own; a poison fill catches the tensor being left untouched.
 TEST_F(OutputLayoutTest, ExpertCountersDeviceFLAT) {
-    SKIP_IF_PULL_PUSH();
+    if (ht_pull_push_active()) {
+        GTEST_SKIP() << "FLAT expert counters apply only to the count/scan paths";
+    }
     const int E_local = kNumExperts / g_nranks;  // 2
     int32_t* d_cnt;
     CUDA_ASSERT(cudaMalloc(&d_cnt, E_local * sizeof(int32_t)));
