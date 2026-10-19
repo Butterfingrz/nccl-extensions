@@ -567,8 +567,11 @@ TEST_F(HtCompactProbTest, FlatPullCounterWindowAndIgnoredOffsets) {
         GTEST_SKIP() << "single LSA team only";
     }
     ASSERT_NO_FATAL_FAILURE(s.update(kTokens, 0, false));
+    void* window_counts = nullptr;
+    const size_t counter_bytes = local_experts * sizeof(int32_t);
+    NCCL_ASSERT(ncclMemAlloc(&window_counts, counter_bytes));
     ncclWindow_t window{};
-    NCCL_ASSERT(ncclCommWindowRegister(g_comm, s.counts.p, s.counts.size * sizeof(int64_t),
+    NCCL_ASSERT(ncclCommWindowRegister(g_comm, window_counts, counter_bytes,
                                       &window, NCCL_WIN_COLL_SYMMETRIC));
     ASSERT_NO_FATAL_FAILURE(s.tensor(&s.counts_tensor, 1, ncclInt32, nullptr, local_experts));
     s.counts_tensor->win_hdl = window;
@@ -584,7 +587,7 @@ TEST_F(HtCompactProbTest, FlatPullCounterWindowAndIgnoredOffsets) {
     CUDA_ASSERT(cudaStreamSynchronize(g_stream));
     auto check_counters = [&]() {
         std::vector<int32_t> actual(local_experts), expected(local_experts, 0);
-        CUDA_ASSERT(cudaMemcpy(actual.data(), s.counts.p, actual.size() * sizeof(int32_t),
+        CUDA_ASSERT(cudaMemcpy(actual.data(), window_counts, actual.size() * sizeof(int32_t),
                                 cudaMemcpyDeviceToHost));
         for (int source = 0; source < g_nranks; ++source) {
             for (int token = 0; token < kTokens; ++token) {
@@ -605,13 +608,14 @@ TEST_F(HtCompactProbTest, FlatPullCounterWindowAndIgnoredOffsets) {
     };
     ASSERT_NO_FATAL_FAILURE(check_counters());
     ASSERT_NO_FATAL_FAILURE(s.update(kTokens, 0, false));
-    CUDA_ASSERT(cudaMemset(s.counts.p, 0xA5, s.counts.size * sizeof(int64_t)));
+    CUDA_ASSERT(cudaMemset(window_counts, 0xA5, counter_bytes));
     s.info.expert_counters = s.counts_tensor;
     s.info.expert_offsets = s.offsets_tensor;
     ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
     ASSERT_NO_FATAL_FAILURE(check_counters());
     ASSERT_NO_FATAL_FAILURE(s.backward());
     NCCL_ASSERT(ncclCommWindowDeregister(g_comm, window));
+    NCCL_ASSERT(ncclMemFree(window_counts));
 }
 
 // Retain the process setting: this test creates differently configured groups
