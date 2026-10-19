@@ -60,6 +60,24 @@ TEST(LlKernelSelection, DispatchPreservesOtherFallbacks) {
 // latter throughout, since these cases never exercise the 1-sided/auto paths. NCCL_EP_COMBINE_LSA
 // only governs the pick within the LSA domain, so a call that isn't LSA-eligible at all falls back
 // to kDefault silently rather than erroring -- see ll_combine_select_kernel's doc comment.
+
+TEST(LlKernelSelection, DispatchJitBurnsInRankRoles) {
+    nccl_ep::DispatchKernelSpec spec{};
+    ASSERT_EQ(nccl_ep::resolveDispatchKernelSpec(
+        NCCL_EP_DISP_QUANT_NONE, ncclBfloat16, ncclFloat32, &spec), ncclSuccess);
+
+    const auto source_for = [&](bool rank_owns_experts, bool rank_owns_tokens) {
+        return ll_dispatch_jit_source(
+            spec, 2048, 2, NCCL_EP_LAYOUT_RANK_MAJOR, true, false,
+            ncclBfloat16, LlDispatchAlgo::kDefault, false, false, false,
+            rank_owns_experts, rank_owns_tokens, 0, 0, false, false, false, 4, false);
+    };
+
+    EXPECT_NE(source_for(true, true).find("false, false, true, true>(p);"), std::string::npos);
+    EXPECT_NE(source_for(false, true).find("false, false, false, true>(p);"), std::string::npos);
+    EXPECT_NE(source_for(true, false).find("false, false, true, false>(p);"), std::string::npos);
+}
+
 TEST(LlKernelSelection, CombineRequiresFullReceiveTiles) {
     for (auto dtype : {ncclBfloat16, ncclFloat16, ncclFloat32}) {
         const int tile = dtype == ncclFloat32 ? 256 : 512;
@@ -189,13 +207,16 @@ TEST(LlKernelSelection, CftJitSeparatesSenderModes) {
         NCCL_EP_DISP_QUANT_NONE, ncclBfloat16, ncclFloat32, &spec), ncclSuccess);
     const std::string counted = ll_dispatch_jit_source(
         spec, 7168, 8, NCCL_EP_LAYOUT_RANK_MAJOR, true, true, ncclBfloat16,
-        LlDispatchAlgo::kCftRmLsa, false, false, true, 0, 0, false, false, true, 4, false);
+        LlDispatchAlgo::kCftRmLsa, false, false, true, true, true,
+        0, 0, false, false, true, 4, false);
     const std::string uncounted = ll_dispatch_jit_source(
         spec, 7168, 8, NCCL_EP_LAYOUT_RANK_MAJOR, true, true, ncclBfloat16,
-        LlDispatchAlgo::kCftRmLsa, false, false, true, 0, 0, false, false, false, 4, false);
+        LlDispatchAlgo::kCftRmLsa, false, false, true, true, true,
+        0, 0, false, false, false, 4, false);
     const std::string zeroCopy = ll_dispatch_jit_source(
         spec, 7168, 8, NCCL_EP_LAYOUT_RANK_MAJOR, true, true, ncclBfloat16,
-        LlDispatchAlgo::kCftRmLsa, false, false, true, 0, 0, false, true, false, 4, false);
+        LlDispatchAlgo::kCftRmLsa, false, false, true, true, true,
+        0, 0, false, true, false, 4, false);
     EXPECT_NE(counted, uncounted);
     EXPECT_NE(uncounted, zeroCopy);
     EXPECT_NE(counted.find("device/ll/ll_dispatch_cft_lsa.cuh"), std::string::npos);

@@ -85,3 +85,19 @@ cdef ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out) ex
 
 cdef ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
     return _nccl_ep._ncclEpErrorClear(ep_group)
+
+
+cdef ncclResult_t ncclEpAfDispatch(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpAfDispatch(handle, inputs, outputs, layout_info, config, stream)
+
+
+cdef ncclResult_t ncclEpAfCombine(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpAfCombine(handle, inputs, outputs, config, stream)
+
+
+cdef ncclResult_t ncclEpAfRecv(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpAfRecv(handle, inputs, outputs, layout_info, config, stream)
+
+
+cdef ncclResult_t ncclEpAfReturn(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpAfReturn(handle, inputs, outputs, config, stream)

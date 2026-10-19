@@ -171,6 +171,7 @@ ncclResult_t call_dispatch(
     args.numExperts = params.numExperts;
     args.currRank = params.currRank;
     args.numRanks = params.numRanks;
+    args.numAttnRanks = params.numAttnRanks;
     args.numWarpGroups = numWarpGroups;
     args.numWarpsPerGroup = numWarpsPerGroup;
     args.roundScale = params.roundScale;
@@ -306,7 +307,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
     // request it still can't honor (e.g. 1-sided enforced but not oneSidedEligible).
     const bool lsa_eligible = jit::ll_combine_lsa_eligible(
         params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout, params.cftEnabled,
-        params.hidden, params.tokenDtype, params.lsaMode);
+        params.hidden, params.tokenDtype, params.lsaMode, params.numAttnRanks);
     // oneSidedEligible implies lsaEligible by construction (AND-ed on top, never asserted
     // independently) -- see CombineParams::groupZeroCopyOn's doc comment for why these two extra
     // conditions live here rather than being precomputed by the caller.
@@ -402,6 +403,7 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
     args.numExperts = params.numExperts;
     args.currRank = params.currRank;
     args.numRanks = params.numRanks;
+    args.numAttnRanks = params.numAttnRanks;
     args.numWarpGroups = numWarpGroups;
     args.numWarpsPerGroup = numWarpsPerGroup;
     args.phases = params.phases;

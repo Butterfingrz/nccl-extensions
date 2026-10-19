@@ -267,6 +267,8 @@ struct dispatch_kernel_args_t {
     int numExperts;
     int currRank;
     int numRanks;
+    // AFD attention-rank count. Non-zero calls always use the universal LL kernel.
+    int numAttnRanks;
     int numWarpGroups;
     int numWarpsPerGroup;
     bool roundScale;
@@ -344,6 +346,8 @@ struct combine_kernel_args_t {
     int numExperts;
     int currRank;
     int numRanks;
+    // AFD attention-rank count. Non-zero calls always use the universal LL kernel.
+    int numAttnRanks;
     int numWarpGroups;
     int numWarpsPerGroup;
     int phases;
@@ -422,6 +426,7 @@ struct DispatchParams {
     int numExperts;
     int currRank;
     int numRanks;
+    int numAttnRanks = 0;
     ncclEpLayout_t layout;
 
     // GIN / NCCL device context
@@ -531,6 +536,7 @@ struct CombineParams {
     int numExperts;
     int currRank;
     int numRanks;
+    int numAttnRanks = 0;
     ncclEpLayout_t layout;
 
     // GIN / NCCL device context

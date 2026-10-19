@@ -51,7 +51,8 @@ enum class LlDispatchAlgo { kDefault, k2SidedRmLsa, k2SidedRmLsaTma, kCftRmLsa }
 // (lsaMode, see NcclEpDispatchLsaMode's doc comment in device/ll_ep_adapter.cuh).
 inline LlDispatchAlgo ll_dispatch_select_algo(
     bool nvlinkOnly, ncclEpDispQuant_t recipe, ncclEpLayout_t layout, bool cftEnabled,
-    NcclEpDispatchLsaMode lsaMode, int hidden, ncclDataType_t tokenDtype) {
+    NcclEpDispatchLsaMode lsaMode, int hidden, ncclDataType_t tokenDtype,
+    int numAttnRanks = 0) {
     // Explicit override: NCCL_EP_DISPATCH_LSA=universal always forces the general kernel,
     // regardless of eligibility.
     if (lsaMode == NcclEpDispatchLsaMode::kUniversal) {
@@ -66,7 +67,7 @@ inline LlDispatchAlgo ll_dispatch_select_algo(
     // CFT: the LSA-CFT specialization (NONE recipe) unless NCCL_EP_LL_CFT_LSA=0; partial tiles
     // and other recipes keep the general CFT kernel.
     const bool cftUsesLsaKernel = !cftEnabled || (ll_cft_lsa_enabled() && recipe == NCCL_EP_DISP_QUANT_NONE);
-    const bool lsaEligible = hidden > 0 && hidden % elemsPerWarp == 0 &&
+    const bool lsaEligible = numAttnRanks == 0 && hidden > 0 && hidden % elemsPerWarp == 0 &&
         cftUsesLsaKernel && nvlinkOnly && lsaRecipe && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
 
     // CFT owns a separate LSA kernel; both SIMT/TMA overrides retain that
@@ -108,6 +109,8 @@ inline std::string ll_dispatch_jit_source(
     bool compactQuant,
     bool stageQuant,
     bool cftEnabled,
+    bool rankOwnsExperts,
+    bool rankOwnsTokens,
     int numTmaStages,
     int numTmaQuantWarps,
     bool recordDstInfo,
@@ -180,7 +183,9 @@ inline std::string ll_dispatch_jit_source(
             << "      " << token_dtype_literal << ",\n"
             << "      " << kernel_spec.scale_type_literal << ",\n"
             << "      " << ::nccl_ep::jit::bool_literal(cftEnabled) << ", "
-            << ::nccl_ep::jit::bool_literal(stageQuant) << ">(p);\n";
+            << ::nccl_ep::jit::bool_literal(stageQuant) << ", "
+            << ::nccl_ep::jit::bool_literal(rankOwnsExperts) << ", "
+            << ::nccl_ep::jit::bool_literal(rankOwnsTokens) << ">(p);\n";
         break;
     }
     src << "}\n";
@@ -211,7 +216,8 @@ inline ncclResult_t launch_ll_dispatch(
     bool* dstInfoDisqualifiedOut,
     bool cftOneWordMask) {
     const bool cftEnabled = cft_smem_bytes != 0;
-    const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout, cftEnabled, lsaMode, hidden, tokenDtype);
+    const LlDispatchAlgo algo = ll_dispatch_select_algo(
+        nvlinkOnly, recipe, layout, cftEnabled, lsaMode, hidden, tokenDtype, args.numAttnRanks);
     // Only STORE LSA kernels record one-sided-combine metadata.
     // Preserve any disqualification already established by the caller.
     *dstInfoDisqualifiedOut = *dstInfoDisqualifiedOut ||
@@ -219,6 +225,8 @@ inline ncclResult_t launch_ll_dispatch(
     const bool twoSidedRmLsa = algo == LlDispatchAlgo::k2SidedRmLsa;
     const bool cftRmLsa = algo == LlDispatchAlgo::kCftRmLsa;
     const bool twoSidedRmLsaTma = algo == LlDispatchAlgo::k2SidedRmLsaTma;
+    const bool rankOwnsExperts = args.numAttnRanks == 0 || args.currRank >= args.numAttnRanks;
+    const bool rankOwnsTokens = args.numAttnRanks == 0 || args.currRank < args.numAttnRanks;
     const bool tmaQuant = twoSidedRmLsaTma && recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
     // Non-quantizing variants have no TMA quantization workers. Keep their
     // specialization independent of the DSFP8 TMA tuning knob.
@@ -329,6 +337,8 @@ inline ncclResult_t launch_ll_dispatch(
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(tokenDtype));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(compactQuant));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(stageQuant));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(rankOwnsExperts));
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(rankOwnsTokens));
     key = ::nccl_ep::jit::runtime_key_mix(
         key, twoSidedRmLsaTma ? (1u | (static_cast<std::uint64_t>(numTmaStages) << 2)) : 0u);
     if (tmaQuant) {
@@ -383,6 +393,8 @@ inline ncclResult_t launch_ll_dispatch(
              << (cftEnabled ? "_cft" : "")
              << (compactQuant ? "_compact" : "")
              << (stageQuant ? "_staged" : "")
+             << (rankOwnsExperts ? "_expertowner" : "_nonexpert")
+             << (rankOwnsTokens ? "_tokenowner" : "_nontoken")
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype)
              << (recordDstInfo ? "_dstinfo1s" : "");
@@ -399,7 +411,8 @@ inline ncclResult_t launch_ll_dispatch(
         variant_name = name.str();
         const std::string source = ll_dispatch_jit_source(
             kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype, algo,
-            compactQuant, stageQuant, cftEnabled, numTmaStages, numTmaQuantWarps, recordDstInfo,
+            compactQuant, stageQuant, cftEnabled, rankOwnsExperts, rankOwnsTokens,
+            numTmaStages, numTmaQuantWarps, recordDstInfo,
             cftZeroCopy, cftCountedPayload, numWarps, cftOneWordMask);
         variant.variant_name = variant_name;
         variant.source = source;

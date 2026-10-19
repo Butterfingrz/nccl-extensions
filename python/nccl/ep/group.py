@@ -74,6 +74,9 @@ class GroupConfig:
             shared budget. NCCL_EP_DISPATCH_SMS overrides it.
         combine_num_sms: Combine SM budget. 0 inherits the resolved
             shared budget. NCCL_EP_COMBINE_SMS overrides it.
+        num_attn_ranks: Number of leading attention ranks for AFD. Non-zero
+            values require universal LL kernels, rank-major layout, and a
+            square attention-to-expert-rank partition. Default: 0.
         alloc: Device allocator hooks. Default
             :class:`AllocConfig` selects ``cudaMalloc``/``cudaFree``.
         enable_mask: Enable active-mask support for fault tolerance
@@ -124,6 +127,7 @@ class GroupConfig:
     combine_num_sms: int = 0
     ht_flow: HtFlow = HtFlow.AUTO
     meta_exchange_policy: MetaExchangePolicy = MetaExchangePolicy.AUTO
+    num_attn_ranks: int = 0
     alloc: AllocConfig = field(default_factory=AllocConfig)
     enable_mask: bool = False
     timeout_ns: int = 0

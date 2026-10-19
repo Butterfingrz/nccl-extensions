@@ -41,6 +41,15 @@ namespace ll {
 // syncSmGroup / warpFirstTopKOccurence / countTokensPerRank_mask moved to
 // ll/ll_common.cuh (included above).
 
+// AFD role predicates. A zero partition preserves classic homogeneous EP.
+__device__ __forceinline__ bool afdRankOwnsExperts(int currRank, int numAttnRanks) {
+    return numAttnRanks == 0 || currRank >= numAttnRanks;
+}
+
+__device__ __forceinline__ bool afdRankOwnsTokens(int currRank, int numAttnRanks) {
+    return numAttnRanks == 0 || currRank < numAttnRanks;
+}
+
 #define SYNC_DISP_SEND_COPY 1
 #define SYNC_DISP_SEND_COMM(idx) (SYNC_DISP_SEND_COPY + idx)
 #define SYNC_DISP_RECV_COPY(topK, idx) (SYNC_DISP_SEND_COMM(topK) + idx)
@@ -486,7 +495,8 @@ __device__ __forceinline__ void cftPublishCountEarly(
 // from size_u8<kTokenDtype>(); the read stride is the input element width whether or
 // not the output is FP8 (so FP32-input quantization reads the correct stride too).
 template <ncclEpDispQuant_t kRecipe, int kHidden, int kNumTopk, ncclEpLayout_t kLayout, bool kNvlinkOnly,
-          typename TopkIdxT, ncclDataType_t kTokenDtype, typename ScaleT, bool kCft, bool kUseSharedQuant>
+          typename TopkIdxT, ncclDataType_t kTokenDtype, typename ScaleT, bool kCft, bool kUseSharedQuant,
+          bool kRankOwnsExperts, bool kRankOwnsTokens>
 __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_t& args) {
     constexpr bool kSharedQuant = kUseSharedQuant && kNvlinkOnly && !kCft &&
         kRecipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4 && kLayout == NCCL_EP_LAYOUT_RANK_MAJOR;
@@ -541,6 +551,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     int numExperts = args.numExperts;
     int currRank = args.currRank;
     int numRanks = args.numRanks;
+    int numAttnRanks = args.numAttnRanks;
     int numWarpGroups = args.numWarpGroups;
     int numWarpsPerGroup = args.numWarpsPerGroup;
     bool roundScale = args.roundScale;
@@ -564,7 +575,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     const auto warpId = threadId / 32, laneId = get_lane_id();
     const auto numSms = static_cast<int>(gridDim.x);
     const auto numWarps = numWarpGroups * numWarpsPerGroup;
-    const auto numLocalExperts = numExperts / numRanks;
+    const auto numLocalExperts = numExperts / (numRanks - numAttnRanks);
     const auto warpGroupId = warpId / numWarpsPerGroup;
     const auto subWarpId = warpId % numWarpsPerGroup;
     const auto responsibleExpertIdx = smId * numWarpGroups + warpGroupId;
@@ -580,7 +591,10 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     void* const recvBuf = rdmaBase + recvOff;
     int* const recvCntBuf = reinterpret_cast<int*>(rdmaBase + recvCntOff);
     int* const nextRecvCntBuf = reinterpret_cast<int*>(rdmaBase + recvCntOffBase + bank_next * signalSlotStride);
-    signalsBase += static_cast<unsigned>(bank) * static_cast<unsigned>(numExperts);
+    // Keep the GIN epoch stride consistent with the host-allocated
+    // [localExpert][worldSrcRank] signaling bank.
+    const auto signalsPerBank = static_cast<unsigned>(numLocalExperts * numRanks);
+    signalsBase += static_cast<unsigned>(bank) * signalsPerBank;
 
     auto rankSentCnt = rankSentCntBase;
     auto rankArrivedCnt = rankArrivedCntBase;
@@ -692,6 +706,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             auto dstExpertIdx =
                 warpId < numTopk ? static_cast<int>(__ldg(inTopkIdx + tokenIdx * numTopk + warpId)) : -1;
             auto dstRank = getExpertRankIdx(dstExpertIdx, numLocalExperts);
+            if (dstRank >= 0) dstRank += numAttnRanks;
 
             // Write token_id and routing information into the local staging
             // slot. Lane 0 of warps 0..numTopk-1 contribute one rtr entry each.
@@ -750,7 +765,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
                     int minTopkIdx = numTopk;
                     for (int i = laneId; i < numTopk; i += 32) {
                         const auto otherExpertIdx = sendBufHdr->rtr[i].expert_id;
-                        const auto otherRank = getExpertRankIdx(otherExpertIdx, numLocalExperts);
+                        auto otherRank = getExpertRankIdx(otherExpertIdx, numLocalExperts);
+                        if (otherRank >= 0) otherRank += numAttnRanks;
                         // if another expert is located on the same rank - disqualify this warp
                         // from sending the token to avoid duplication
                         if (otherRank == dstRank) {
@@ -835,7 +851,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
         // grid barrier before receive makes the clear visible before receive
         // overwrites the live rows. This makes every unwritten row an all--1
         // sentinel row without relying on received-token counts.
-        if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR) {
+        if constexpr (kLayout == NCCL_EP_LAYOUT_RANK_MAJOR && kRankOwnsExperts) {
             const size_t totalTopkEntries = static_cast<size_t>(numRanks) * maxTokensPerRank * numTopk;
             for (size_t i = static_cast<size_t>(smId) * 32 + laneId; i < totalTopkEntries;
                  i += static_cast<size_t>(numSms) * 32) {
@@ -857,54 +873,56 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
             }
         }
 
-        const auto expertBeginIdx = smId * numWarpGroups;
-        const auto expertEndIdx = min(expertBeginIdx + numWarpGroups, numExperts);
+        if constexpr (kRankOwnsTokens) {
+            const auto expertBeginIdx = smId * numWarpGroups;
+            const auto expertEndIdx = min(expertBeginIdx + numWarpGroups, numExperts);
 
-        // Note: it's possible that experts from the same rank are handled by multiple SMs
-        // In this case, the counters will be calculated on each involved SM
-        const int rankBeginIdx = expertBeginIdx / numLocalExperts;
-        const int rankEndIdx = expertEndIdx / numLocalExperts + 1;
+            // Note: it's possible that experts from the same rank are handled by multiple SMs
+            // In this case, the counters will be calculated on each involved SM
+            const int rankBeginIdx = expertBeginIdx / numLocalExperts;
+            const int rankEndIdx = expertEndIdx / numLocalExperts + 1;
 
-        if constexpr (kCft) {
-            // Early count publication puts this scan on the CFT receive path.
-            countTokensPerRankCft(
-                inTopkIdx,
-                numTokens,
-                numTopk,
-                numLocalExperts,
-                rankBeginIdx,
-                rankEndIdx,
-                sharedNumTokensSentPerRank,
-                laneId);
-            __syncwarp();
-            cftPublishCountEarly(
-                expertBeginIdx, expertEndIdx, sharedNumTokensSentPerRank, laneId,
-                currRank, numRanks, numLocalExperts, recvCntOff, recvCntBuf,
-                asyncErrorFlag, windows, devComm);
-        } else {
-            constexpr int kNumMaxRanks = 32;
-            int rankCount[kNumMaxRanks] = {0};
-            uint64_t rankMap[kNumMaxRanks] = {0};
-            countTokensPerRank_mask(
-                inTopkIdx,
-                numTokens,
-                numTopk,
-                numLocalExperts,
-                rankBeginIdx,
-                rankEndIdx,
-                rankCount,
-                rankMap,
-                sharedNumTokensSentPerRank,
-                laneId);
+            if constexpr (kCft) {
+                // Early count publication puts this scan on the CFT receive path.
+                countTokensPerRankCft(
+                    inTopkIdx,
+                    numTokens,
+                    numTopk,
+                    numLocalExperts,
+                    rankBeginIdx,
+                    rankEndIdx,
+                    sharedNumTokensSentPerRank,
+                    laneId);
+                __syncwarp();
+                cftPublishCountEarly(
+                    expertBeginIdx, expertEndIdx, sharedNumTokensSentPerRank, laneId,
+                    currRank, numRanks, numLocalExperts, recvCntOff, recvCntBuf,
+                    asyncErrorFlag, windows, devComm);
+            } else {
+                constexpr int kNumMaxRanks = 32;
+                int rankCount[kNumMaxRanks] = {0};
+                uint64_t rankMap[kNumMaxRanks] = {0};
+                countTokensPerRank_mask(
+                    inTopkIdx,
+                    numTokens,
+                    numTopk,
+                    numLocalExperts,
+                    rankBeginIdx,
+                    rankEndIdx,
+                    rankCount,
+                    rankMap,
+                    sharedNumTokensSentPerRank,
+                    laneId);
 
-            // One counting warp updates rankDone per rank on the store path.
+                // One counting warp updates rankDone per rank on the store path.
 #pragma unroll
-            for (int i = rankBeginIdx + laneId; i < rankEndIdx; i += 32) {
-                int firstExpertIdx = i * numLocalExperts;
-                if (firstExpertIdx >= expertBeginIdx and firstExpertIdx < expertEndIdx) {
-                    atomic_add_release_global(
-                        rankDone + i,
-                        FINISHED_SUM_TAG - sharedNumTokensSentPerRank[i - rankBeginIdx]);
+                for (int i = rankBeginIdx + laneId; i < rankEndIdx; i += 32) {
+                    int firstExpertIdx = i * numLocalExperts;
+                    if (firstExpertIdx >= expertBeginIdx and firstExpertIdx < expertEndIdx) {
+                        atomic_add_release_global(
+                            rankDone + i + numAttnRanks,
+                            FINISHED_SUM_TAG - sharedNumTokensSentPerRank[i - rankBeginIdx]);
+                    }
                 }
             }
         }
@@ -912,41 +930,45 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
 
     __syncthreads();
 
-    // Issue count sends
-    if (responsibleExpertIdx < numExperts and subWarpId == 0 and laneId == 0) {
-        const auto expertBeginIdx = smId * numWarpGroups;
-        const int rankBeginIdx = expertBeginIdx / numLocalExperts;
-        const auto dstRank = responsibleExpertIdx / numLocalExperts;
-        const auto dstExpertLocalIdx = responsibleExpertIdx % numLocalExperts;
-        const auto numTokensSent = sharedNumTokensSentPerRank[dstRank - rankBeginIdx];
+    if constexpr (kRankOwnsTokens) {
+        // Issue count sends only from ranks that dispatch tokens. F-ranks must
+        // not publish zero counts into signaling slots that no receiver polls.
+        if (responsibleExpertIdx < numExperts and subWarpId == 0 and laneId == 0) {
+            const auto expertBeginIdx = smId * numWarpGroups;
+            const int rankBeginIdx = expertBeginIdx / numLocalExperts;
+            const auto dstRankLocal = responsibleExpertIdx / numLocalExperts;
+            const auto dstRank = dstRankLocal + numAttnRanks;
+            const auto dstExpertLocalIdx = responsibleExpertIdx % numLocalExperts;
+            const auto numTokensSent = sharedNumTokensSentPerRank[dstRankLocal - rankBeginIdx];
 
-        // CFT counts were published by the counting warp. The store path
-        // must wait for payload completion before publishing its count.
-        if constexpr (!kCft) {
-            // Also wait for the next-bank wipe: a peer may publish its next
-            // operation's count/flag as soon as it receives this count.
-            const int rankDoneTarget = FINISHED_SUM_TAG * 2;
-            while (ld_acquire_global(rankDone + dstRank) != rankDoneTarget);
-            auto recvCntPtr = reinterpret_cast<uint64_t>(recvCntBuf + dstExpertLocalIdx * numRanks + currRank);
-            size_t recvCntOffset = recvCntOff + (dstExpertLocalIdx * numRanks + currRank) * sizeof(int);
-            sendExpertCount(
-                numTokensSent,
-                dstRank,
-                dstExpertLocalIdx,
-                currRank,
-                numRanks,
-                recvCntPtr,
-                recvCntOffset,
-                recvCntBuf,
-                rankMask,
-                signalsBase,
-                windows,
-                devComm);
-        }
+            // CFT counts were published by the counting warp. The store path
+            // must wait for payload completion before publishing its count.
+            if constexpr (!kCft) {
+                // Also wait for the next-bank wipe: a peer may publish its next
+                // operation's count/flag as soon as it receives this count.
+                const int rankDoneTarget = FINISHED_SUM_TAG * 2;
+                while (ld_acquire_global(rankDone + dstRank) != rankDoneTarget);
+                auto recvCntPtr = reinterpret_cast<uint64_t>(recvCntBuf + dstExpertLocalIdx * numRanks + currRank);
+                size_t recvCntOffset = recvCntOff + (dstExpertLocalIdx * numRanks + currRank) * sizeof(int);
+                sendExpertCount(
+                    numTokensSent,
+                    dstRank,
+                    dstExpertLocalIdx,
+                    currRank,
+                    numRanks,
+                    recvCntPtr,
+                    recvCntOffset,
+                    recvCntBuf,
+                    rankMask,
+                    signalsBase,
+                    windows,
+                    devComm);
+            }
 
-        // Clean `packed_recv_count` (expert-major only: outCnt is the per-expert slot allocator)
-        if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
-            if (dstRank == 0) outCnt[dstExpertLocalIdx] = 0;
+            // Clean `packed_recv_count` (expert-major only: outCnt is the per-expert slot allocator)
+            if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+                if (dstRankLocal == 0) outCnt[dstExpertLocalIdx] = 0;
+            }
         }
     }
     __syncwarp();
@@ -971,6 +993,9 @@ LOW_LATENCY_DISPATCH_RECV:
     }
 
     // Receiving and packing
+    // Rank ownership is a JIT specialization, so A-rank binaries end here
+    // without a runtime role branch or references to receive-only outputs.
+    if constexpr (!kRankOwnsExperts) return;
     if (responsibleExpertIdx < numExperts) {
         // responsibleExpertIdx defines 2 things:
         // 1. the source rank of tokens
@@ -981,7 +1006,7 @@ LOW_LATENCY_DISPATCH_RECV:
         // Point to the beginning of the per-token table (the first numRanks entries hold per-rank token counts)
         const auto recvSrcInfoBase = outSrcInfo + numRanks;
         // First global expert id that is hosted by this rank
-        const auto globalExpertStartIdx = currRank * numLocalExperts;
+        const auto globalExpertStartIdx = (currRank - numAttnRanks) * numLocalExperts;
         // Shared between sub-warps in warp groups
         __shared__ int sharedNumRecvTokens[kNumMaxWarpGroups];
 
@@ -1173,7 +1198,8 @@ LOW_LATENCY_DISPATCH_RECV:
                 if (numTopk > 1) {
                     bool matchesCurrRank =
                         (laneId < numTopk) &&
-                        (getExpertRankIdx((int)recvBufHdr->rtr[laneId].expert_id, numLocalExperts) == currRank);
+                        (getExpertRankIdx((int)recvBufHdr->rtr[laneId].expert_id, numLocalExperts) + numAttnRanks ==
+                         currRank);
                     uint32_t currRankMask = __ballot_sync(0xffffffff, matchesCurrRank);
                     int j_eff = currRankMask ? (__ffs(currRankMask) - 1) : -1;
                     if (laneId == 0) {
@@ -1255,12 +1281,12 @@ __forceinline__ __device__ void cleanNextRecvCntBufAndNotify(
     int* nextRecvCntBuf,
     int nextRecvCntBufSize,
     int* atomicCleanFlag,
-    int numExperts,
+    int notifyCount,
     int laneId) {
     cleanNextRecvCntBufStrided(nextRecvCntBuf, nextRecvCntBufSize, laneId, 32);
     // Notify before executing `int_p`
     __syncwarp();
-    if (laneId == 0) atomic_add_release_global(atomicCleanFlag, numExperts);
+    if (laneId == 0 and notifyCount != 0) atomic_add_release_global(atomicCleanFlag, notifyCount);
 }
 
 // Send finish flag to destination rank
@@ -1757,6 +1783,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
   LowLatencyEpochState* epochState, size_t payloadSlotStride, size_t signalSlotStride,
   // CONFIG
   int numCombinedTokens, int hidden, int maxTokensPerRank, int numExperts, int currRank, int numRanks,
+  int numAttnRanks,
   int numWarpGroups, int numWarpsPerGroup, int phases, bool zeroCopy, ncclDevComm* devComm,
   const ncclWindow_t* windows, unsigned signalsBase, uint64_t timeoutCycles) {
 #if !defined(__CUDA_ARCH_FAMILY_SPECIFIC__) || \
@@ -1776,7 +1803,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
     const auto threadId = static_cast<int>(threadIdx.x);
     const auto numThreads = __shfl_sync(0xffffffff, static_cast<int>(blockDim.x), 0);
     const auto warpId = __shfl_sync(0xffffffff, threadId / 32, 0), laneId = get_lane_id();
-    const auto numLocalExperts = numExperts / numRanks;
+    const auto numLocalExperts = numExperts / (numRanks - numAttnRanks);
     const auto warpGroupId = warpId / numWarpsPerGroup;
     const auto subWarpId = warpId % numWarpsPerGroup;
     const auto responsibleExpertIdx = smId * numWarpGroups + warpGroupId;
@@ -1792,7 +1819,10 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
     void* const recvBuf = rdmaBase + recvOff;
     int* const recvFlagBuf = reinterpret_cast<int*>(rdmaBase + recvFlagOff);
     int* const nextRecvCntBuf = reinterpret_cast<int*>(rdmaBase + recvFlagOffBase + bank_next * signalSlotStride);
-    signalsBase += static_cast<unsigned>(bank) * static_cast<unsigned>(numExperts);
+    // Dispatch and combine share the host-sized L * R epoch stride even though
+    // combine itself consumes only E flags from each bank.
+    const auto signalsPerBank = static_cast<unsigned>(numLocalExperts * numRanks);
+    signalsBase += static_cast<unsigned>(bank) * signalsPerBank;
 
     extern __shared__ __align__(1024) uint8_t smemBuffer[];
 
@@ -1841,11 +1871,12 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
 
     // Clean up next buffer
     if (smId == 0 and warpGroupId == 0 and subWarpId == 0) {
-        cleanNextRecvCntBufAndNotify(nextRecvCntBuf, nextRecvCntBufSize, atomicCleanFlag, numExperts, laneId);
+        const int notifyCount = afdRankOwnsExperts(currRank, numAttnRanks) ? numExperts : 0;
+        cleanNextRecvCntBufAndNotify(nextRecvCntBuf, nextRecvCntBufSize, atomicCleanFlag, notifyCount, laneId);
     }
 
     // Issue tokens sending
-    if (responsibleExpertIdx < numExperts) {
+    if (responsibleExpertIdx < numExperts && afdRankOwnsExperts(currRank, numAttnRanks)) {
         const auto dstRank = responsibleExpertIdx / numLocalExperts;
         // Each pair of rank establish numLocalExperts channels for parallelization
         const auto rankLaneIdx = responsibleExpertIdx % numLocalExperts;
@@ -2041,7 +2072,7 @@ __device__ __forceinline__ void combine_kernel_impl( // INPUT
         if (subWarpId == 1 and laneId == 0) {
             while (ld_acquire_global(atomicCleanFlag) == 0);
 
-            int globalExpertIdx = currRank * numLocalExperts + rankLaneIdx;
+            int globalExpertIdx = (currRank - numAttnRanks) * numLocalExperts + rankLaneIdx;
             auto recvFlagPtr = reinterpret_cast<uint64_t>(recvFlagBuf + globalExpertIdx);
             size_t recvFlagOffset = recvFlagOff + globalExpertIdx * sizeof(int);
 
@@ -2075,10 +2106,10 @@ LOW_LATENCY_COMBINE_RECV:
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0) return;
 
     // Wait all ranks to arrive
-    if (responsibleExpertIdx < numExperts) {
+    if (responsibleExpertIdx < numExperts && afdRankOwnsTokens(currRank, numAttnRanks)) {
         EP_DEVICE_ASSERT(numWarpsPerGroup > 1);
         if (subWarpId == 0 and laneId == 0) {
-            const auto srcRank = responsibleExpertIdx / numLocalExperts;
+            const auto srcRank = responsibleExpertIdx / numLocalExperts + numAttnRanks;
             waitForRecvFlag(
                 responsibleExpertIdx,
                 srcRank,
@@ -2185,7 +2216,7 @@ LOW_LATENCY_COMBINE_RECV:
                 for (int i = 0; i < numTopk; ++i) {
                     int topkIdxReg = __shfl_sync(0xffffffff, topkIdxByLane, i);
                     if (topkIdxReg < 0) continue;
-                    if (isRankMasked(rankMask, topkIdxReg / numLocalExperts)) continue;
+                    if (isRankMasked(rankMask, topkIdxReg / numLocalExperts + numAttnRanks)) continue;
 
                     uint64_t start_time = clock64();
                     mbarrier_wait<true>(emptyBarriers[stageIdx], tmaPhase, stageIdx);
@@ -2251,7 +2282,7 @@ LOW_LATENCY_COMBINE_RECV:
                 for (int i = 0; i < numTopk; ++i) {
                     int topkIdxReg = __shfl_sync(0xffffffff, topkIdxByLane, i);
                     if (topkIdxReg < 0) continue;
-                    if (isRankMasked(rankMask, topkIdxReg / numLocalExperts)) continue;
+                    if (isRankMasked(rankMask, topkIdxReg / numLocalExperts + numAttnRanks)) continue;
                     float topkWeight;
                     if constexpr (kLayout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
                         topkWeight = __shfl_sync(0xffffffff, topkWeightsByLane, i);

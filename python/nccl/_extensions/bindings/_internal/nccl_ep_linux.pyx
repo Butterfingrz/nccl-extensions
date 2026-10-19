@@ -135,6 +135,10 @@ cdef void* __ncclEpMaskUpdate = NULL
 cdef void* __ncclEpMaskClean = NULL
 cdef void* __ncclEpGetAsyncError = NULL
 cdef void* __ncclEpErrorClear = NULL
+cdef void* __ncclEpAfDispatch = NULL
+cdef void* __ncclEpAfCombine = NULL
+cdef void* __ncclEpAfRecv = NULL
+cdef void* __ncclEpAfReturn = NULL
 
 cdef int _init_nccl_ep() except -1 nogil:
     global _cyb___py_nccl_ep_init
@@ -275,6 +279,34 @@ cdef int _init_nccl_ep() except -1 nogil:
                 handle = load_library()
             __ncclEpErrorClear = _cyb_dlsym(handle, 'ncclEpErrorClear')
 
+        global __ncclEpAfDispatch
+        __ncclEpAfDispatch = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpAfDispatch')
+        if __ncclEpAfDispatch == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpAfDispatch = _cyb_dlsym(handle, 'ncclEpAfDispatch')
+
+        global __ncclEpAfCombine
+        __ncclEpAfCombine = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpAfCombine')
+        if __ncclEpAfCombine == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpAfCombine = _cyb_dlsym(handle, 'ncclEpAfCombine')
+
+        global __ncclEpAfRecv
+        __ncclEpAfRecv = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpAfRecv')
+        if __ncclEpAfRecv == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpAfRecv = _cyb_dlsym(handle, 'ncclEpAfRecv')
+
+        global __ncclEpAfReturn
+        __ncclEpAfReturn = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpAfReturn')
+        if __ncclEpAfReturn == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpAfReturn = _cyb_dlsym(handle, 'ncclEpAfReturn')
+
         _cyb_atomic_int_store(<int *>&_cyb___py_nccl_ep_init, 1)
         return 0
 
@@ -348,6 +380,18 @@ cpdef dict _inspect_function_pointers():
 
     global __ncclEpErrorClear
     data["__ncclEpErrorClear"] = <intptr_t>__ncclEpErrorClear
+
+    global __ncclEpAfDispatch
+    data["__ncclEpAfDispatch"] = <intptr_t>__ncclEpAfDispatch
+
+    global __ncclEpAfCombine
+    data["__ncclEpAfCombine"] = <intptr_t>__ncclEpAfCombine
+
+    global __ncclEpAfRecv
+    data["__ncclEpAfRecv"] = <intptr_t>__ncclEpAfRecv
+
+    global __ncclEpAfReturn
+    data["__ncclEpAfReturn"] = <intptr_t>__ncclEpAfReturn
     _cyb_func_ptrs = data
     return data
 
@@ -599,3 +643,43 @@ cdef ncclResult_t _ncclEpErrorClear(ncclEpGroup_t ep_group) except?_NCCLRESULT_T
             raise FunctionNotFoundError("function ncclEpErrorClear is not found")
     return (<ncclResult_t (*)(ncclEpGroup_t) noexcept nogil>__ncclEpErrorClear)(
         ep_group)
+
+
+cdef ncclResult_t _ncclEpAfDispatch(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpAfDispatch
+    _check_or_init_nccl_ep()
+    if __ncclEpAfDispatch == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpAfDispatch is not found")
+    return (<ncclResult_t (*)(ncclEpHandle_t, const ncclEpDispatchInputs_t*, const ncclEpDispatchOutputs_t*, const ncclEpLayoutInfo_t*, const ncclEpDispatchConfig_t*, cudaStream_t) noexcept nogil>__ncclEpAfDispatch)(
+        handle, inputs, outputs, layout_info, config, stream)
+
+
+cdef ncclResult_t _ncclEpAfCombine(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpAfCombine
+    _check_or_init_nccl_ep()
+    if __ncclEpAfCombine == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpAfCombine is not found")
+    return (<ncclResult_t (*)(ncclEpHandle_t, const ncclEpCombineInputs_t*, const ncclEpCombineOutputs_t*, const ncclEpCombineConfig_t*, cudaStream_t) noexcept nogil>__ncclEpAfCombine)(
+        handle, inputs, outputs, config, stream)
+
+
+cdef ncclResult_t _ncclEpAfRecv(ncclEpHandle_t handle, const ncclEpDispatchInputs_t* inputs, const ncclEpDispatchOutputs_t* outputs, const ncclEpLayoutInfo_t* layout_info, const ncclEpDispatchConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpAfRecv
+    _check_or_init_nccl_ep()
+    if __ncclEpAfRecv == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpAfRecv is not found")
+    return (<ncclResult_t (*)(ncclEpHandle_t, const ncclEpDispatchInputs_t*, const ncclEpDispatchOutputs_t*, const ncclEpLayoutInfo_t*, const ncclEpDispatchConfig_t*, cudaStream_t) noexcept nogil>__ncclEpAfRecv)(
+        handle, inputs, outputs, layout_info, config, stream)
+
+
+cdef ncclResult_t _ncclEpAfReturn(ncclEpHandle_t handle, const ncclEpCombineInputs_t* inputs, const ncclEpCombineOutputs_t* outputs, const ncclEpCombineConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpAfReturn
+    _check_or_init_nccl_ep()
+    if __ncclEpAfReturn == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpAfReturn is not found")
+    return (<ncclResult_t (*)(ncclEpHandle_t, const ncclEpCombineInputs_t*, const ncclEpCombineOutputs_t*, const ncclEpCombineConfig_t*, cudaStream_t) noexcept nogil>__ncclEpAfReturn)(
+        handle, inputs, outputs, config, stream)

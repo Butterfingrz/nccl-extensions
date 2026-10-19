@@ -2420,8 +2420,8 @@ cdef class CombineOutputs:
 cdef _get_group_config_dtype_offsets():
     cdef ncclEpGroupConfig_t pod
     return _numpy.dtype({
-        'names': ['size_', 'magic', 'version', 'algorithm', 'num_experts', 'max_dispatch_tokens_per_rank', 'max_recv_tokens_per_rank', 'max_token_bytes', 'rdma_buffer_size', 'num_qp_per_rank', 'num_channels', 'max_num_sms', 'alloc', 'enable_mask', 'timeout_ns', 'zero_copy', 'overflow_policy', 'num_topk', 'padding_v2', 'dispatch_num_sms', 'combine_num_sms', 'ht_flow', 'meta_exchange_policy'],
-        'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.dtype(('V', sizeof(unsigned long int))), _numpy.uint32, _numpy.uint32, _numpy.uint32, alloc_config_dtype, _numpy.uint32, _numpy.uint64, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4), _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.int32],
+        'names': ['size_', 'magic', 'version', 'algorithm', 'num_experts', 'max_dispatch_tokens_per_rank', 'max_recv_tokens_per_rank', 'max_token_bytes', 'rdma_buffer_size', 'num_qp_per_rank', 'num_channels', 'max_num_sms', 'alloc', 'enable_mask', 'timeout_ns', 'zero_copy', 'overflow_policy', 'num_topk', 'padding_v2', 'dispatch_num_sms', 'combine_num_sms', 'ht_flow', 'meta_exchange_policy', 'num_attn_ranks', 'padding_v4'],
+        'formats': [_numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.uint32, _numpy.dtype(('V', sizeof(unsigned long int))), _numpy.uint32, _numpy.uint32, _numpy.uint32, alloc_config_dtype, _numpy.uint32, _numpy.uint64, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4), _numpy.uint32, _numpy.uint32, _numpy.int32, _numpy.int32, _numpy.uint32, (_numpy.uint8, 4)],
         'offsets': [
             (<intptr_t>&(pod.size)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.magic)) - (<intptr_t>&pod),
@@ -2446,6 +2446,8 @@ cdef _get_group_config_dtype_offsets():
             (<intptr_t>&(pod.combine_num_sms)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.ht_flow)) - (<intptr_t>&pod),
             (<intptr_t>&(pod.meta_exchange_policy)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.num_attn_ranks)) - (<intptr_t>&pod),
+            (<intptr_t>&(pod.padding_v4)) - (<intptr_t>&pod),
         ],
         'itemsize': sizeof(ncclEpGroupConfig_t),
     })
@@ -2787,6 +2789,34 @@ cdef class GroupConfig:
             raise ValueError("This GroupConfig instance is read-only")
         self._ptr[0].meta_exchange_policy = <ncclEpMetaExchangePolicy_t><int>val
 
+    @property
+    def num_attn_ranks(self):
+        """int: Number of leading attention ranks for AFD; zero disables AFD."""
+        return self._ptr[0].num_attn_ranks
+
+    @num_attn_ranks.setter
+    def num_attn_ranks(self, val):
+        if self._readonly:
+            raise ValueError("This GroupConfig instance is read-only")
+        self._ptr[0].num_attn_ranks = val
+
+    @property
+    def padding_v4(self):
+        """~_numpy.uint8: (array of length 4)."""
+        cdef _cyb_view.array arr = _cyb_view.array(shape=(4,), itemsize=sizeof(unsigned char), format="B", mode="c", allocate_buffer=False)
+        arr.data = <char *>(&(self._ptr[0].padding_v4))
+        return _numpy.asarray(arr)
+
+    @padding_v4.setter
+    def padding_v4(self, val):
+        if self._readonly:
+            raise ValueError("This GroupConfig instance is read-only")
+        if len(val) != 4:
+            raise ValueError(f"Expected length { 4 } for field padding_v4, got {len(val)}")
+        cdef _cyb_view.array arr = _cyb_view.array(shape=(4,), itemsize=sizeof(unsigned char), format="B", mode="c")
+        arr[:] = _numpy.asarray(val, dtype=_numpy.uint8)
+        _cyb_memcpy(<void *>(&(self._ptr[0].padding_v4)), <void *>(arr.data), sizeof(unsigned char) * len(val))
+
     @staticmethod
     def from_buffer(buffer):
         """Create an GroupConfig instance with the memory from the given buffer."""
@@ -3062,6 +3092,30 @@ cpdef int get_async_error(intptr_t ep_group) except? -1:
 cpdef error_clear(intptr_t ep_group):
     with nogil:
         __status__ = ncclEpErrorClear(<Group>ep_group)
+    check_status(__status__)
+
+
+cpdef af_dispatch(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t layout_info, intptr_t config, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpAfDispatch(<Handle>handle, <const ncclEpDispatchInputs_t*>inputs, <const ncclEpDispatchOutputs_t*>outputs, <const ncclEpLayoutInfo_t*>layout_info, <const ncclEpDispatchConfig_t*>config, <Stream>stream)
+    check_status(__status__)
+
+
+cpdef af_combine(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t config, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpAfCombine(<Handle>handle, <const ncclEpCombineInputs_t*>inputs, <const ncclEpCombineOutputs_t*>outputs, <const ncclEpCombineConfig_t*>config, <Stream>stream)
+    check_status(__status__)
+
+
+cpdef af_recv(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t layout_info, intptr_t config, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpAfRecv(<Handle>handle, <const ncclEpDispatchInputs_t*>inputs, <const ncclEpDispatchOutputs_t*>outputs, <const ncclEpLayoutInfo_t*>layout_info, <const ncclEpDispatchConfig_t*>config, <Stream>stream)
+    check_status(__status__)
+
+
+cpdef af_return(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t config, intptr_t stream):
+    with nogil:
+        __status__ = ncclEpAfReturn(<Handle>handle, <const ncclEpCombineInputs_t*>inputs, <const ncclEpCombineOutputs_t*>outputs, <const ncclEpCombineConfig_t*>config, <Stream>stream)
     check_status(__status__)
 
 

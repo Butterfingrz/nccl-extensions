@@ -15,7 +15,7 @@ function: [Quantization](quantization.md), [Zero-Copy](zero_copy.md),
 | [Group Management](#group-management) | `ncclEpCreateGroup`, `ncclEpGroupDestroy` |
 | [Tensor Descriptors](#tensor-descriptors) | `ncclEpTensorAlloc`, `ncclEpTensorDestroy` |
 | [Handle Management](#handle-management) | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpImportHandle`, `ncclEpHandleDestroy` |
-| [Communication Operations](#communication-operations) | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete` |
+| [Communication Operations](#communication-operations) | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpAfDispatch`, `ncclEpAfRecv`, `ncclEpAfCombine`, `ncclEpAfReturn`, `ncclEpComplete` |
 | [Fault Tolerance](#fault-tolerance) | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear` |
 
 ## Library
@@ -434,6 +434,75 @@ ncclResult_t ncclEpCombine(
     cudaStream_t stream
 );
 ```
+
+### AFD role wrappers
+
+Attention-FFN Disaggregation (AFD) partitions an LL rank-major group into a
+leading prefix of attention ranks and a trailing set of expert ranks, selected
+by `ncclEpGroupConfig_t::num_attn_ranks`. The four role-named APIs validate the
+calling rank and then forward to the ordinary dispatch or combine operation.
+They do not create separate collectives: every rank must call its matching side
+of each row below in the same order.
+
+| Collective | Attention ranks | Expert ranks |
+|---|---|---|
+| Dispatch | `ncclEpAfDispatch` | `ncclEpAfRecv` |
+| Combine | `ncclEpAfCombine` | `ncclEpAfReturn` |
+
+```c
+ncclResult_t ncclEpAfDispatch(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream);
+
+ncclResult_t ncclEpAfRecv(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream);
+
+ncclResult_t ncclEpAfCombine(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream);
+
+ncclResult_t ncclEpAfReturn(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream);
+```
+
+On attention ranks, dispatch receive tensors and combine `inputs->tokens` are
+omitted. On expert ranks, dispatch `inputs->topk_weights` is omitted, while the
+rank-major dispatch receive tensors and combine input tensor are required. A
+wrong-role call returns `ncclInvalidUsage`; an invalid handle returns
+`ncclInvalidArgument`.
+
+AFD follows the ordinary LL `AUTO` zero-copy contract: window use must be
+consistent across the collective. When dispatch output tokens are window-backed,
+every rank participates in the same `ncclCommWindowRegister` call and attaches
+the resulting handle to `outputs->tokens`. F-ranks register the full receive
+allocation. A-ranks may register a minimal placeholder allocation because NCCL
+supports asymmetric window sizes; their local allocation is not written. If no
+rank attaches a window, dispatch uses library staging as usual. Mixing windowed
+and non-windowed descriptors across ranks is unsupported, as in classic LL EP.
+
+Python exposes the same role checks as `Handle.af_dispatch`, `Handle.af_recv`,
+`Handle.af_combine`, and `Handle.af_return`.
+
+AFD currently supports unquantized communication only. Both sides of dispatch
+must use `NCCL_EP_DISP_QUANT_NONE`, and both sides of combine must use
+`NCCL_EP_COMB_QUANT_NONE`. Other quantization recipes are not supported with
+`num_attn_ranks > 0`.
 
 ### `ncclEpComplete()` (LL mode only)
 

@@ -329,6 +329,7 @@ static inline const ncclEpTensor_t* tensor_required(const ncclEpTensor_t* t) {
 struct DispatchRecipeLaunchContext {
     ncclEpAlgorithm_t algorithm;
     ncclEpLayout_t layout;
+    bool requires_output;
     int hidden;
     int num_local_experts;
     int num_ranks;
@@ -358,10 +359,10 @@ static ncclResult_t validateDispatchRecipe(
             if (!validate_dtype(tokens->datatype)) {
                 return fail("tokens has unsupported dtype");
             }
-            if (output_tokens == nullptr) {
+            if (launch.requires_output && output_tokens == nullptr) {
                 return fail("outputs->tokens is required");
             }
-            if (output_tokens->datatype != tokens->datatype) {
+            if (launch.requires_output && output_tokens->datatype != tokens->datatype) {
                 return fail("outputs->tokens dtype must match inputs->tokens");
             }
             if (input_scales != nullptr) {
@@ -393,14 +394,15 @@ static ncclResult_t validateDispatchRecipe(
             if (input_scales == nullptr) {
                 return fail("inputs->scales is required");
             }
-            if (output_scales == nullptr) {
+            if (launch.requires_output && output_scales == nullptr) {
                 return fail("outputs->scales is required");
             }
-            if (output_tokens == nullptr) {
+            if (launch.requires_output && output_tokens == nullptr) {
                 return fail("outputs->tokens is required");
             }
             if (!storage_aligned(tokens) || !storage_aligned(input_scales) ||
-                !storage_aligned(output_tokens) || !storage_aligned(output_scales)) {
+                (launch.requires_output &&
+                 (!storage_aligned(output_tokens) || !storage_aligned(output_scales)))) {
                 return fail("token and scale storage pointers/window offsets must be 16-byte aligned");
             }
             if (input_scales->ndim != 2) {
@@ -422,7 +424,7 @@ static ncclResult_t validateDispatchRecipe(
             if (token_bytes + scale_bytes > launch.max_token_bytes) {
                 return fail("token bytes plus scale bytes exceed the group token-byte limit");
             }
-            if (launch.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
+            if (launch.algorithm == NCCL_EP_ALGO_LOW_LATENCY && launch.requires_output) {
                 size_t expected_rows = 0;
                 size_t expected_slots = 0;
                 if (launch.layout == NCCL_EP_LAYOUT_RANK_MAJOR) {
@@ -452,7 +454,7 @@ static ncclResult_t validateDispatchRecipe(
                     output_scales->sizes[2] != input_scales->sizes[1]) {
                     return fail("LL outputs->scales dimensions do not match the selected layout and input scales");
                 }
-            } else {
+            } else if (launch.algorithm != NCCL_EP_ALGO_LOW_LATENCY) {
                 if (output_tokens->datatype != tokens->datatype || output_tokens->ndim != 2 ||
                     output_tokens->sizes[1] != tokens->sizes[1]) {
                     return fail("HT outputs->tokens must match the input dtype and physical row width");
@@ -474,10 +476,10 @@ static ncclResult_t validateDispatchRecipe(
             if (tokens->datatype != ncclBfloat16) {
                 return fail("DS_FP8E3M4 requires BF16 input tokens");
             }
-            if (output_tokens == nullptr) {
+            if (launch.requires_output && output_tokens == nullptr) {
                 return fail("DS_FP8E3M4 requires outputs->tokens");
             }
-            if (output_tokens->datatype != ncclFloat8e4m3) {
+            if (launch.requires_output && output_tokens->datatype != ncclFloat8e4m3) {
                 return fail("DS_FP8E3M4 requires E4M3 output tokens");
             }
             if (tokens->ndim != 2 ||
@@ -487,7 +489,7 @@ static ncclResult_t validateDispatchRecipe(
             if (input_scales != nullptr) {
                 return fail("DS_FP8E3M4 does not accept inputs->scales");
             }
-            if (output_scales == nullptr) {
+            if (launch.requires_output && output_scales == nullptr) {
                 return fail("DS_FP8E3M4 requires outputs->scales");
             }
             const size_t expected_scales =
@@ -501,14 +503,16 @@ static ncclResult_t validateDispatchRecipe(
                 expected_rows = static_cast<size_t>(launch.num_local_experts);
                 expected_slots = static_cast<size_t>(launch.max_tokens_per_rank) * launch.num_ranks;
             }
-            if (output_tokens->ndim != 3 || output_tokens->sizes[0] != expected_rows ||
-                output_tokens->sizes[1] != expected_slots || output_tokens->sizes[2] != tokens->sizes[1]) {
+            if (launch.requires_output &&
+                (output_tokens->ndim != 3 || output_tokens->sizes[0] != expected_rows ||
+                 output_tokens->sizes[1] != expected_slots || output_tokens->sizes[2] != tokens->sizes[1])) {
                 return fail("DS_FP8E3M4 outputs->tokens must be 3D matching the selected layout and hidden");
             }
-            if (output_scales->ndim != 3 || output_scales->datatype != ncclFloat32 ||
-                output_scales->sizes[0] != expected_rows ||
-                output_scales->sizes[1] != expected_slots ||
-                output_scales->sizes[2] != expected_scales) {
+            if (launch.requires_output &&
+                (output_scales->ndim != 3 || output_scales->datatype != ncclFloat32 ||
+                 output_scales->sizes[0] != expected_rows ||
+                 output_scales->sizes[1] != expected_slots ||
+                 output_scales->sizes[2] != expected_scales)) {
                 return fail("DS_FP8E3M4 outputs->scales must be FP32 3D matching the selected layout "
                             "and hidden / 128");
             }
@@ -528,9 +532,10 @@ static ncclResult_t validateCombineRecipe(
     const ncclEpCombineConfig_t* config,
     ncclEpAlgorithm_t algorithm,
     unsigned int device_sm,
-    bool internode) {
+    bool internode,
+    bool requires_input) {
     const auto recipe = config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
-    const ncclEpTensor_t* tokens = tensor_required(inputs->tokens);
+    const ncclEpTensor_t* tokens = requires_input ? tensor_required(inputs->tokens) : tensor_ptr(inputs->tokens);
     const ncclEpTensor_t* scales = tensor_ptr(inputs->scales);
     // Recipe validation must be able to reject an invalid input contract before
     // later execution validation requires an output descriptor.  This preserves
@@ -546,7 +551,7 @@ static ncclResult_t validateCombineRecipe(
             if (scales != nullptr) {
                 return fail("inputs->scales must be null for NONE");
             }
-            return validate_dtype(tokens->datatype)
+            return !requires_input || validate_dtype(tokens->datatype)
                 ? ncclSuccess : fail("tokens has unsupported dtype");
         case NCCL_EP_COMB_QUANT_NVFP4:
             // LL-only, as the enum documents: the HT combine kernels have no NVFP4
@@ -565,10 +570,13 @@ static ncclResult_t validateCombineRecipe(
                         device_sm);
                 return ncclInvalidUsage;
             }
-            if (output_tokens == nullptr || tokens->datatype != ncclBfloat16 || output_tokens->datatype != ncclBfloat16) {
+            if (output_tokens == nullptr ||
+                (requires_input && tokens->datatype != ncclBfloat16) ||
+                output_tokens->datatype != ncclBfloat16) {
                 return fail("NVFP4 requires BF16 input and output tokens");
             }
-            if (scales == nullptr || scales->datatype != ncclFloat32 || scales->ndim != 3) {
+            if (requires_input &&
+                (scales == nullptr || scales->datatype != ncclFloat32 || scales->ndim != 3)) {
                 return fail("NVFP4 requires FP32 3D inputs->scales global scales");
             }
             return ncclSuccess;
@@ -821,7 +829,8 @@ struct ncclEpGroup {
 
     } gin_config;
 
-    int num_local_experts;    // Number of local experts (num_experts / comm->nRanks)
+    int num_local_experts;    // Experts per F-rank (or per rank for classic EP).
+    int num_attn_ranks;       // AFD A-side rank count; zero means classic EP.
     int max_recv_tokens;      // Resolved per-rank IPC slot budget (= config.max_recv_tokens_per_rank).
 
     // SM-count configuration, all resolved once at ncclEpCreateGroup.
@@ -1001,7 +1010,7 @@ struct ncclEpGroup {
           ws_dispatch_rankArrivedCnt(nullptr), ws_dispatch_rankDone(nullptr), ws_combine_sync(nullptr),
           cuda_device_id(0), lsa_team_size(0),
           lsa_rank(0), rdma_team_size(0), rdma_rank(0), rdma_buffer(nullptr), rdma_buffer_size_alloc(0), config{},
-          num_local_experts(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
+          num_local_experts(0), num_attn_ranks(0), max_recv_tokens(0), device_sm(0), device_sm_count(0), max_dynamic_smem(0),
           last_ll_combine_warps_per_group(0), device_smem_optin(0), dispatch_num_sms(0), combine_num_sms(0),
           dispatch_copy_mode(nccl_ep::ht::DispatchCopyMode::kTma), shuffle_sms(0),
           preprocess_num_sms(0), ht_em_mode(HtEmMode::kLocalPermute), alloc{}, gpus_per_node(0), rank_in_node(0),
@@ -2273,6 +2282,30 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     }
     assert(in_config->num_experts > 0 && "ncclEpCreateGroup: num_experts must be greater than 0");
     assert(in_config->max_token_bytes > 0 && "ncclEpCreateGroup: max_token_bytes must be greater than 0");
+    if (in_config->num_attn_ranks >= static_cast<unsigned int>(nRanks)) {
+        fprintf(stderr, "ncclEpCreateGroup: num_attn_ranks must be in [0, nRanks)\n");
+        return ncclInvalidArgument;
+    }
+    const int num_attn_ranks = static_cast<int>(in_config->num_attn_ranks);
+    if (num_attn_ranks > 0 && !low_latency_mode) {
+        fprintf(stderr, "ncclEpCreateGroup: AFD is supported by the universal LL kernels only\n");
+        return ncclInvalidUsage;
+    }
+    if (num_attn_ranks > 0 && num_attn_ranks != nRanks - num_attn_ranks) {
+        fprintf(stderr, "ncclEpCreateGroup: AFD currently requires a square A:F rank partition\n");
+        return ncclInvalidUsage;
+    }
+    // Low-expert AFD geometries are outside the current scope. Requiring E > R
+    // also lets the existing E-sized counter storage cover every world-rank
+    // index without changing main's allocation or reset scheme.
+    if (num_attn_ranks > 0 && in_config->num_experts <= static_cast<unsigned int>(nRanks)) {
+        fprintf(stderr, "ncclEpCreateGroup: AFD requires num_experts > nRanks\n");
+        return ncclInvalidArgument;
+    }
+    if (num_attn_ranks > 0 && in_config->num_experts % (nRanks - num_attn_ranks) != 0) {
+        fprintf(stderr, "ncclEpCreateGroup: num_experts must be divisible by the F-rank count\n");
+        return ncclInvalidArgument;
+    }
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -2496,7 +2529,8 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
     }
     ep_group->nNodes = static_cast<int>(unique_hosts.size());
 
-    ep_group->num_local_experts = ep_group->config.num_experts / ep_group->nRanks;
+    ep_group->num_attn_ranks = num_attn_ranks;
+    ep_group->num_local_experts = ep_group->config.num_experts / (ep_group->nRanks - ep_group->num_attn_ranks);
     EP_HOST_ASSERT(
         !(in_config->algorithm == NCCL_EP_ALGO_HIGH_THROUGHPUT && ep_group->config.max_recv_tokens_per_rank != 0 &&
           ep_group->config.max_recv_tokens_per_rank < ep_group->config.max_dispatch_tokens_per_rank) &&
@@ -2883,28 +2917,41 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ep_group->ll_epoch_state), sizeof(nccl_ep::LowLatencyEpochState)));
         CUDA_CHECK(cudaMemset(ep_group->ll_epoch_state, 0, sizeof(nccl_ep::LowLatencyEpochState)));
 
-        // Agree on CFT before endpoint setup and mask-window registration,
-        // both of which would deadlock if only a subset of ranks entered.
+        // Agree on the LL wire-layout inputs and CFT before endpoint setup and
+        // mask-window registration, which require the same decision on every rank.
         bool want_ll_cft = false;
         {
-            // Include each rank's floors so debug overrides produce the same
-            // collective verdict on every rank.
-            struct CftVote {
+            // num_attn_ranks changes rank roles and the symmetric signaling
+            // layout. Include it in the existing vote so mismatches fail
+            // collectively before any rank enters the selected protocol.
+            // Include each rank's floors so debug overrides also produce the
+            // same collective verdict on every rank.
+            struct LlGroupVote {
+                uint32_t num_attn_ranks;
                 uint8_t want_cft;
                 uint8_t enable_mask;
                 uint8_t zero_copy;
-                uint8_t pad_[5];
+                uint8_t pad_[1];
                 ncclEpCftPlatformFacts facts;
                 ncclEpCftPlatformFloors floors;
             };
-            std::vector<CftVote> vote(ep_group->nRanks, CftVote{});
+            std::vector<LlGroupVote> vote(ep_group->nRanks, LlGroupVote{});
+            vote[ep_group->rank].num_attn_ranks = ep_group->config.num_attn_ranks;
             vote[ep_group->rank].want_cft = nccl_ep_env_flag_on(ep_group->env.ll_cft) ? 1 : 0;
             vote[ep_group->rank].enable_mask = ep_group->config.enable_mask ? 1 : 0;
             vote[ep_group->rank].zero_copy = ep_group->config.zero_copy == NCCL_EP_ZERO_COPY_ON;
             vote[ep_group->rank].facts = cft_facts;
             vote[ep_group->rank].floors = cft_floors;
-            ncclAllGatherHost(vote.data(), sizeof(CftVote), ep_group->rank, ep_group->nRanks, comm, stream);
+            ncclAllGatherHost(vote.data(), sizeof(LlGroupVote), ep_group->rank, ep_group->nRanks, comm, stream);
             for (int r = 1; r < ep_group->nRanks; ++r) {
+                if (vote[r].num_attn_ranks != vote[0].num_attn_ranks) {
+                    fprintf(stderr,
+                            "NCCL EP: num_attn_ranks must be identical on every rank "
+                            "(rank 0 = %u, rank %d = %u); it selects AFD rank roles and "
+                            "the LL signaling layout\n",
+                            vote[0].num_attn_ranks, r, vote[r].num_attn_ranks);
+                    return reject_group(ncclInvalidUsage);
+                }
                 if (vote[0].want_cft && vote[r].zero_copy != vote[0].zero_copy) {
                     fprintf(stderr, "NCCL EP: CFT requires zero_copy=ON on all ranks or none\n");
                     return reject_group(ncclInvalidUsage);
@@ -2921,6 +2968,13 @@ ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* out_ep_group, ncclComm_t comm, con
             }
             // All ranks judge the same facts before creating any endpoints.
             if (vote[0].want_cft) {
+                if (ep_group->num_attn_ranks > 0) {
+                    fprintf(stderr,
+                            "NCCL EP: AFD currently supports the universal LL store/RDMA path only; "
+                            "unset %s on every rank.\n",
+                            ep_group->env.ll_cft.name);
+                    return reject_group(ncclInvalidUsage);
+                }
                 if (props.nLsaTeams != 1) {
                     fprintf(stderr,
                             "NCCL EP: %s requires all ranks in one NCCL LSA team for P2P token-count "
@@ -3958,7 +4012,8 @@ ll_init_handle(ncclEpHandle_t handle, ncclEpGroup_t ep_group, const ncclEpTensor
         ep_group->nRanks,
         ep_group->config.num_experts,
         num_topk,
-        handle->layout);
+        handle->layout,
+        ep_group->num_attn_ranks);
 
     // Ensure rdma_buffer is large enough for this handle's actual layout.
     // - NCCL_EP_AUTO: lazily allocate (first handle) or grow (later handle
@@ -4293,8 +4348,12 @@ ncclResult_t ncclEpInitHandle(
         !(ep_group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY && layout != NCCL_EP_LAYOUT_EXPERT_MAJOR &&
           layout != NCCL_EP_LAYOUT_RANK_MAJOR) &&
         "ncclEpInitHandle: LL mode supports only expert-major and rank-major layouts");
+    if (ep_group->num_attn_ranks > 0 && layout != NCCL_EP_LAYOUT_RANK_MAJOR) {
+        fprintf(stderr, "ncclEpInitHandle: AFD supports rank-major layout only\n");
+        return ncclInvalidUsage;
+    }
     assert(ep_group->config.num_experts > 0);
-    assert(ep_group->config.num_experts % ep_group->nRanks == 0);
+    assert(ep_group->config.num_experts % (ep_group->nRanks - ep_group->num_attn_ranks) == 0);
     NCCLCHECK(validate_required_fused_exchange(ep_group, layout, num_topk));
 
     // Validate EM padding alignment up-front (pow2 required) before any allocation.
@@ -5390,11 +5449,20 @@ ncclResult_t ncclEpDispatch(
     const ncclEpDispQuant_t recipe =
         config ? config->quant_recipe : NCCL_EP_DISP_QUANT_NONE;
     ncclEpGroup_t group = handle->group;
+    if (group->num_attn_ranks > 0 && recipe != NCCL_EP_DISP_QUANT_NONE) {
+        fprintf(stderr, "ncclEpDispatch: AFD supports only NCCL_EP_DISP_QUANT_NONE\n");
+        return ncclInvalidUsage;
+    }
+    const bool owns_experts =
+        group->num_attn_ranks == 0 || group->rank >= group->num_attn_ranks;
+    const bool owns_tokens =
+        group->num_attn_ranks == 0 || group->rank < group->num_attn_ranks;
     const ncclEpTensor_t* recipe_tokens = tensor_required(inputs->tokens);
     if (recipe_tokens->ndim != 2) return ncclInvalidArgument;
     const DispatchRecipeLaunchContext recipe_launch{
         .algorithm = group->config.algorithm,
         .layout = handle->layout,
+        .requires_output = owns_experts,
         .hidden = static_cast<int>(recipe_tokens->sizes[1]),
         .num_local_experts = group->num_local_experts,
         .num_ranks = group->nRanks,
@@ -5432,16 +5500,18 @@ ncclResult_t ncclEpDispatch(
         const int hidden = static_cast<int>(x->sizes[1]);
 
         // Find and validate output tensors
-        const ncclEpTensor_t* recv_x = tensor_required(outputs->tokens);
+        const ncclEpTensor_t* recv_x = owns_experts ? tensor_required(outputs->tokens) : tensor_ptr(outputs->tokens);
         const ncclEpTensor_t* scales = tensor_ptr(outputs->scales);
         // Resolve window-only descriptors before staged fallback.
         ncclEpTensor_t recv_x_local = NCCL_EP_TENSOR_INIT;
         ncclEpTensor_t scales_local = NCCL_EP_TENSOR_INIT;
-        NCCLCHECK(resolveTensorWindowBinding(group, recv_x, &recv_x_local, 0, &recv_x));
+        if (recv_x != nullptr) {
+            NCCLCHECK(resolveTensorWindowBinding(group, recv_x, &recv_x_local, 0, &recv_x));
+        }
         if (scales != nullptr) {
             NCCLCHECK(resolveTensorWindowBinding(group, scales, &scales_local, 0, &scales));
         }
-        assert(recv_x->ndim > 0);
+        if (owns_experts) assert(recv_x->ndim > 0);
 
 
         // Read rank-major-specific tensors unconditionally so we can assert
@@ -5457,28 +5527,32 @@ ncclResult_t ncclEpDispatch(
         case NCCL_EP_LAYOUT_RANK_MAJOR:
             // Rank-major output is 3D so the per-rank, per-slot structure is
             // explicit in the descriptor — the caller must acknowledge it.
-            assert(recv_x->ndim == 3);
-            assert(recv_x->sizes[0] == static_cast<unsigned>(group->nRanks));
-            assert(recv_x->sizes[1] == group->config.max_dispatch_tokens_per_rank);
-            assert(recv_x->sizes[2] == static_cast<unsigned>(hidden));
-            assert(topk_weights_in != nullptr);
-            assert(recv_topk_weights != nullptr);
-            assert(recv_topk_idx != nullptr);
-            assert(topk_weights_in->ndim == 2);
-            assert(topk_weights_in->datatype == ncclFloat32);
-            assert(topk_weights_in->sizes[0] == static_cast<unsigned>(handle->num_tokens));
-            assert(topk_weights_in->sizes[1] == static_cast<unsigned>(handle->num_topk));
-            assert(recv_topk_weights->ndim == 3);
-            assert(recv_topk_weights->datatype == ncclFloat32);
-            assert(recv_topk_weights->sizes[0] == static_cast<unsigned>(group->nRanks));
-            assert(recv_topk_weights->sizes[1] == group->config.max_dispatch_tokens_per_rank);
-            assert(recv_topk_weights->sizes[2] == static_cast<unsigned>(handle->num_topk));
-            assert(recv_topk_idx->ndim == 3);
-            assert(recv_topk_idx->datatype == ncclInt32);
-            assert(recv_topk_idx->sizes[0] == static_cast<unsigned>(group->nRanks));
-            assert(recv_topk_idx->sizes[1] == group->config.max_dispatch_tokens_per_rank);
-            assert(recv_topk_idx->sizes[2] == static_cast<unsigned>(handle->num_topk));
-            if (src_rank_counter != nullptr) {
+            if (owns_experts) {
+                assert(recv_x->ndim == 3);
+                assert(recv_x->sizes[0] == static_cast<unsigned>(group->nRanks));
+                assert(recv_x->sizes[1] == group->config.max_dispatch_tokens_per_rank);
+                assert(recv_x->sizes[2] == static_cast<unsigned>(hidden));
+                assert(recv_topk_weights != nullptr);
+                assert(recv_topk_idx != nullptr);
+                assert(recv_topk_weights->ndim == 3);
+                assert(recv_topk_weights->datatype == ncclFloat32);
+                assert(recv_topk_weights->sizes[0] == static_cast<unsigned>(group->nRanks));
+                assert(recv_topk_weights->sizes[1] == group->config.max_dispatch_tokens_per_rank);
+                assert(recv_topk_weights->sizes[2] == static_cast<unsigned>(handle->num_topk));
+                assert(recv_topk_idx->ndim == 3);
+                assert(recv_topk_idx->datatype == ncclInt32);
+                assert(recv_topk_idx->sizes[0] == static_cast<unsigned>(group->nRanks));
+                assert(recv_topk_idx->sizes[1] == group->config.max_dispatch_tokens_per_rank);
+                assert(recv_topk_idx->sizes[2] == static_cast<unsigned>(handle->num_topk));
+            }
+            if (owns_tokens) {
+                assert(topk_weights_in != nullptr);
+                assert(topk_weights_in->ndim == 2);
+                assert(topk_weights_in->datatype == ncclFloat32);
+                assert(topk_weights_in->sizes[0] == static_cast<unsigned>(handle->num_tokens));
+                assert(topk_weights_in->sizes[1] == static_cast<unsigned>(handle->num_topk));
+            }
+            if (owns_experts && src_rank_counter != nullptr) {
                 assert(src_rank_counter->ndim == 1);
                 assert(src_rank_counter->datatype == ncclInt32);
                 assert(src_rank_counter->sizes[0] == static_cast<unsigned>(group->nRanks));
@@ -5523,7 +5597,9 @@ ncclResult_t ncclEpDispatch(
             recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_FWD ||
             recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
         const bool cft_active = group->ll_cft_buffers.initialized;
-        NCCLCHECK(prepare_ll_cft_output(handle, *recv_x, recipe, hidden, x->datatype, stream));
+        if (cft_active) {
+            NCCLCHECK(prepare_ll_cft_output(handle, *recv_x, recipe, hidden, x->datatype, stream));
+        }
         const bool cft_zc_live = cft_active && group->ll_cft_buffers.zc_active;
         const bool zcopy_ok =
             nvlink_only &&
@@ -5546,7 +5622,7 @@ ncclResult_t ncclEpDispatch(
                 return ncclInvalidArgument;
             }
         }
-        const bool zcopy_rcv_x = zcopy_ok && recv_x->win_hdl != ncclWindow_t{};
+        const bool zcopy_rcv_x = zcopy_ok && recv_x != nullptr && recv_x->win_hdl != ncclWindow_t{};
         const bool zcopy_rcv_scales =
             zcopy_ok && (recipe == NCCL_EP_DISP_QUANT_FWD || recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4) &&
             scales != nullptr && scales->win_hdl != ncclWindow_t{};
@@ -5571,7 +5647,7 @@ ncclResult_t ncclEpDispatch(
                 static_cast<int>(group->config.zero_copy),
                 static_cast<int>(nvlink_only),
                 static_cast<int>(handle->layout == NCCL_EP_LAYOUT_RANK_MAJOR),
-                static_cast<int>(recv_x->win_hdl != ncclWindow_t{}),
+                static_cast<int>(recv_x != nullptr && recv_x->win_hdl != ncclWindow_t{}),
                 static_cast<int>(zcopy_rcv_scales));
         }
         // Strict zero_copy=ON contract: at least one eligible payload window
@@ -5628,13 +5704,14 @@ ncclResult_t ncclEpDispatch(
         // 1-sided, so dispatch must not record dstInfo or publish want-1-sided for a combine that
         // will never read them. A forced "1sided" request still records for STORE only.
         const bool want_1sided_combine =
+            group->num_attn_ranks == 0 &&
             ((combine_enforced_kernel == ll::LlCombineKernel::kNone &&
               !handle->ll.dispatch_1sided_disqualified) ||
              combine_enforced_kernel == ll::LlCombineKernel::k1SidedRmLsa) &&
             dispatch_lsa_mode != ll::NcclEpDispatchLsaMode::kUniversal && !cft_active;
         // Window resolution can use stack descriptors; the receive continuation
         // must retain their data pointers rather than the descriptors themselves.
-        void* const recv_x_data = recv_x->data;
+        void* const recv_x_data = recv_x ? recv_x->data : nullptr;
         void* const scales_data = scales ? scales->data : nullptr;
         auto dispatch_fn = [=](int phases) -> ncclResult_t {
             void* const rdma_buf = group->rdma_buffer;
@@ -5703,6 +5780,7 @@ ncclResult_t ncclEpDispatch(
                 params.numExperts = group->config.num_experts;
                 params.currRank = group->rank;
                 params.numRanks = group->nRanks;
+                params.numAttnRanks = group->num_attn_ranks;
                 params.layout = handle->layout;
                 params.devComm = group->nccl_dev_comm;
                 params.windows = group->nccl_wins;
@@ -7079,9 +7157,16 @@ ncclResult_t ncclEpCombine(
     const ncclEpPassDir_t pass_direction = config ? config->pass_direction : NCCL_EP_FWD_PASS;
     const ncclEpCombQuant_t quantization_recipe =
         config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
+    ncclEpGroup_t group = handle->group;
+    if (group->num_attn_ranks > 0 && quantization_recipe != NCCL_EP_COMB_QUANT_NONE) {
+        fprintf(stderr, "ncclEpCombine: AFD supports only NCCL_EP_COMB_QUANT_NONE\n");
+        return ncclInvalidUsage;
+    }
+    const bool owns_experts =
+        group->num_attn_ranks == 0 || group->rank >= group->num_attn_ranks;
     NCCLCHECK(validateCombineRecipe(
-        inputs, outputs, config, handle->group->config.algorithm, handle->group->device_sm,
-        is_internode_available(handle->group)));
+        inputs, outputs, config, group->config.algorithm, group->device_sm,
+        is_internode_available(group), owns_experts));
     if (pass_direction != NCCL_EP_FWD_PASS && handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         fprintf(stderr, "ncclEpCombine: backward pass (pass_direction=%d) is not supported in LL mode\n",
                 (int)pass_direction);
@@ -7103,7 +7188,9 @@ ncclResult_t ncclEpCombine(
     {
         const ncclEpCombQuant_t gate_recipe =
             config ? config->quant_recipe : NCCL_EP_COMB_QUANT_NONE;
-        const ncclEpTensor_t* xt = tensor_required(inputs->tokens);
+        const ncclEpTensor_t* xt = owns_experts
+            ? tensor_required(inputs->tokens)
+            : tensor_required(outputs->tokens);
         if (gate_recipe == NCCL_EP_COMB_QUANT_NONE && !validate_dtype(xt->datatype)) {
             fprintf(stderr, "NCCL EP: combine unsupported token dtype %d\n", static_cast<int>(xt->datatype));
             return ncclInvalidArgument;
@@ -7112,9 +7199,11 @@ ncclResult_t ncclEpCombine(
 
     if (handle->group->config.algorithm == NCCL_EP_ALGO_LOW_LATENCY) {
         // Find and validate input tensors
-        const ncclEpTensor_t* x = tensor_required(inputs->tokens);
+        const ncclEpTensor_t* x = owns_experts ? tensor_required(inputs->tokens) : tensor_ptr(inputs->tokens);
         const ncclEpTensor_t* global_scales = tensor_ptr(inputs->scales);
-        assert(x->ndim > 0);
+        if (owns_experts) assert(x->ndim > 0);
+        const ncclEpTensor_t* out = tensor_required(outputs->tokens);
+        assert(out->ndim == 2);
 
         // LSA-eligibility input to ll_combine_lsa_eligible (called by call_combine in
         // device/ll_ep_adapter.cu), which picks the RDMA-staged 2-sided kernel for eligible calls
@@ -7151,23 +7240,28 @@ ncclResult_t ncclEpCombine(
 
         // Extract hidden dimension (index differs by layout).
         int hidden;
-        switch (handle->layout) {
-        case NCCL_EP_LAYOUT_RANK_MAJOR:
-            // Rank-major input is 3D so the per-rank, per-slot structure is
-            // explicit in the descriptor — the caller must acknowledge it.
-            assert(x->ndim == 3);
-            assert(x->sizes[0] == static_cast<unsigned>(num_ranks));
-            assert(x->sizes[1] == static_cast<unsigned>(num_max_dispatch_tokens_per_rank));
-            assert(x->sizes[2] % sizeof(int4) == 0);
-            hidden = static_cast<int>(x->sizes[2]);
-            break;
-        default:
-            assert(x->ndim == 3);
-            assert(x->sizes[0] == num_experts / num_ranks);
-            assert(x->sizes[1] == static_cast<unsigned>(num_ranks) * num_max_dispatch_tokens_per_rank);
-            assert(x->sizes[2] % sizeof(int4) == 0);
-            hidden = static_cast<int>(x->sizes[2]);
-            break;
+        if (!owns_experts) {
+            hidden = static_cast<int>(out->sizes[1]);
+            assert(out->sizes[1] % sizeof(int4) == 0);
+        } else {
+            switch (handle->layout) {
+            case NCCL_EP_LAYOUT_RANK_MAJOR:
+                // Rank-major input is 3D so the per-rank, per-slot structure is
+                // explicit in the descriptor — the caller must acknowledge it.
+                assert(x->ndim == 3);
+                assert(x->sizes[0] == static_cast<unsigned>(num_ranks));
+                assert(x->sizes[1] == static_cast<unsigned>(num_max_dispatch_tokens_per_rank));
+                assert(x->sizes[2] % sizeof(int4) == 0);
+                hidden = static_cast<int>(x->sizes[2]);
+                break;
+            default:
+                assert(x->ndim == 3);
+                assert(x->sizes[0] == num_experts / num_ranks);
+                assert(x->sizes[1] == static_cast<unsigned>(num_ranks) * num_max_dispatch_tokens_per_rank);
+                assert(x->sizes[2] % sizeof(int4) == 0);
+                hidden = static_cast<int>(x->sizes[2]);
+                break;
+            }
         }
 
         // NCCL_EP_COMBINE_LSA, resolved to the kernel it enforces (see resolve_combine_enforced_kernel's
@@ -7176,7 +7270,7 @@ ncclResult_t ncclEpCombine(
         // the want-1-sided decision (see dispatch_kernel_args_t::combineLsaThreshold's doc comment).
         const ll::LlCombineKernel combine_enforced_kernel = resolve_combine_enforced_kernel(handle->group->env);
 
-        if (quantization_recipe == NCCL_EP_COMB_QUANT_NVFP4) {
+        if (quantization_recipe == NCCL_EP_COMB_QUANT_NVFP4 && owns_experts) {
             constexpr int kNvfp4WarpSize = 32;
             constexpr int kNvfp4MaxSendUnrolls = 4;
             constexpr int kNvfp4ElementsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
@@ -7234,14 +7328,12 @@ ncclResult_t ncclEpCombine(
         // Validate buffer layout
         assert(handle->ll.layout.total_bytes <= handle->group->rdma_buffer_size_alloc);
 
-        // Find and validate output tensor
-        const ncclEpTensor_t* out = tensor_required(outputs->tokens);
-
         assert(out->ndim > 0);
         assert(out->ndim == 2);
         assert(out->sizes[0] == num_combined_tokens);
         assert(out->sizes[1] == hidden);
-        assert(out->datatype == x->datatype);
+        const ncclEpTensor_t* wire_tokens = owns_experts ? x : out;
+        assert(out->datatype == wire_tokens->datatype);
 
         if (nccl_ep_env_flag_on(handle->group->env.debug)) {
             fprintf(
@@ -7258,7 +7350,7 @@ ncclResult_t ncclEpCombine(
             void* const rdma_buf = handle->group->rdma_buffer;
             // Prepare data pointers
             auto* out_data = out->data;
-            auto* x_data = x->data;
+            auto* x_data = x ? x->data : nullptr;
             auto* topk_weights_data = topk_weights ? static_cast<float*>(topk_weights->data) : nullptr;
             auto* src_info_data = static_cast<int*>(src_info->data);
             // Passed through unconditionally -- call_combine decides whether 1-sided is actually
@@ -7302,6 +7394,7 @@ ncclResult_t ncclEpCombine(
                 params.numExperts = num_experts;
                 params.currRank = handle->group->rank;
                 params.numRanks = handle->group->nRanks;
+                params.numAttnRanks = handle->group->num_attn_ranks;
                 params.layout = handle->layout;
                 params.devComm = handle->group->nccl_dev_comm;
                 params.windows = handle->group->nccl_wins;
@@ -7320,7 +7413,7 @@ ncclResult_t ncclEpCombine(
                 params.useLogFmt = false;
                 params.zeroCopy = false;
                 params.phases = phases;
-                params.tokenDtype = x->datatype;
+                params.tokenDtype = wire_tokens->datatype;
                 params.quantizationRecipe = quantization_recipe;
                 params.nvlinkOnly = nvlink_only;
                 params.enforced = combine_enforced_kernel;
@@ -7946,7 +8039,8 @@ ncclResult_t ncclEpMaskClean(ncclEpGroup_t ep_group, cudaStream_t stream) {
         ep_group->nRanks,
         ep_group->config.num_experts,
         MAX_NUM_TOPK,
-        NCCL_EP_LAYOUT_RANK_MAJOR);
+        NCCL_EP_LAYOUT_RANK_MAJOR,
+        ep_group->num_attn_ranks);
     char* rdma_base = static_cast<char*>(ep_group->rdma_buffer);
     const auto clean_0 = layout.buffer.clean_meta_offset();
     const auto clean_1 = std::pair{clean_0.first + layout.signal_slot_stride, clean_0.second};
@@ -8002,6 +8096,77 @@ ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) {
     __atomic_store_n(ep_group->async_error_flag, 0, __ATOMIC_RELEASE);
     return ncclSuccess;
 }
+
+static ncclResult_t ncclEpAfValidateRole(ncclEpHandle_t handle, bool expect_attn, const char* api_name) {
+    if (handle == nullptr || handle->group == nullptr) {
+        fprintf(stderr, "%s: handle and group must be valid\n", api_name);
+        return ncclInvalidArgument;
+    }
+    if (handle->group->num_attn_ranks == 0) {
+        fprintf(stderr, "%s: group was not created with num_attn_ranks > 0\n", api_name);
+        return ncclInvalidUsage;
+    }
+    const bool is_attn = handle->group->rank < handle->group->num_attn_ranks;
+    if (is_attn != expect_attn) {
+        fprintf(stderr, "%s must be called on an %s rank\n", api_name, expect_attn ? "attention" : "expert");
+        return ncclInvalidUsage;
+    }
+    // Expert ranks receive/return attention-owned tokens but never contribute
+    // source-token rows of their own. Require an explicitly bound zero-row
+    // routing tensor so a lazy handle cannot adopt a nonzero input later.
+    if (!expect_attn && (!handle->num_tokens_set || handle->num_tokens != 0)) {
+        fprintf(stderr, "%s requires an expert-rank handle bound to zero source tokens\n", api_name);
+        return ncclInvalidUsage;
+    }
+    return ncclSuccess;
+}
+
+ncclResult_t ncclEpAfDispatch(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream) {
+    const ncclResult_t role_result = ncclEpAfValidateRole(handle, true, "ncclEpAfDispatch");
+    if (role_result != ncclSuccess) return role_result;
+    return ncclEpDispatch(handle, inputs, outputs, layout_info, config, stream);
+}
+
+ncclResult_t ncclEpAfCombine(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream) {
+    const ncclResult_t role_result = ncclEpAfValidateRole(handle, true, "ncclEpAfCombine");
+    if (role_result != ncclSuccess) return role_result;
+    return ncclEpCombine(handle, inputs, outputs, config, stream);
+}
+
+ncclResult_t ncclEpAfRecv(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream) {
+    const ncclResult_t role_result = ncclEpAfValidateRole(handle, false, "ncclEpAfRecv");
+    if (role_result != ncclSuccess) return role_result;
+    return ncclEpDispatch(handle, inputs, outputs, layout_info, config, stream);
+}
+
+ncclResult_t ncclEpAfReturn(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream) {
+    const ncclResult_t role_result = ncclEpAfValidateRole(handle, false, "ncclEpAfReturn");
+    if (role_result != ncclSuccess) return role_result;
+    return ncclEpCombine(handle, inputs, outputs, config, stream);
+}
+
 // ── Test-only internal helpers (declared in nccl_ep_test_internal.h) ─────────
 // Exposed via a separate test header so library consumers cannot accidentally
 // depend on these implementation details.

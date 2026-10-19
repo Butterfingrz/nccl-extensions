@@ -78,6 +78,7 @@ static constexpr int kPullMaxLsaRanks = 128;
 // ============================================================================
 // Standard includes
 // ============================================================================
+#include <cassert>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -349,7 +350,8 @@ struct LowLatencyLayout {
         int num_ranks,
         int num_experts,
         int num_topk,
-        ncclEpLayout_t layout) {
+        ncclEpLayout_t layout,
+        int num_attn_ranks = 0) {
         // Two physical payload and signaling banks are addressed from one base
         // layout by the device-selected epoch parity.
 
@@ -406,9 +408,18 @@ struct LowLatencyLayout {
         payload_slot_stride = slot_bytes;
         total_bytes += payload_slot_stride * 2;
 
-        // Symmetric signaling buffers: dispatch recv-count / combine recv-flag share one slot.
-        size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int);
-        size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
+        // Dispatch addresses each epoch bank as [localExpert][worldSrcRank],
+        // which requires L * R counters. Combine needs one flag per expert (E).
+        // Both operations reuse the same bank, so size it for max(L * R, E).
+        // In classic EP every rank owns experts, hence L * R == E; AFD has only
+        // F expert ranks, so L = E / F and the dispatch bank grows to L * R.
+        const int num_expert_ranks = num_ranks - num_attn_ranks;
+        // Public group validation establishes this before any layout is built.
+        assert(num_expert_ranks > 0 && num_experts % num_expert_ranks == 0);
+        const size_t num_dispatch_signals =
+            static_cast<size_t>(num_experts / num_expert_ranks) * num_ranks;
+        size_t dispatch_recv_count_buffer_bytes = num_dispatch_signals * sizeof(int);
+        size_t combine_recv_flag_buffer_bytes = static_cast<size_t>(num_experts) * sizeof(int);
         size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
 
         // Read-done (combine_kernel_impl_1sided_rm_lsa) and total-token (NCCL_EP_COMBINE_LSA auto
@@ -452,14 +463,16 @@ inline unsigned long int get_low_latency_rdma_size_hint_for_layout(
     size_t max_token_bytes,
     int num_ranks,
     int num_experts,
-    ncclEpLayout_t layout) {
+    ncclEpLayout_t layout,
+    int num_attn_ranks = 0) {
     auto num_bytes = LowLatencyLayout(
                          num_max_dispatch_tokens_per_rank,
                          max_token_bytes,
                          num_ranks,
                          num_experts,
                          MAX_NUM_TOPK,
-                         layout)
+                         layout,
+                         num_attn_ranks)
                          .total_bytes;
     return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }
@@ -471,14 +484,16 @@ inline unsigned long int get_low_latency_rdma_size_hint(
     int num_max_dispatch_tokens_per_rank,
     size_t max_token_bytes,
     int num_ranks,
-    int num_experts) {
+    int num_experts,
+    int num_attn_ranks = 0) {
     auto bytes_for = [&](ncclEpLayout_t layout) {
         return get_low_latency_rdma_size_hint_for_layout(
             num_max_dispatch_tokens_per_rank,
             max_token_bytes,
             num_ranks,
             num_experts,
-            layout);
+            layout,
+            num_attn_ranks);
     };
     return std::max(bytes_for(NCCL_EP_LAYOUT_EXPERT_MAJOR), bytes_for(NCCL_EP_LAYOUT_RANK_MAJOR));
 }

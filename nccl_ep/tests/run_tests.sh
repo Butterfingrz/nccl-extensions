@@ -142,6 +142,7 @@ SUITES=(
     "test_quantization_recipe|EP Quantization Recipe Tests|1"
     "test_zero_copy|EP Zero-Copy forced|0"
     "test_recv_topk_idx_flags|EP Recv Topk Idx Flags Tests|0"
+    "test_ll_afd_selection|EP LL AFD Kernel Selection Tests|0"
     "test_elastic_buffer|EP Elastic Buffer Tests|0"
     "test_mxfp8_combine|EP MXFP8 Combine Tests|0"
     "test_mxfp8_combine_conversion|EP MXFP8 Conversion Coverage Tests|0"

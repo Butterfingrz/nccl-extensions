@@ -56,14 +56,14 @@ constexpr int kLlCombineMaxUnrolls = 4;
 inline bool ll_combine_lsa_eligible(
     bool nvlinkOnly, ncclEpCombQuant_t qrecipe, bool useLogFmt, ncclEpLayout_t layout,
     bool cftEnabled, int hidden, ncclDataType_t tokenDtype,
-    NcclEpDispatchLsaMode lsaMode) {
+    NcclEpDispatchLsaMode lsaMode, int numAttnRanks = 0) {
     // General CFT does not clear the next bank and must use general combine.
     const bool dispatchWipesNextBank = !cftEnabled ||
         (ll_cft_lsa_enabled() && lsaMode != NcclEpDispatchLsaMode::kUniversal);
     const int elemBytes = tokenDtype == ncclFloat32 ? 4 : 2;
     const int elemsPerTile = combine_smem::kWarpSize * combine_smem::kNumRecvUnrolls *
         combine_smem::elements_per_int4(elemBytes);
-    return hidden > 0 && hidden % elemsPerTile == 0 && dispatchWipesNextBank && nvlinkOnly &&
+    return numAttnRanks == 0 && hidden > 0 && hidden % elemsPerTile == 0 && dispatchWipesNextBank && nvlinkOnly &&
         qrecipe == NCCL_EP_COMB_QUANT_NONE && !useLogFmt && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
 }
 
@@ -206,6 +206,7 @@ inline std::string ll_combine_jit_source(
                 << "      p.waitStats, p.epochState, p.payloadSlotStride, p.signalSlotStride,\n"
                 << "      p.numCombinedTokens, p.hidden, p.maxTokensPerRank,\n"
                 << "      p.numExperts, p.currRank, p.numRanks,\n"
+                << "      p.numAttnRanks,\n"
                 << "      p.numWarpGroups, p.numWarpsPerGroup,\n"
                 << "      p.phases, p.zeroCopy,\n"
                 << "      p.devComm, p.windows, p.signalsBase, p.timeoutCycles);\n";

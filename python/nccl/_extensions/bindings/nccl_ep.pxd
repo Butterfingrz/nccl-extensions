@@ -69,4 +69,8 @@ cpdef mask_update(intptr_t ep_group, intptr_t mask, intptr_t stream)
 cpdef mask_clean(intptr_t ep_group, intptr_t stream)
 cpdef int get_async_error(intptr_t ep_group) except? -1
 cpdef error_clear(intptr_t ep_group)
+cpdef af_dispatch(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t layout_info, intptr_t config, intptr_t stream)
+cpdef af_combine(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t config, intptr_t stream)
+cpdef af_recv(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t layout_info, intptr_t config, intptr_t stream)
+cpdef af_return(intptr_t handle, intptr_t inputs, intptr_t outputs, intptr_t config, intptr_t stream)
 cpdef object get_library_path()

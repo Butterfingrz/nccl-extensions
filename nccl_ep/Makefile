@@ -46,7 +46,7 @@ ifeq ($(origin NVCC_GENCODE),file)
   endif
 endif
 
-.PHONY: all build clean lib ep_test ep_bench
+.PHONY: all build clean lib ep_test ep_bench af_test
 
 # Build layout:
 #   NCCL_HOME — input: NCCL core headers + libnccl.so
@@ -173,7 +173,7 @@ SOLIBLINKS   := $(LIBDIR)/$(SOLIBSONAME) $(LIBDIR)/$(SOLIBNAME)
 HEADERS := include/nccl_ep.h
 HEADER_TARGETS := $(HEADERS:include/%=$(INCDIR)/%)
 # Build targets
-all: lib ep_test ep_bench
+all: lib ep_test ep_bench af_test
 build: lib
 
 lib: $(LIBTARGET) $(SOLIBTARGET) $(SOLIBLINKS) $(HEADER_TARGETS) $(NCCL_EP_JIT_HEADER_TARGETS)
@@ -281,6 +281,7 @@ EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) -I$(NCCL_INCDIR) $(MPI_CFLAGS)
 EP_BENCH_NVLDFLAGS := $(EP_EXE_NCCL_LDFLAGS) $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
+af_test: lib $(DST_DIR)/af_test
 
 $(DST_DIR)/ep_test.o: ep_test.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
@@ -288,6 +289,16 @@ $(DST_DIR)/ep_test.o: ep_test.cu $(HEADER_TARGETS)
 	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
 
 $(DST_DIR)/ep_test: $(DST_DIR)/ep_test.o $(SOLIBTARGET)
+	@printf "Linking    %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
+
+$(DST_DIR)/af_test.o: af_test.cu $(HEADER_TARGETS)
+	@printf "Compiling  %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
+
+$(DST_DIR)/af_test: $(DST_DIR)/af_test.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
@@ -312,6 +323,7 @@ EP_BENCH_NVCUFLAGS := $(NVCC_GENCODE) -I$(INCDIR) $(MPI_CFLAGS) $(CUPTI_CFLAGS) 
 EP_BENCH_NVLDFLAGS := $(EP_EXE_NCCL_LDFLAGS) $(MPI_LDFLAGS) -lpthread -lrt -ldl -lcuda $(CUPTI_LDFLAGS)
 ep_test: lib $(DST_DIR)/ep_test
 ep_bench: lib $(DST_DIR)/ep_bench
+af_test: lib $(DST_DIR)/af_test
 
 $(DST_DIR)/ep_test.o: ep_test.cu $(HEADER_TARGETS)
 	@printf "Compiling  %-35s > %s\n" $< $@
@@ -319,6 +331,16 @@ $(DST_DIR)/ep_test.o: ep_test.cu $(HEADER_TARGETS)
 	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
 
 $(DST_DIR)/ep_test: $(DST_DIR)/ep_test.o $(SOLIBTARGET)
+	@printf "Linking    %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
+
+$(DST_DIR)/af_test.o: af_test.cu $(HEADER_TARGETS)
+	@printf "Compiling  %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) -c $<
+
+$(DST_DIR)/af_test: $(DST_DIR)/af_test.o $(SOLIBTARGET)
 	@printf "Linking    %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_TEST_NVCUFLAGS) $< $(EP_TEST_NVLDFLAGS)
@@ -333,8 +355,8 @@ $(DST_DIR)/ep_bench: $(DST_DIR)/ep_bench.o $(SOLIBTARGET)
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(EP_BENCH_NVCUFLAGS) $< $(EP_BENCH_NVLDFLAGS)
 else
-ep_test ep_bench:
-	@echo "Skipping ep_test/ep_bench (MPI not enabled). Use MPI=1 to build."
+ep_test ep_bench af_test:
+	@echo "Skipping ep_test/ep_bench/af_test (MPI not enabled). Use MPI=1 to build."
 endif
 endif
 

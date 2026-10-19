@@ -500,6 +500,8 @@ typedef struct {
     unsigned char padding_v2[4];                // Consumes V2 tail padding; future fields append after
     unsigned int dispatch_num_sms;              // Dispatch budget (AUTO inherits max_num_sms/default)
     unsigned int combine_num_sms;               // Combine budget (AUTO inherits max_num_sms/default)
+    unsigned int num_attn_ranks;                // AFD A-side ranks; 0 = classic EP (universal LL only)
+    unsigned char padding_v4[4];                // Consumes V4 tail padding; future fields append after
 } ncclEpGroupConfig_t;
 
 // Use NCCL_EP_GROUP_CONFIG_INIT to pre-fill size/magic/version correctly.
@@ -697,7 +699,7 @@ documentation for more details.
 ## API Reference
 
 The complete C API reference lives in **[docs/documentation/api_reference.md](docs/documentation/api_reference.md)**,
-covering all 19 public entry points:
+covering all 23 public entry points:
 
 | Group                    | Functions                                                                                                    |
 |--------------------------|--------------------------------------------------------------------------------------------------------------|
@@ -705,7 +707,7 @@ covering all 19 public entry points:
 | Group Management         | `ncclEpCreateGroup`, `ncclEpGroupDestroy`                                                                    |
 | Tensor Descriptors       | `ncclEpTensorAlloc`, `ncclEpTensorDestroy`                                                                   |
 | Handle Management        | `ncclEpCreateHandle`, `ncclEpInitHandle`, `ncclEpUpdateHandle`, `ncclEpHandleMemSize`, `ncclEpImportHandle`, `ncclEpHandleDestroy` |
-| Communication Operations | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpComplete`                                                          |
+| Communication Operations | `ncclEpDispatch`, `ncclEpCombine`, `ncclEpAfDispatch`, `ncclEpAfRecv`, `ncclEpAfCombine`, `ncclEpAfReturn`, `ncclEpComplete` |
 | Fault Tolerance (LL)     | `ncclEpMaskQuery`, `ncclEpMaskUpdate`, `ncclEpMaskClean`, `ncclEpGetAsyncError`, `ncclEpErrorClear`          |
 
 # Execution Modes

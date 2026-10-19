@@ -68,7 +68,9 @@ void ncclEpGroupConfig_backwards_compat_test() {
     static_assert(offsetof(ncclEpGroupConfig_t, combine_num_sms) == 116);
     static_assert(offsetof(ncclEpGroupConfig_t, ht_flow) == 120);
     static_assert(offsetof(ncclEpGroupConfig_t, meta_exchange_policy) == 124);
-    static_assert(sizeof(ncclEpGroupConfig_t) == 128);
+    static_assert(offsetof(ncclEpGroupConfig_t, num_attn_ranks) == 128);
+    static_assert(offsetof(ncclEpGroupConfig_t, padding_v4) == 132);
+    static_assert(sizeof(ncclEpGroupConfig_t) == 136);
 }
 
 void ncclEpLayoutInfo_backwards_compat_test() {
@@ -234,6 +236,7 @@ TEST(PublicStructAbiTest, InitializersPopulatePrefix) {
     EXPECT_EQ(group.combine_num_sms, NCCL_EP_AUTO);
     EXPECT_EQ(group.ht_flow, NCCL_EP_HT_FLOW_AUTO);
     EXPECT_EQ(group.meta_exchange_policy, NCCL_EP_META_EXCHANGE_AUTO);
+    EXPECT_EQ(group.num_attn_ranks, 0u);
     expectPublicStructPrefix(
         dispatch_inputs, NCCL_EP_DISPATCH_INPUTS_SIZE, NCCL_EP_MAGIC);
     expectPublicStructPrefix(

@@ -3,6 +3,11 @@
 This document defines the public tensor contracts for NCCL EP quantization
 support. The support is realized via quantization recipes (separate for Dispatch and Combine).
 
+Attention-FFN Disaggregation (AFD, enabled by
+`ncclEpGroupConfig_t::num_attn_ranks > 0`) currently supports unquantized
+communication only. AFD callers must select `NCCL_EP_DISP_QUANT_NONE` for
+dispatch and `NCCL_EP_COMB_QUANT_NONE` for combine.
+
 In the remainder of this document,
 * `B` is the batch size,
 * `H` is the logical hidden dimension, and

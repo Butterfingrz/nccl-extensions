@@ -350,6 +350,12 @@ typedef struct {
     // fallbacks otherwise. REQUIRE_FUSED rejects handles/calls that need
     // early exchange or scan; FORCE_SCAN selects the legacy scan path.
     ncclEpMetaExchangePolicy_t meta_exchange_policy;
+    // AFD (Attention-FFN Disaggregation), universal LL kernel only. Ranks
+    // [0, num_attn_ranks) own source tokens; remaining ranks own all experts.
+    // AFD requires num_experts > communicator ranks and supports only unquantized
+    // dispatch/combine recipes. Zero preserves classic EP.
+    unsigned int num_attn_ranks;
+    unsigned char padding_v4[4];
 } ncclEpGroupConfig_t;
 
 #define NCCL_EP_GROUP_CONFIG_INIT \
@@ -368,8 +374,8 @@ typedef struct {
 
 #define NCCL_EP_GROUP_CONFIG_V3_LAST_FIELD combine_num_sms
 #define NCCL_EP_GROUP_CONFIG_V3_SIZE 120u
-#define NCCL_EP_GROUP_CONFIG_V4_LAST_FIELD meta_exchange_policy
-#define NCCL_EP_GROUP_CONFIG_V4_SIZE 128u
+#define NCCL_EP_GROUP_CONFIG_V4_LAST_FIELD padding_v4
+#define NCCL_EP_GROUP_CONFIG_V4_SIZE 136u
 #define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 4
 
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG);
@@ -426,6 +432,8 @@ typedef struct {
   //   LL/expert-major layout: per-expert received token counts (dispatch time).
     ncclEpTensor_t* src_rank_counters; // 1D [num_ranks] int32
   //   LL/rank-major layout only: per-source-rank token counts (dispatch time).
+  //   On AFD expert ranks, only [0, num_attn_ranks) is written; the remaining
+  //   entries are unspecified. AFD attention ranks do not write this tensor.
     ncclEpTensor_t* expert_offsets; // 1D [num_local_experts] int32 or int64
   //   HT (Handle time), expert-major layout only: prefix sum of padded per-expert counts.
   //   Ignored for the Flat layout (no per-expert zones), at handle and dispatch time alike.
@@ -469,6 +477,7 @@ typedef struct {
     ncclEpTensor_t* tokens; // required; 2D [num_tokens, hidden]
     ncclEpTensor_t* topk_weights; // optional; 2D [num_tokens, top_k], ncclFloat32
   //   LL rank-major: per-token routing weights
+  //   AFD: required on attention ranks and omitted on expert ranks
   //   HT forward: routing weights (topk_idx taken from handle)
     ncclEpTensor_t* scales;       // required by QUANT_FWD; caller-provided scales are forwarded
                                   // without conversion (see the recipe contract below)
@@ -493,7 +502,7 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchInputs_t, NCCL_EP_DISPAT
 typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
-    ncclEpTensor_t* tokens; // required; received tokens
+    ncclEpTensor_t* tokens; // required received tokens; omitted on AFD attention ranks
     ncclEpTensor_t* topk_weights; // optional; LL rank-major or HT: received top-k weights
   //   LL rank-major: ncclFloat32 [num_ranks, max_dispatch_tokens_per_rank, top_k]
     ncclEpTensor_t* scales;       // required by recipes that forward or generate scales; received per-token scales
@@ -526,7 +535,7 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchOutputs_t, NCCL_EP_DISPA
 typedef struct {
     unsigned int size; // = sizeof(this struct); first field, never moves
     unsigned int magic; // = NCCL_EP_MAGIC; second field, never moves
-    ncclEpTensor_t* tokens; // required; post-expert activation tensor
+    ncclEpTensor_t* tokens; // required post-expert activations; omitted on AFD attention ranks
     ncclEpTensor_t* topk_weights; // optional; HT backward combine only:
   //   2D [num_recv_tokens, top_k], ncclFloat32
     // Optional; recipe-dependent:
@@ -942,9 +951,10 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //   inputs        - [IN]     Named input tensors (see ncclEpDispatchInputs_t).
 //                            inputs->tokens is required for all modes and layouts.
 //                            For LL mode (rank-major layout) and HT mode (all layouts, forward pass),
-//                            inputs->topk_weights must be provided.
+//                            inputs->topk_weights must be provided. AFD expert ranks omit it.
 //   outputs       - [IN,OUT] Named preallocated output tensors (see ncclEpDispatchOutputs_t).
-//                            outputs->tokens is required; other fields depend on the layout and pass direction.
+//                            outputs->tokens is required except on AFD attention ranks, which omit all
+//                            dispatch receive tensors. Other fields depend on the layout and pass direction.
 //                            HT mode:
 //                              The sizing of the output tensors relies on `num_recv_slots`.
 //
@@ -986,6 +996,9 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //                                * outputs->topk_idx [num_ranks, max_dispatch_tokens_per_rank, num_topk]
 //                                The actual number of tokens received by rank `r` is obtained via
 //                                layout_info->src_rank_counters[`r`] (see below).
+//                                AFD expert ranks provide all three receive slabs. AFD attention
+//                                ranks omit them unless outputs->tokens carries the placeholder
+//                                window descriptor required by collective zero-copy registration.
 //   layout_info   - [IN,OUT] Named local tensors for layout-specific counters (see ncclEpLayoutInfo_t).
 //                              * For HT mode normally NULL: the counter information is available through
 //                                ncclEpUpdateHandle. Exception: HT count mode (expert-major local-permute
@@ -1001,6 +1014,9 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //                                * Expert-major layout: expert_counters tensor is required.
 //                                * Rank-major layout: src_rank_counters is optional; when provided,
 //                                  it receives one token count per source rank.
+//                                  On AFD expert ranks, only attention-source entries
+//                                  [0, num_attn_ranks) are written; later entries are unspecified.
+//                                  AFD attention ranks do not write src_rank_counters.
 //   config        - [IN]     Dispatch configuration (see ncclEpDispatchConfig_t). NULL = defaults.
 //   stream        - [IN]     CUDA stream. If `ncclEpDispatch()` is called on a different stream than the stream used in
 //                            `ncclEpCreateHandle()`,
@@ -1054,7 +1070,8 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpCombineConfig_t, NCCL_EP_COMBINE
 //   inputs           - [IN]     Named input tensors (see ncclEpCombineInputs_t).
 //                               The shapes of the tensors are identical to the shapes of the respective
 //                               output tensors of the corresponding `ncclEpDispatch()` call.
-//                               The inputs->tokens tensor is required.
+//                               The inputs->tokens tensor is required except on AFD attention ranks,
+//                               which receive combined results but send no expert outputs.
 //                               For the backward pass in HT mode, the inputs->topk_weights must also be provided.
 //   outputs          - [IN,OUT] Named preallocated output tensors (see ncclEpCombineOutputs_t).
 //                               outputs->tokens [num_tokens, hidden] is required; returns tokens in the original order.
@@ -1188,6 +1205,99 @@ ncclResult_t ncclEpGetAsyncError(ncclEpGroup_t ep_group, int* error_out);
 // Returns: ncclResult_t error code
 
 ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group);
+
+// Dispatch tokens from an AFD attention rank.
+//   Role-checked wrapper around ncclEpDispatch(). Every rank in the AFD group
+//   participates in the same collective: attention ranks call
+//   ncclEpAfDispatch(), while expert ranks call ncclEpAfRecv(). The group must
+//   use LL mode with num_attn_ranks > 0 and a rank-major handle. Quantized AFD
+//   is unsupported; config->quant_recipe must be NCCL_EP_DISP_QUANT_NONE.
+//
+// Arguments:
+//   handle      - [IN,OUT] Handle on an attention rank.
+//   inputs      - [IN]     Attention-side dispatch inputs, including tokens and topk_weights.
+//   outputs     - [IN,OUT] Dispatch outputs with receive tensor fields omitted (NULL).
+//                          For zero-copy, tokens instead carries this rank's handle
+//                          from the collective (possibly asymmetric-size) window registration;
+//                          its local placeholder allocation is not written.
+//   layout_info - [IN,OUT] Optional layout metadata; A-ranks write no src_rank_counters.
+//   config      - [IN]     Dispatch configuration. NULL = defaults.
+//   stream      - [IN]     CUDA stream.
+//
+// Returns: ncclSuccess, ncclInvalidArgument for an invalid handle, or
+// ncclInvalidUsage when the handle is not an AFD attention-rank handle.
+ncclResult_t ncclEpAfDispatch(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream);
+
+// Receive dispatched tokens on an AFD expert rank.
+//   Expert-rank collective counterpart to ncclEpAfDispatch().
+//
+// Arguments:
+//   handle      - [IN,OUT] Handle on an expert rank, created or updated with a
+//                          zero-row topk_idx tensor.
+//   inputs      - [IN]     Expert-side dispatch inputs. tokens is a zero-row descriptor;
+//                          topk_weights is omitted (NULL).
+//   outputs     - [IN,OUT] Preallocated rank-major receive tensors.
+//   layout_info - [IN,OUT] Optional metadata, including src_rank_counters when requested.
+//   config      - [IN]     Dispatch configuration. NULL = defaults.
+//   stream      - [IN]     CUDA stream.
+//
+// Returns: ncclSuccess, ncclInvalidArgument for an invalid handle, or
+// ncclInvalidUsage when the handle is not an AFD expert-rank handle.
+ncclResult_t ncclEpAfRecv(
+    ncclEpHandle_t handle,
+    const ncclEpDispatchInputs_t* inputs,
+    const ncclEpDispatchOutputs_t* outputs,
+    const ncclEpLayoutInfo_t* layout_info,
+    const ncclEpDispatchConfig_t* config,
+    cudaStream_t stream);
+
+// Receive combined results on an AFD attention rank.
+//   Role-checked wrapper around ncclEpCombine(). Every rank in the AFD group
+//   participates in the same collective: attention ranks call
+//   ncclEpAfCombine(), while expert ranks call ncclEpAfReturn(). Quantized AFD
+//   is unsupported; config->quant_recipe must be NCCL_EP_COMB_QUANT_NONE.
+//
+// Arguments:
+//   handle  - [IN,OUT] Handle on an attention rank, reused from dispatch.
+//   inputs  - [IN]     Combine inputs with tokens omitted (NULL).
+//   outputs - [IN,OUT] Preallocated combined tokens in original token order.
+//   config  - [IN]     Combine configuration. NULL = defaults.
+//   stream  - [IN]     CUDA stream.
+//
+// Returns: ncclSuccess, ncclInvalidArgument for an invalid handle, or
+// ncclInvalidUsage when the handle is not an AFD attention-rank handle.
+ncclResult_t ncclEpAfCombine(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream);
+
+// Return expert outputs from an AFD expert rank.
+//   Expert-rank collective counterpart to ncclEpAfCombine().
+//
+// Arguments:
+//   handle  - [IN,OUT] Handle on an expert rank, reused from receive and bound
+//                      to a zero-row topk_idx tensor.
+//   inputs  - [IN]     Post-expert rank-major activation tensor.
+//   outputs - [IN,OUT] Zero-row expert-side combine output descriptor.
+//   config  - [IN]     Combine configuration. NULL = defaults.
+//   stream  - [IN]     CUDA stream.
+//
+// Returns: ncclSuccess, ncclInvalidArgument for an invalid handle, or
+// ncclInvalidUsage when the handle is not an AFD expert-rank handle.
+ncclResult_t ncclEpAfReturn(
+    ncclEpHandle_t handle,
+    const ncclEpCombineInputs_t* inputs,
+    const ncclEpCombineOutputs_t* outputs,
+    const ncclEpCombineConfig_t* config,
+    cudaStream_t stream);
 
 #ifdef __cplusplus
 }
