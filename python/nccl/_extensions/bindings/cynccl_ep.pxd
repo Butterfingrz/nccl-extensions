@@ -68,6 +68,7 @@ ctypedef enum ncclEpDispQuant_t "ncclEpDispQuant_t":
 ctypedef enum ncclEpCombQuant_t "ncclEpCombQuant_t":
     NCCL_EP_COMB_QUANT_NONE "NCCL_EP_COMB_QUANT_NONE" = 0
     NCCL_EP_COMB_QUANT_NVFP4 "NCCL_EP_COMB_QUANT_NVFP4" = 1
+    NCCL_EP_COMB_QUANT_MXFP8 "NCCL_EP_COMB_QUANT_MXFP8" = 2
 
 
 # types
@@ -108,6 +109,13 @@ ctypedef struct ncclEpHandleConfig_t 'ncclEpHandleConfig_t':
     unsigned int size
     unsigned int magic
     size_t dispatch_output_per_expert_alignment
+
+ctypedef struct ncclEpHandleState_t 'ncclEpHandleState_t':
+    unsigned int size
+    unsigned int magic
+    int num_tokens
+    int num_topk
+    ncclDataType_t topk_idx_datatype
 
 ctypedef struct ncclEpDispatchConfig_t 'ncclEpDispatchConfig_t':
     unsigned int size
@@ -218,6 +226,7 @@ cdef ncclResult_t ncclEpCreateGroup(ncclEpGroup_t* ep_group, ncclComm_t comm, co
 cdef ncclResult_t ncclEpGroupDestroy(ncclEpGroup_t ep_group) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpHandleMemSize(ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpHandleConfig_t* config, size_t* size_out, int num_topk) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpInitHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpHandleConfig_t* config, int num_topk, const ncclEpTensor_t* handle_mem) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
+cdef ncclResult_t ncclEpImportHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpHandleConfig_t* config, const ncclEpHandleState_t* state, const ncclEpTensor_t* handle_mem) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpUpdateHandle(ncclEpHandle_t handle, const ncclEpTensor_t* topk_idx, const ncclEpLayoutInfo_t* layout_info, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpCreateHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpTensor_t* topk_idx, const ncclEpLayoutInfo_t* layout_info, const ncclEpHandleConfig_t* config, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil
 cdef ncclResult_t ncclEpHandleDestroy(ncclEpHandle_t handle) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil

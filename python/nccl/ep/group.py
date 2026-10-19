@@ -25,7 +25,7 @@ from nccl.ep.enums import (
     OverflowPolicy,
     ZeroCopyMode,
 )
-from nccl.ep.handle import Handle, HandleConfig, LayoutInfo
+from nccl.ep.handle import Handle, HandleConfig, HandleState, LayoutInfo
 
 if TYPE_CHECKING:
     from nccl.core import Communicator
@@ -214,6 +214,80 @@ class Group:
             get_stream_ptr(stream),
         )
         return Handle(ptr)
+
+    def handle_mem_size(
+        self,
+        layout: Layout,
+        *,
+        config: HandleConfig | None = None,
+        num_topk: int = -1,
+    ) -> int:
+        """Return device bytes required for caller-owned handle memory.
+
+        ``num_topk`` must be positive for LL and may remain ``-1`` for HT.
+        Allocate a one-dimensional ``ncclUint8`` :class:`Tensor` with at
+        least this many elements before calling :meth:`init_handle`.
+        """
+        self._check_valid("query handle memory size")
+        return int(
+            _ep_bindings.handle_mem_size(
+                self._ptr,
+                int(layout),
+                config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+                int(num_topk),
+            )
+        )
+
+    def init_handle(
+        self,
+        layout: Layout,
+        *,
+        config: HandleConfig | None = None,
+        num_topk: int = -1,
+        handle_mem: Tensor | None = None,
+    ) -> Handle:
+        """Allocate routing state without binding this step's top-k tensor.
+
+        Call :meth:`Handle.update` before dispatch/combine. Passing
+        ``handle_mem=None`` lets NCCL EP allocate the routing buffer; otherwise
+        the supplied 1D ``ncclUint8`` tensor is borrowed and retained by the
+        returned handle. With an auto-sized group RDMA buffer this call may be
+        collective and must be made in rank-consistent order.
+        """
+        self._check_valid("initialize handle")
+        ptr = _ep_bindings.init_handle(
+            self._ptr,
+            int(layout),
+            config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+            int(num_topk),
+            handle_mem.ptr if handle_mem is not None else 0,
+        )
+        return Handle(ptr, handle_mem=handle_mem)
+
+    def import_handle(
+        self,
+        layout: Layout,
+        state: HandleState,
+        handle_mem: Tensor,
+        *,
+        config: HandleConfig | None = None,
+    ) -> Handle:
+        """Import an HT handle from an already-prepared routing buffer.
+
+        The buffer must have been prepared with matching group, layout,
+        configuration, and :class:`HandleState`. Import is local: it performs
+        no CUDA launch, metadata scan, or device copy. The returned handle
+        retains ``handle_mem`` for its lifetime.
+        """
+        self._check_valid("import handle")
+        ptr = _ep_bindings.import_handle(
+            self._ptr,
+            int(layout),
+            config._lowpp.ptr if config is not None else 0,  # type: ignore[attr-defined]
+            state._lowpp.ptr,  # type: ignore[attr-defined]
+            handle_mem.ptr,
+        )
+        return Handle(ptr, handle_mem=handle_mem)
 
     def destroy(self) -> None:
         """Release the group. Subsequent operations on this object are invalid."""

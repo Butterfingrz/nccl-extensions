@@ -5,9 +5,9 @@
 
 """Per-step EP handle (:class:`Handle`) and the Pythonic dataclasses
 that mirror the named-struct ABI used by NCCL EP's dispatch/combine
-entry points: :class:`HandleConfig`, :class:`DispatchConfig`,
-:class:`CombineConfig`, :class:`LayoutInfo`, :class:`DispatchInputs`,
-:class:`DispatchOutputs`, :class:`CombineInputs`,
+entry points: :class:`HandleConfig`, :class:`HandleState`,
+:class:`DispatchConfig`, :class:`CombineConfig`, :class:`LayoutInfo`,
+:class:`DispatchInputs`, :class:`DispatchOutputs`, :class:`CombineInputs`,
 :class:`CombineOutputs`.
 """
 
@@ -17,7 +17,7 @@ from dataclasses import field
 from typing import TYPE_CHECKING
 
 from nccl.core.cuda import get_stream_ptr
-from nccl.core.typing import NcclInvalid, NcclStreamSpec
+from nccl.core.typing import NcclDataType, NcclInvalid, NcclStreamSpec
 
 
 from nccl._extensions._binding_helpers import binding_dataclass
@@ -42,6 +42,7 @@ __all__ = [
     "DispatchOutputs",
     "Handle",
     "HandleConfig",
+    "HandleState",
     "LayoutInfo",
 ]
 
@@ -65,6 +66,24 @@ class HandleConfig:
     """
 
     dispatch_output_per_expert_alignment: int = 0
+
+
+@binding_dataclass(_ep_bindings.HandleState)
+class HandleState:
+    """Host metadata for importing a prepared HT handle buffer.
+
+    Mirrors :c:struct:`ncclEpHandleState_t`. The values must describe the
+    routing state used to prepare ``handle_mem`` with :meth:`Handle.update`.
+
+    Attributes:
+        num_tokens: Number of token rows in the prepared top-k tensor.
+        num_topk: Number of experts selected per token.
+        topk_idx_datatype: Top-k index dtype; ``ncclInt32`` or ``ncclInt64``.
+    """
+
+    num_tokens: int
+    num_topk: int
+    topk_idx_datatype: NcclDataType
 
 
 @binding_dataclass(_ep_bindings.DispatchConfig)
@@ -113,7 +132,8 @@ class CombineConfig:
         quantization_recipe: Selects the quantized combine pipeline; see
             :py:class:`CombineQuantizationRecipe`. Default ``NONE``.
             ``NVFP4`` is LL-only, experimental, and requires
-            :py:attr:`CombineInputs.scales`.
+            :py:attr:`CombineInputs.scales`; ``MXFP8`` is HT-only and
+            generates its scales internally.
     """
 
     send_only: int = 0
@@ -231,7 +251,7 @@ class CombineInputs:
         scales: Experimental NVFP4 combine only: FP32 per-expert-token
             global quantization scales. For each valid token row, pass
             ``2688 / amax(abs(tokens[row, :]))``, or 0 when ``amax`` is
-            0.
+            0. Must be ``None`` for ``NONE`` and ``MXFP8``.
     """
 
     tokens: Tensor | None = None
@@ -263,11 +283,15 @@ class CombineOutputs:
 class Handle:
     """Per-step routing handle for dispatch/combine.
 
-    Construct via :py:meth:`Group.create_handle`; release with :meth:`destroy`.
+    Construct via :py:meth:`Group.create_handle`, :py:meth:`Group.init_handle`,
+    or :py:meth:`Group.import_handle`; release with :meth:`destroy`.
     """
 
-    def __init__(self, ptr: int) -> None:
+    def __init__(self, ptr: int, *, handle_mem: Tensor | None = None) -> None:
         self._ptr = ptr
+        # Imported and caller-allocated handles borrow this descriptor and its
+        # backing buffer. Anchor both until ncclEpHandleDestroy completes.
+        self._handle_mem = handle_mem
 
     def _check_valid(self, operation: str) -> None:
         if not self._ptr:
@@ -414,6 +438,7 @@ class Handle:
         if self._ptr:
             _ep_bindings.handle_destroy(self._ptr)
             self._ptr = 0
+            self._handle_mem = None
 
     def __repr__(self) -> str:
         if self._ptr:

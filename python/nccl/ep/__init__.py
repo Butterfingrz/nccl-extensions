@@ -54,6 +54,7 @@ from nccl.ep.handle import (
     DispatchOutputs,
     Handle,
     HandleConfig,
+    HandleState,
     LayoutInfo,
 )
 from nccl.ep.tensor import Tensor
@@ -79,6 +80,7 @@ __all__ = [
     "HtFlow",
     "Handle",
     "HandleConfig",
+    "HandleState",
     "Layout",
     "LayoutInfo",
     "MetaExchangePolicy",

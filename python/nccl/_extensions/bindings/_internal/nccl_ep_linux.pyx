@@ -80,12 +80,11 @@ cdef extern from "<dlfcn.h>" nogil:
 # located here instead of through cuda.pathfinder.
 ###############################################################################
 
-# Resolved at first import via _resolve_library_path() below. Path lookup runs
-# once, then dlopen handle is cached in the lowpp nccl_ep init guard.
-#
+# The matching CUDA variant ships under this library's facade package.
+# _resolve_library_path() runs on the first call that needs a symbol, not at
+# import; after that the generated init guard holds the resolved pointers.
 def _resolve_library_path() -> str:
-    # 1. nccl-extensions package path (replaces cuda.pathfinder's
-    #    NVIDIA-pip-wheel step).
+    # 1. CUDA-specific nccl-extensions package path.
     pkg_lib = bundled_library("nccl_ep")
     if pkg_lib is not None:
         return pkg_lib
@@ -124,6 +123,7 @@ cdef void* __ncclEpCreateGroup = NULL
 cdef void* __ncclEpGroupDestroy = NULL
 cdef void* __ncclEpHandleMemSize = NULL
 cdef void* __ncclEpInitHandle = NULL
+cdef void* __ncclEpImportHandle = NULL
 cdef void* __ncclEpUpdateHandle = NULL
 cdef void* __ncclEpCreateHandle = NULL
 cdef void* __ncclEpHandleDestroy = NULL
@@ -190,6 +190,13 @@ cdef int _init_nccl_ep() except -1 nogil:
             if handle == NULL:
                 handle = load_library()
             __ncclEpInitHandle = _cyb_dlsym(handle, 'ncclEpInitHandle')
+
+        global __ncclEpImportHandle
+        __ncclEpImportHandle = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpImportHandle')
+        if __ncclEpImportHandle == NULL:
+            if handle == NULL:
+                handle = load_library()
+            __ncclEpImportHandle = _cyb_dlsym(handle, 'ncclEpImportHandle')
 
         global __ncclEpUpdateHandle
         __ncclEpUpdateHandle = _cyb_dlsym(_cyb_RTLD_DEFAULT, 'ncclEpUpdateHandle')
@@ -305,6 +312,9 @@ cpdef dict _inspect_function_pointers():
 
     global __ncclEpInitHandle
     data["__ncclEpInitHandle"] = <intptr_t>__ncclEpInitHandle
+
+    global __ncclEpImportHandle
+    data["__ncclEpImportHandle"] = <intptr_t>__ncclEpImportHandle
 
     global __ncclEpUpdateHandle
     data["__ncclEpUpdateHandle"] = <intptr_t>__ncclEpUpdateHandle
@@ -469,6 +479,16 @@ cdef ncclResult_t _ncclEpInitHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_gro
             raise FunctionNotFoundError("function ncclEpInitHandle is not found")
     return (<ncclResult_t (*)(ncclEpHandle_t*, ncclEpGroup_t, ncclEpLayout_t, const ncclEpHandleConfig_t*, int, const ncclEpTensor_t*) noexcept nogil>__ncclEpInitHandle)(
         handle, ep_group, layout, config, num_topk, handle_mem)
+
+
+cdef ncclResult_t _ncclEpImportHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpHandleConfig_t* config, const ncclEpHandleState_t* state, const ncclEpTensor_t* handle_mem) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    global __ncclEpImportHandle
+    _check_or_init_nccl_ep()
+    if __ncclEpImportHandle == NULL:
+        with gil:
+            raise FunctionNotFoundError("function ncclEpImportHandle is not found")
+    return (<ncclResult_t (*)(ncclEpHandle_t*, ncclEpGroup_t, ncclEpLayout_t, const ncclEpHandleConfig_t*, const ncclEpHandleState_t*, const ncclEpTensor_t*) noexcept nogil>__ncclEpImportHandle)(
+        handle, ep_group, layout, config, state, handle_mem)
 
 
 cdef ncclResult_t _ncclEpUpdateHandle(ncclEpHandle_t handle, const ncclEpTensor_t* topk_idx, const ncclEpLayoutInfo_t* layout_info, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:

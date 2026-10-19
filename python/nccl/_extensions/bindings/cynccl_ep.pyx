@@ -39,6 +39,10 @@ cdef ncclResult_t ncclEpInitHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_grou
     return _nccl_ep._ncclEpInitHandle(handle, ep_group, layout, config, num_topk, handle_mem)
 
 
+cdef ncclResult_t ncclEpImportHandle(ncclEpHandle_t* handle, ncclEpGroup_t ep_group, ncclEpLayout_t layout, const ncclEpHandleConfig_t* config, const ncclEpHandleState_t* state, const ncclEpTensor_t* handle_mem) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
+    return _nccl_ep._ncclEpImportHandle(handle, ep_group, layout, config, state, handle_mem)
+
+
 cdef ncclResult_t ncclEpUpdateHandle(ncclEpHandle_t handle, const ncclEpTensor_t* topk_idx, const ncclEpLayoutInfo_t* layout_info, cudaStream_t stream) except?_NCCLRESULT_T_INTERNAL_LOADING_ERROR nogil:
     return _nccl_ep._ncclEpUpdateHandle(handle, topk_idx, layout_info, stream)
 

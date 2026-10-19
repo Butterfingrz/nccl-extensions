@@ -235,3 +235,10 @@ class CombineQuantizationRecipe(IntEnum):
     graduation. The caller supplies FP32 global scales through
     :py:attr:`CombineInputs.scales`; the kernel follows the DeepEP-LL
     NVFP4 pack/dequantize contract."""
+
+    MXFP8 = 2
+    """HT expert-major local-permute transport for a single LSA team.
+    The caller supplies BF16 tokens and no scales; NCCL EP internally
+    quantizes to FP8 E4M3 with E8M0 scales (block size 32), transports the
+    packed row over NVLink, and produces BF16 output. Hidden size must be a
+    multiple of 512 and the library must be built with CUDA 12.8 or newer."""
