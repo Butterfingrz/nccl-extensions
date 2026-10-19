@@ -287,13 +287,12 @@ TEST_F(OutputLayoutTest, FlatLayout) {
 // ── Test: expert-major layout (no alignment) ──────────────────────────────────
 
 TEST_F(OutputLayoutTest, ExpertMajorLayout) {
-    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
-    // count both publish it at UpdateHandle time like this test expects.
-    if (!ht_ag_scan_mode_active() && !ht_count_unfused_active()) {
-        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
-    }
     ncclEpHandle_t h = make_handle_em(nullptr);
     ASSERT_NE(h, nullptr);
+    if (ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandleDestroy(h));
+        GTEST_SKIP() << "fused metadata publishes the EM recv count during dispatch";
+    }
 
     unsigned int num_recv = 0;
     NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
@@ -323,11 +322,6 @@ TEST_F(OutputLayoutTest, ExpertMajorLayout) {
 // ── Test: expert-major + alignment ───────────────────────────────────────────
 
 TEST_F(OutputLayoutTest, ExpertMajorWithAlignment) {
-    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
-    // count both publish it at UpdateHandle time like this test expects.
-    if (!ht_ag_scan_mode_active() && !ht_count_unfused_active()) {
-        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
-    }
     constexpr size_t kAlign = 4;  // each expert zone padded to 4 tokens
 
     ncclEpHandleConfig_t cfg = NCCL_EP_HANDLE_CONFIG_INIT;
@@ -335,6 +329,10 @@ TEST_F(OutputLayoutTest, ExpertMajorWithAlignment) {
 
     ncclEpHandle_t h = make_handle_em(&cfg);
     ASSERT_NE(h, nullptr);
+    if (ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandleDestroy(h));
+        GTEST_SKIP() << "fused metadata publishes the EM recv count during dispatch";
+    }
 
     // GetNumRecvTokens must return the padded total:
     // 2 local experts × align(2 tokens, 4) = 2 × 4 = 8
@@ -398,13 +396,12 @@ TEST_F(OutputLayoutTest, CombineFlat) {
 // S2D to route expert outputs back correctly — result identical to rank-major.
 
 TEST_F(OutputLayoutTest, CombineExpertMajor) {
-    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
-    // count both publish it at UpdateHandle time like this test expects.
-    if (!ht_ag_scan_mode_active() && !ht_count_unfused_active()) {
-        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
-    }
     ncclEpHandle_t h = make_handle_em(nullptr);
     ASSERT_NE(h, nullptr);
+    if (ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandleDestroy(h));
+        GTEST_SKIP() << "fused metadata publishes the EM recv count during dispatch";
+    }
 
     unsigned int num_recv = 0;
     NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
@@ -1604,13 +1601,12 @@ TEST_F(TopK2MixedRoutingTest, FlatLayout) {
 // ── Test: expert-major no-align — E1 duplicated from E0 for same-rank pairs ────
 
 TEST_F(TopK2MixedRoutingTest, ExpertMajorNoAlign) {
-    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
-    // count both publish it at UpdateHandle time like this test expects.
-    if (!ht_ag_scan_mode_active() && !ht_count_unfused_active()) {
-        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
-    }
     ncclEpHandle_t h = make_handle2_em(nullptr);
     ASSERT_NE(h, nullptr);
+    if (ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandleDestroy(h));
+        GTEST_SKIP() << "fused metadata publishes the EM recv count during dispatch";
+    }
 
     unsigned int num_recv = 0;
     NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
@@ -1631,11 +1627,6 @@ TEST_F(TopK2MixedRoutingTest, ExpertMajorNoAlign) {
 // Cross-rank pair (ranks 2,3): both zones filled with distinct tokens (no padding needed).
 
 TEST_F(TopK2MixedRoutingTest, ExpertMajorAlignZeroPadding) {
-    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
-    // count both publish it at UpdateHandle time like this test expects.
-    if (!ht_ag_scan_mode_active() && !ht_count_unfused_active()) {
-        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
-    }
     constexpr size_t kAlign = 4;
 
     ncclEpHandleConfig_t cfg = NCCL_EP_HANDLE_CONFIG_INIT;
@@ -1643,6 +1634,10 @@ TEST_F(TopK2MixedRoutingTest, ExpertMajorAlignZeroPadding) {
 
     ncclEpHandle_t h = make_handle2_em(&cfg);
     ASSERT_NE(h, nullptr);
+    if (ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandleDestroy(h));
+        GTEST_SKIP() << "fused metadata publishes the EM recv count during dispatch";
+    }
 
     unsigned int num_recv = 0;
     NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
@@ -1669,13 +1664,12 @@ TEST_F(TopK2MixedRoutingTest, ExpertMajorAlignZeroPadding) {
 // Cross-rank pair (ranks 2,3): E0 and E1 slots are distinct token values.
 
 TEST_F(TopK2MixedRoutingTest, ExpertMajorDupTokens) {
-    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
-    // count both publish it at UpdateHandle time like this test expects.
-    if (!ht_ag_scan_mode_active() && !ht_count_unfused_active()) {
-        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
-    }
     ncclEpHandle_t h = make_handle2_em(nullptr);
     ASSERT_NE(h, nullptr);
+    if (ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandleDestroy(h));
+        GTEST_SKIP() << "fused metadata publishes the EM recv count during dispatch";
+    }
 
     unsigned int num_recv = 0;
     NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
@@ -1711,11 +1705,6 @@ TEST_F(TopK2MixedRoutingTest, ExpertMajorDupTokens) {
 // Cross-rank pair (ranks 2,3): each zone has 4 real + 4 pad.
 
 TEST_F(TopK2MixedRoutingTest, ExpertMajorAlignZeroPadVerified) {
-    // Fused count mode defers the EM recv count to post-dispatch; scan and unfused
-    // count both publish it at UpdateHandle time like this test expects.
-    if (!ht_ag_scan_mode_active() && !ht_count_unfused_active()) {
-        GTEST_SKIP() << "fused count mode defers EM recv count to post-dispatch";
-    }
     constexpr size_t kAlign = 8;
 
     ncclEpHandleConfig_t cfg = NCCL_EP_HANDLE_CONFIG_INIT;
@@ -1723,6 +1712,10 @@ TEST_F(TopK2MixedRoutingTest, ExpertMajorAlignZeroPadVerified) {
 
     ncclEpHandle_t h = make_handle2_em(&cfg);
     ASSERT_NE(h, nullptr);
+    if (ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandleDestroy(h));
+        GTEST_SKIP() << "fused metadata publishes the EM recv count during dispatch";
+    }
 
     unsigned int num_recv = 0;
     NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
