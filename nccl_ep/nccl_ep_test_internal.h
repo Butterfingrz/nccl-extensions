@@ -18,6 +18,15 @@ const int32_t* ncclEpHandle_test_getSparseToDenseMap(ncclEpHandle_t handle);
 // FWD inline weights + IDs: selected payload width in words, or zero on fallback.
 int ncclEpHandle_test_getCompactProbWireFloats(ncclEpHandle_t handle);
 
+enum ncclEpTestMetadataMode {
+    NCCL_EP_TEST_META_SCAN = 0,
+    NCCL_EP_TEST_META_UNFUSED = 1,
+    NCCL_EP_TEST_META_FUSED = 2
+};
+
+// Resolved metadata mode after UpdateHandle, including handle-specific fallbacks.
+int ncclEpHandle_test_getMetadataMode(ncclEpHandle_t handle);
+
 // Returns the HT scan-only workspace pointers wired into a handle. These buffers
 // are group-owned and may be reused after ncclEpUpdateHandle completes.
 void ncclEpHandle_test_getScanScratch(

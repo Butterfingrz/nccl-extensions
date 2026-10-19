@@ -3558,6 +3558,10 @@ static inline bool dispatch_pull_count_active(ncclEpGroup_t group, ncclEpHandle_
              handle->ht.dispatch_push_count.fused_meta_dispatch));
 }
 
+static bool flat_pull_maps_deferred(ncclEpGroup_t group, ncclEpHandle_t handle) {
+    return handle->layout == NCCL_EP_LAYOUT_FLAT && dispatch_pull_count_active(group, handle);
+}
+
 // Push combine returns one contribution per source token and expert rank.
 // EM first reduces local expert copies; FLAT relays the caller's reduced row.
 static bool ht_comb_push_enabled(ncclEpGroup_t group, ncclEpLayout_t layout) {
@@ -4644,6 +4648,47 @@ static ncclResult_t validate_ht_flat_counters(const ncclEpTensor_t* counters, in
     return ncclSuccess;
 }
 
+struct FlatPullLayoutOutputs {
+    ncclEpTensor_t counts_storage;
+    ncclEpTensor_t total_storage;
+    const ncclEpTensor_t* counts = nullptr;
+    const ncclEpTensor_t* total = nullptr;
+};
+
+static ncclResult_t resolve_flat_pull_layout_outputs(
+    ncclEpGroup_t group, const ncclEpLayoutInfo_t* layout_info, FlatPullLayoutOutputs* outputs) {
+    if (layout_info == nullptr) {
+        return ncclSuccess;
+    }
+    outputs->counts = tensor_ptr(layout_info->expert_counters);
+    NCCLCHECK(validate_ht_flat_counters(outputs->counts, group->num_local_experts));
+    if (outputs->counts != nullptr) {
+        NCCLCHECK(resolveTensorWindowBinding(
+            group, outputs->counts, &outputs->counts_storage, 0, &outputs->counts));
+        if (outputs->counts->data == nullptr) {
+            fprintf(stderr, "ncclEpDispatch: flat expert_counters data must not be null\n");
+            return ncclInvalidArgument;
+        }
+    }
+    outputs->total = tensor_ptr(layout_info->recv_total_counter);
+    if (outputs->total != nullptr) {
+        const ncclEpTensor_t* total = outputs->total;
+        if (total->ndim != 1 || total->sizes[0] < 1 ||
+            (total->datatype != ncclInt32 && total->datatype != ncclInt64) ||
+            (total->data == nullptr && total->win_hdl == ncclWindow_t{})) {
+            fprintf(stderr, "ncclEpDispatch: recv_total_counter must be int32 or int64 [1] or larger\n");
+            return ncclInvalidArgument;
+        }
+        NCCLCHECK(resolveTensorWindowBinding(
+            group, total, &outputs->total_storage, 0, &outputs->total));
+        if (outputs->total->data == nullptr) {
+            fprintf(stderr, "ncclEpDispatch: recv_total_counter data must not be null\n");
+            return ncclInvalidArgument;
+        }
+    }
+    return ncclSuccess;
+}
+
 ncclResult_t ncclEpUpdateHandle(
     ncclEpHandle_t handle,
     const ncclEpTensor_t* topk_idx,
@@ -4739,7 +4784,7 @@ ncclResult_t ncclEpUpdateHandle(
     // early-output contract. Otherwise flat metadata is built inside dispatch.
     if (handle->layout == NCCL_EP_LAYOUT_FLAT) {
         const bool early_layout = layout_info &&
-            (layout_info->expert_counters || layout_info->expert_offsets || layout_info->recv_total_counter);
+            (layout_info->expert_counters || layout_info->recv_total_counter);
         handle->ht.dispatch_push_count.fused_meta_dispatch =
             !early_layout && !meta_exchange_force_unfused(ep_group);
     }
@@ -4748,8 +4793,8 @@ ncclResult_t ncclEpUpdateHandle(
     if (nccl_ep_env_verbose(ep_group->env)) {
         const bool early_layout = layout_info != nullptr &&
             (layout_info->expert_counters != nullptr ||
-             layout_info->src_rank_counters != nullptr ||
-             layout_info->expert_offsets != nullptr ||
+             (handle->layout != NCCL_EP_LAYOUT_FLAT &&
+              (layout_info->src_rank_counters != nullptr || layout_info->expert_offsets != nullptr)) ||
              layout_info->recv_total_counter != nullptr);
         const char* path = "scan";
         const char* reason = "layout or resolved flow is not fused-count capable";
@@ -5781,6 +5826,19 @@ ncclResult_t ncclEpDispatch(
     } else { // HT
 
         bool is_lsa_only = !is_internode_available(group);
+
+        const bool flat_deferred = flat_pull_maps_deferred(group, handle);
+        FlatPullLayoutOutputs flat_pull_outputs;
+        if (flat_deferred) {
+            if (pass_direction == NCCL_EP_BWD_PASS && !handle->ht.dispatch_push_count.fwd_maps_built) {
+                fprintf(stderr, "ncclEpDispatch: flat pull/push backward requires a forward dispatch "
+                                "after ncclEpUpdateHandle\n");
+                return ncclInvalidUsage;
+            }
+            if (pass_direction == NCCL_EP_FWD_PASS) {
+                NCCLCHECK(resolve_flat_pull_layout_outputs(group, layout_info, &flat_pull_outputs));
+            }
+        }
 
         const bool expert_major = (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR);
 
@@ -6827,10 +6885,18 @@ ncclResult_t ncclEpDispatch(
                 void* pull_caller_recv_total = nullptr;
                 bool pull_caller_out_is_int64 = true;
                 if (pull_count_rebuild) {
+                    const bool flat = handle->layout == NCCL_EP_LAYOUT_FLAT;
                     const ncclEpTensor_t* caller_offsets_tensor =
-                        layout_info ? tensor_ptr(layout_info->expert_offsets) : nullptr;
-                    const ncclEpTensor_t* caller_counts_tensor =
-                        layout_info ? tensor_ptr(layout_info->expert_counters) : nullptr;
+                        (layout_info && !flat) ? tensor_ptr(layout_info->expert_offsets) : nullptr;
+                    const ncclEpTensor_t* caller_counts_tensor = nullptr;
+                    const ncclEpTensor_t* recv_total_tensor = nullptr;
+                    if (flat) {
+                        caller_counts_tensor = flat_pull_outputs.counts;
+                        recv_total_tensor = flat_pull_outputs.total;
+                    } else if (layout_info != nullptr) {
+                        caller_counts_tensor = tensor_ptr(layout_info->expert_counters);
+                        recv_total_tensor = tensor_ptr(layout_info->recv_total_counter);
+                    }
                     auto check_pull_caller_tensor = [&](const ncclEpTensor_t* t) {
                         EP_HOST_ASSERT(t->ndim == 1 && "tensor must be 1D");
                         EP_HOST_ASSERT((t->datatype == ncclInt32 || t->datatype == ncclInt64) && "tensor must be ncclInt32 or ncclInt64");
@@ -6839,29 +6905,24 @@ ncclResult_t ncclEpDispatch(
                             "tensor size must be >= num_local_experts");
                         EP_HOST_ASSERT(t->data != nullptr && "tensor data must not be null");
                     };
-                    const bool flat = handle->layout == NCCL_EP_LAYOUT_FLAT;
-                    if (flat && caller_offsets_tensor) {
-                        return ncclInvalidArgument;
+                    if (caller_offsets_tensor) {
+                        check_pull_caller_tensor(caller_offsets_tensor);
                     }
-                    if (flat && caller_counts_tensor && caller_counts_tensor->datatype != ncclInt32) {
-                        return ncclInvalidArgument;
+                    if (caller_counts_tensor) {
+                        check_pull_caller_tensor(caller_counts_tensor);
                     }
-                    if (caller_offsets_tensor) check_pull_caller_tensor(caller_offsets_tensor);
-                    if (caller_counts_tensor) check_pull_caller_tensor(caller_counts_tensor);
-                    if (caller_offsets_tensor && caller_counts_tensor)
+                    if (caller_offsets_tensor && caller_counts_tensor) {
                         EP_HOST_ASSERT(
                             caller_offsets_tensor->datatype == caller_counts_tensor->datatype &&
                             "expert_offsets and expert_counters must share dtype");
+                    }
                     pull_caller_offsets = caller_offsets_tensor ? caller_offsets_tensor->data : nullptr;
                     pull_caller_counts = caller_counts_tensor ? caller_counts_tensor->data : nullptr;
-                    const ncclEpTensor_t* recv_total_tensor =
-                        layout_info ? tensor_ptr(layout_info->recv_total_counter) : nullptr;
-                    pull_caller_out_is_int64 =
-                        caller_counts_tensor  ? (caller_counts_tensor->datatype == ncclInt64)
-                        : caller_offsets_tensor ? (caller_offsets_tensor->datatype == ncclInt64)
-                        : recv_total_tensor      ? (recv_total_tensor->datatype == ncclInt64)
-                                                  : true;
-                    if (flat && recv_total_tensor) {
+                    if (caller_counts_tensor && !flat) {
+                        pull_caller_out_is_int64 = caller_counts_tensor->datatype == ncclInt64;
+                    } else if (caller_offsets_tensor) {
+                        pull_caller_out_is_int64 = caller_offsets_tensor->datatype == ncclInt64;
+                    } else if (recv_total_tensor) {
                         pull_caller_out_is_int64 = recv_total_tensor->datatype == ncclInt64;
                     }
                     if (flat && pull_caller_counts != nullptr) {
@@ -7002,7 +7063,7 @@ ncclResult_t ncclEpDispatch(
         // Count mode: the recv maps BWD dispatch and combine read are finished by the
         // epilogues above (lerm_flat_copy for Flat, dispatch_permute for EM), so only
         // mark them built once every step has been enqueued without an early return.
-        if (count_mode_dispatch) {
+        if (count_mode_dispatch || (flat_deferred && forward_dispatch)) {
             handle->ht.dispatch_push_count.fwd_maps_built = true;
         }
     }
@@ -7317,6 +7378,11 @@ ncclResult_t ncclEpCombine(
         // Backward combine: tokens + gradients (training, topk_weights provided)
         ncclEpGroup_t group = handle->group;
         bool is_lsa_only = !is_internode_available(group);
+        if (flat_pull_maps_deferred(group, handle) && !handle->ht.dispatch_push_count.fwd_maps_built) {
+            fprintf(stderr, "ncclEpCombine: flat pull/push requires a forward dispatch "
+                            "after ncclEpUpdateHandle\n");
+            return ncclInvalidUsage;
+        }
         // assert(is_lsa_only && "HT mode only supports single-node");
 
         /* ===== Inputs validation ===== */
@@ -7962,6 +8028,18 @@ ncclResult_t ncclEpErrorClear(ncclEpGroup_t ep_group) {
 
 const int32_t* ncclEpHandle_test_getSparseToDenseMap(ncclEpHandle_t handle) {
     return handle->ht.sparse_to_dense_map;
+}
+
+int ncclEpHandle_test_getMetadataMode(ncclEpHandle_t handle) {
+    if (handle == nullptr || handle->group == nullptr ||
+        handle->group->config.algorithm != NCCL_EP_ALGO_HIGH_THROUGHPUT) {
+        return 0;
+    }
+    if (!dispatch_push_count_active(handle->group, handle) &&
+        !dispatch_pull_count_active(handle->group, handle)) {
+        return 0;
+    }
+    return handle->ht.dispatch_push_count.fused_meta_dispatch ? 2 : 1;
 }
 
 int ncclEpHandle_test_getCompactProbWireFloats(ncclEpHandle_t handle) {
