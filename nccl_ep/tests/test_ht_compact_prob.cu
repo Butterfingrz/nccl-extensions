@@ -22,6 +22,19 @@ namespace {
 constexpr int kTokens = 4;
 constexpr int kWidth = 16;
 constexpr int kAlignment = 8;
+constexpr int kTokenIdRadix = 256;
+
+// Small integer fields stay exact in BF16, including the 513-token case.
+float token_value(int rank, int token, int column) {
+    switch (column % 3) {
+        case 0:
+            return static_cast<float>(rank + 1);
+        case 1:
+            return static_cast<float>(token / kTokenIdRadix);
+        default:
+            return static_cast<float>(token % kTokenIdRadix);
+    }
+}
 
 bool enabled(const char* name) {
     return env_flag_active(name);
@@ -128,6 +141,8 @@ struct State {
 
     void initialize(ncclEpGroup_t group, bool expert_major, bool int64_ids, int k, int e, int cap,
                     int alignment = kAlignment, bool guard_buffers = false) {
+        ASSERT_LE(g_nranks, kTokenIdRadix);
+        ASSERT_LE(token_capacity, kTokenIdRadix * kTokenIdRadix);
         em = expert_major; use_i64 = int64_ids; topk = k; experts = e; capacity = cap;
         ASSERT_NO_FATAL_FAILURE(ids32.allocate(token_capacity * topk));
         ASSERT_NO_FATAL_FAILURE(ids64.allocate(token_capacity * topk));
@@ -209,12 +224,8 @@ struct State {
         std::vector<nv_bfloat16> ht(ntokens * kWidth);
         std::vector<float> hw(ntokens * topk);
         for (int t = 0; t < ntokens; ++t) {
-            // Encode identity in BF16 bits so larger token IDs remain exact.
-            const uint16_t identity = 0x3f80 + g_rank * token_capacity + t;
-            nv_bfloat16 value;
-            std::memcpy(&value, &identity, sizeof(value));
             for (int d = 0; d < kWidth; ++d) {
-                ht[t * kWidth + d] = value;
+                ht[t * kWidth + d] = __float2bfloat16(token_value(g_rank, t, d));
             }
             for (int k = 0; k < topk; ++k) hw[t * topk + k] = source_weight(g_rank, t, k, epoch, repeat);
         }
@@ -276,20 +287,26 @@ struct State {
         output.token_gradients.assign(recv_tokens.size, __float2bfloat16(0));
         for (int s = 0; s < output.total; ++s) {
             SCOPED_TRACE(::testing::Message() << "rank=" << g_rank << " epoch=" << epoch << " recv_slot=" << s);
-            float token_id = __bfloat162float(output.recv_x[s * kWidth]);
-            if (token_id == 0) {
+            const float source_rank = __bfloat162float(output.recv_x[s * kWidth]);
+            if (source_rank == 0) {
                 ASSERT_TRUE(em) << "FLAT has no internal padding in its active receive range";
                 for (int d = 0; d < kWidth; ++d) EXPECT_EQ(__bfloat162float(output.recv_x[s * kWidth + d]), 0.0f);
                 EXPECT_EQ(bits(output.recv_w[s]), bits(0.0f));
                 continue;
             }
-            uint16_t identity_bits;
-            std::memcpy(&identity_bits, &output.recv_x[s * kWidth], sizeof(identity_bits));
-            const int identity = static_cast<int>(identity_bits) - 0x3f80;
-            int source = identity / token_capacity, token = identity % token_capacity;
-            ASSERT_GE(source, 0); ASSERT_LT(source, g_nranks); ASSERT_LT(token, source_tokens[source]);
+            const float token_high = __bfloat162float(output.recv_x[s * kWidth + 1]);
+            const float token_low = __bfloat162float(output.recv_x[s * kWidth + 2]);
+            ASSERT_GE(source_rank, 1.0f);
+            ASSERT_LE(source_rank, static_cast<float>(g_nranks));
+            ASSERT_GE(token_high, 0.0f);
+            ASSERT_LT(token_high, static_cast<float>(kTokenIdRadix));
+            ASSERT_GE(token_low, 0.0f);
+            ASSERT_LT(token_low, static_cast<float>(kTokenIdRadix));
+            const int source = static_cast<int>(source_rank) - 1;
+            const int token = static_cast<int>(token_high) * kTokenIdRadix + static_cast<int>(token_low);
+            ASSERT_LT(token, source_tokens[source]);
             for (int d = 0; d < kWidth; ++d) {
-                EXPECT_EQ(__bfloat162float(output.recv_x[s * kWidth + d]), token_id);
+                EXPECT_EQ(__bfloat162float(output.recv_x[s * kWidth + d]), token_value(source, token, d));
                 output.token_gradients[s * kWidth + d] = __float2bfloat16(1);
             }
             std::vector<std::pair<int, int>> local;

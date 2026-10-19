@@ -273,6 +273,7 @@ TEST_F(HtOverflowDropTest, FlatFusedDropRecount) {
     ASSERT_NE(h, nullptr);
     NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_, nullptr, g_stream));
     if (!ht_count_fused_active(h)) {
+        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
         (void)ncclEpHandleDestroy(h);
         GTEST_SKIP() << "fused count mode only";
     }
