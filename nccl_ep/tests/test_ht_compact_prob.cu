@@ -680,7 +680,9 @@ TEST_F(HtCompactProbTest, DenseFallbackExpertMajor) {
 // busiest rank's unique count, any budget check or total derived from the per-expert sum (as the
 // unfused count path once did for FLAT) aborts or over-reports.
 TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevel) {
-    SKIP_IF_PULL_PUSH();
+    if (ht_pull_push_active()) {
+        GTEST_SKIP() << "This case exercises HT Flat count mode";
+    }
     // The EM duplication reruns stage with a larger recv budget than this exact-budget fixture.
     if (enabled("NCCL_EP_HT_EM_LOCAL_DUP") || enabled("NCCL_EP_HT_EM_NVLINK_DUP"))
         GTEST_SKIP() << "EM duplication modes need more recv budget than the exact FLAT fixture";
@@ -707,7 +709,7 @@ TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevel) {
     // Hand layout info to UpdateHandle so count mode runs its unfused path and publishes
     // recv_total_counter here (before any dispatch); it must be the rank-level count.
     s.layout_info_at_update = true;
-    ASSERT_NO_FATAL_FAILURE(s.update(tokens, 0));
+    ASSERT_NO_FATAL_FAILURE(s.update(tokens, 0, false));
     // Scan writes the same rank-level total at UpdateHandle; only multi-team groups differ.
     if (ncclEpHandle_test_getNRanksPerNode(s.handle) == g_nranks) {
         std::vector<int64_t> total_after_update;
@@ -722,7 +724,9 @@ TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevel) {
 // Same exact rank-level budget on the fused path: no layout info at UpdateHandle, so the
 // dispatch MAP warps apply the budget check and publish recv_total_counter themselves.
 TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevelFused) {
-    SKIP_IF_PULL_PUSH();
+    if (ht_pull_push_active()) {
+        GTEST_SKIP() << "This case exercises HT Flat count mode";
+    }
     if (enabled("NCCL_EP_HT_EM_LOCAL_DUP") || enabled("NCCL_EP_HT_EM_NVLINK_DUP"))
         GTEST_SKIP() << "EM duplication modes need more recv budget than the exact FLAT fixture";
     if (!fused_count_mode())
@@ -747,7 +751,7 @@ TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevelFused) {
     ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, capacity, false, tokens, &group_));
     State s;
     ASSERT_NO_FATAL_FAILURE(s.initialize(group_, false, false, topk, experts, capacity));
-    ASSERT_NO_FATAL_FAILURE(s.update(tokens, 0));
+    ASSERT_NO_FATAL_FAILURE(s.update(tokens, 0, false));
     ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
     EXPECT_EQ(s.output.total, unique_recv(g_rank)) << "rank=" << g_rank;
     // Poison the counter so the replay check proves the graph rewrote it rather
@@ -764,7 +768,9 @@ TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevelFused) {
 // even though nothing is dropped, zeroing the later experts. Checked at UpdateHandle (unfused
 // publish), after a plain dispatch and after graph replays (LERM recount).
 TEST_F(HtCompactProbTest, FlatDropPolicyExpertCountsAreHitCounts) {
-    SKIP_IF_PULL_PUSH();
+    if (ht_pull_push_active()) {
+        GTEST_SKIP() << "This case exercises HT Flat count mode";
+    }
     if (enabled("NCCL_EP_HT_EM_LOCAL_DUP") || enabled("NCCL_EP_HT_EM_NVLINK_DUP"))
         GTEST_SKIP() << "EM duplication modes need more recv budget than the exact FLAT fixture";
     constexpr int topk = 8, experts = 256, tokens = 4;
@@ -806,7 +812,7 @@ TEST_F(HtCompactProbTest, FlatDropPolicyExpertCountsAreHitCounts) {
         }
     };
     ASSERT_NO_FATAL_FAILURE(hits.upload(poison));
-    ASSERT_NO_FATAL_FAILURE(s.update(tokens, 0));
+    ASSERT_NO_FATAL_FAILURE(s.update(tokens, 0, false));
     ASSERT_NO_FATAL_FAILURE(expect_hits("UpdateHandle"));
     ASSERT_NO_FATAL_FAILURE(hits.upload(poison));
     ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
