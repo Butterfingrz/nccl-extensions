@@ -247,10 +247,10 @@ __forceinline__ __device__ void sendPeerTotalTokenCountLsa(
 // ctaDone counts CTAs (== SMs, one CTA per SM in this grid model), not ranks
 // -- despite living in the same host-allocated workspace region as the
 // general kernel's args.rankDone (which genuinely is per-rank there; see
-// dispatch_kernel_impl in ll_ep.cuh), this file only ever touches index 0 of
-// it, as a scalar "how many CTAs have finished SEND" census counter. Named
-// for what it counts in this file specifically, not for the shared field's
-// name at the call site.
+// dispatch_kernel_impl in ll_ep.cuh), the store path only ever touches index
+// 0 of it, as a scalar "how many CTAs have finished SEND" census counter.
+// Named for what it counts here, rather than the shared field's name at
+// the call site.
 //
 // The elected last CTA also resets rankSentCnt[]/ctaDone[0] to 0 for the next
 // epoch, right here, instead of every CTA separately resetting its own
@@ -505,10 +505,11 @@ __forceinline__ __device__ void recordRecvTokensLsa(
 
     const auto srcRank = responsibleExpertIdx / numLocalExperts;
     const auto rankLaneIdx = responsibleExpertIdx % numLocalExperts;
-    const auto globalExpertStartIdx = currRank * numLocalExperts;
 
     const int encoded = recvCntBuf[srcRank];
-    const int numRecvTokens = isRankMasked(rankMask, srcRank) ? 0 : (-encoded - 1);
+    const int numRecvTokens = isRankMasked(rankMask, srcRank)
+        ? 0
+        : (-encoded - 1);
     if (laneId == 0 and rankLaneIdx == 0) {
         outSrcInfo[srcRank] = numRecvTokens;
         if (outRecvRankCounter != nullptr) outRecvRankCounter[srcRank] = numRecvTokens;
@@ -527,37 +528,14 @@ __forceinline__ __device__ void recordRecvTokensLsa(
         const auto recvBufUint8 = srcRankRecvBase;
         const int slot = srcRank * maxTokensPerRank + i;
         const auto recvBufHdr = reinterpret_cast<const DispatchHdr<NCCL_EP_LAYOUT_RANK_MAJOR>*>(
-            recvBufUint8 + i * dispatch_hdr_sz);
-        const auto rtr = recvBufHdr->rtr;
+            recvBufUint8 + static_cast<size_t>(i) * dispatch_hdr_sz);
 
         const auto recvSrcInfoBase = outSrcInfo + numRanks;
         const auto slotsPerToken = numTopk + 1;
         const auto recvSrcInfo = recvSrcInfoBase + (srcRank * maxTokensPerRank + i) * slotsPerToken;
-        const auto recvSrcTopkInfo = recvSrcInfo + 1;
-        if (laneId == 0) {
-            recvSrcInfo[0] = recvBufHdr->token_id;
-            recvSrcTopkInfo[0] = slot;
-        }
-        if (numTopk > 1) {
-            bool matchesCurrRank = (laneId < numTopk) &&
-                (getExpertRankIdx((int)rtr[laneId].expert_id, numLocalExperts) == currRank);
-            uint32_t currRankMask = __ballot_sync(0xffffffff, matchesCurrRank);
-            int j_eff = currRankMask ? (__ffs(currRankMask) - 1) : -1;
-            if (laneId == 0) {
-                recvSrcTopkInfo[1] = j_eff;
-            }
-        }
-
-        EP_DEVICE_ASSERT(outRecvTopkIdx != nullptr && outRecvTopkWeights != nullptr);
-        EP_DEVICE_ASSERT(recvTopkIdxKind == NCCL_EP_EXPERT_ID_LOCAL || recvTopkIdxKind == NCCL_EP_EXPERT_ID_GLOBAL);
-        if (laneId < numTopk) {
-            int globalExpertIdx = (int)rtr[laneId].expert_id;
-            int localExpertIdx = globalExpertIdx - globalExpertStartIdx;
-            bool valid = (localExpertIdx >= 0 && localExpertIdx < numLocalExperts);
-            int writeIdx = (recvTopkIdxKind == NCCL_EP_EXPERT_ID_GLOBAL) ? globalExpertIdx : localExpertIdx;
-            outRecvTopkIdx[slot * numTopk + laneId] = valid ? (int32_t)writeIdx : (int32_t)-1;
-            outRecvTopkWeights[slot * numTopk + laneId] = rtr[laneId].topk_weight;
-        }
+        recordRankMajorRecvTokenMetadata(
+            recvBufHdr, slot, numTopk, numLocalExperts, currRank, laneId, recvSrcInfo,
+            outRecvTopkIdx, outRecvTopkWeights, recvTopkIdxKind);
 
         const bool copyData = recvDataWindow == ncclWindow_t{};
         const bool copyScales = kRecipe != NCCL_EP_DISP_QUANT_NONE && recvScalesWindow == ncclWindow_t{};

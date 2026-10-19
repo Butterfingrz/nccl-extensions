@@ -27,8 +27,10 @@ bool enabled(const char* name) {
     return env_flag_active(name);
 }
 
-bool fused_count_mode(bool em) {
-    return em && !enabled("NCCL_EP_HT_EM_LOCAL_DUP") && !enabled("NCCL_EP_HT_EM_NVLINK_DUP") &&
+// Fused count mode applies to both EM local-permute and Flat handles (see
+// dispatch_push_count_capable).
+bool fused_count_mode() {
+    return !enabled("NCCL_EP_HT_EM_LOCAL_DUP") && !enabled("NCCL_EP_HT_EM_NVLINK_DUP") &&
            !enabled("NCCL_EP_HT_EM_AG_SCAN_MODE") && !enabled("NCCL_EP_HT_EM_COUNT_UNFUSED");
 }
 
@@ -103,6 +105,9 @@ struct State {
     DeviceBuffer<nv_bfloat16> tokens, recv_tokens, combined_tokens;
     DeviceBuffer<float> weights, recv_weights, combined_weights;
     ncclEpLayoutInfo_t info = NCCL_EP_LAYOUT_INFO_INIT;
+    // Hand info to UpdateHandle even in fused count mode (forces the unfused exchange, so
+    // the layout tensors are published before dispatch).
+    bool layout_info_at_update = false;
     bool em = false, use_i64 = false, topk_order = false;
     int topk = 0, experts = 0, capacity = 0, ntokens = 0, epoch = 0;
     std::vector<int> source_tokens;
@@ -191,7 +196,8 @@ struct State {
         // Passing layout info to UpdateHandle forces count provisioning there.
         // Omit it only for a single-team fused mode, to test dispatch-time map
         // build. Multi-team scan paths must publish their layout at UpdateHandle.
-        const bool fused = fused_count_mode(em) && ncclEpHandle_test_getNRanksPerNode(handle) == g_nranks;
+        const bool fused = fused_count_mode() && !layout_info_at_update &&
+                           ncclEpHandle_test_getNRanksPerNode(handle) == g_nranks;
         NCCL_ASSERT(ncclEpUpdateHandle(handle, ids, fused ? nullptr : &info, g_stream));
         CUDA_ASSERT(cudaStreamSynchronize(g_stream));
     }
@@ -666,6 +672,152 @@ TEST_F(HtCompactProbTest, DenseFallbackFlat) {
 TEST_F(HtCompactProbTest, DenseFallbackExpertMajor) {
     if (g_nranks > 8) GTEST_SKIP() << "E8 fallback fixture requires EP4 or EP8";
     run(true, true, 8, 8);
+}
+
+// FLAT has no per-expert zones, so its receive budget and recv_total_counter are rank-level
+// (one slot per destined token). route() sends every token to two experts of each owning rank,
+// so the per-expert sum is about twice the unique-token count. With the budget set to exactly the
+// busiest rank's unique count, any budget check or total derived from the per-expert sum (as the
+// unfused count path once did for FLAT) aborts or over-reports.
+TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevel) {
+    SKIP_IF_PULL_PUSH();
+    // The EM duplication reruns stage with a larger recv budget than this exact-budget fixture.
+    if (enabled("NCCL_EP_HT_EM_LOCAL_DUP") || enabled("NCCL_EP_HT_EM_NVLINK_DUP"))
+        GTEST_SKIP() << "EM duplication modes need more recv budget than the exact FLAT fixture";
+    constexpr int topk = 8, experts = 256, tokens = 4;
+    const int epr = experts / g_nranks;
+    auto unique_recv = [&](int rank) {
+        int count = 0;
+        for (int source = 0; source < g_nranks; ++source) for (int t = 0; t < tokens; ++t) {
+            bool hit = false;
+            for (int k = 0; k < topk; ++k) {
+                const int64_t e = route(source, t, k, topk, experts, 0);
+                if (e >= 0 && e / epr == rank) hit = true;
+            }
+            count += hit ? 1 : 0;
+        }
+        return count;
+    };
+    int capacity = 0;
+    for (int rank = 0; rank < g_nranks; ++rank) capacity = std::max(capacity, unique_recv(rank));
+    ASSERT_GT(capacity, 0);
+    ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, capacity, false, tokens, &group_));
+    State s;
+    ASSERT_NO_FATAL_FAILURE(s.initialize(group_, false, false, topk, experts, capacity));
+    // Hand layout info to UpdateHandle so count mode runs its unfused path and publishes
+    // recv_total_counter here (before any dispatch); it must be the rank-level count.
+    s.layout_info_at_update = true;
+    ASSERT_NO_FATAL_FAILURE(s.update(tokens, 0));
+    // Scan writes the same rank-level total at UpdateHandle; only multi-team groups differ.
+    if (ncclEpHandle_test_getNRanksPerNode(s.handle) == g_nranks) {
+        std::vector<int64_t> total_after_update;
+        ASSERT_NO_FATAL_FAILURE(s.total.download(total_after_update, 1));
+        EXPECT_EQ(total_after_update[0], unique_recv(g_rank)) << "UpdateHandle total, rank=" << g_rank;
+    }
+    ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
+    EXPECT_EQ(s.output.total, unique_recv(g_rank)) << "rank=" << g_rank;
+    ASSERT_NO_FATAL_FAILURE(s.backward());
+}
+
+// Same exact rank-level budget on the fused path: no layout info at UpdateHandle, so the
+// dispatch MAP warps apply the budget check and publish recv_total_counter themselves.
+TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevelFused) {
+    SKIP_IF_PULL_PUSH();
+    if (enabled("NCCL_EP_HT_EM_LOCAL_DUP") || enabled("NCCL_EP_HT_EM_NVLINK_DUP"))
+        GTEST_SKIP() << "EM duplication modes need more recv budget than the exact FLAT fixture";
+    if (!fused_count_mode())
+        GTEST_SKIP() << "fused count mode only";
+    constexpr int topk = 8, experts = 256, tokens = 4;
+    const int epr = experts / g_nranks;
+    auto unique_recv = [&](int rank) {
+        int count = 0;
+        for (int source = 0; source < g_nranks; ++source) for (int t = 0; t < tokens; ++t) {
+            bool hit = false;
+            for (int k = 0; k < topk; ++k) {
+                const int64_t e = route(source, t, k, topk, experts, 0);
+                if (e >= 0 && e / epr == rank) hit = true;
+            }
+            count += hit ? 1 : 0;
+        }
+        return count;
+    };
+    int capacity = 0;
+    for (int rank = 0; rank < g_nranks; ++rank) capacity = std::max(capacity, unique_recv(rank));
+    ASSERT_GT(capacity, 0);
+    ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, capacity, false, tokens, &group_));
+    State s;
+    ASSERT_NO_FATAL_FAILURE(s.initialize(group_, false, false, topk, experts, capacity));
+    ASSERT_NO_FATAL_FAILURE(s.update(tokens, 0));
+    ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
+    EXPECT_EQ(s.output.total, unique_recv(g_rank)) << "rank=" << g_rank;
+    // Poison the counter so the replay check proves the graph rewrote it rather
+    // than reading the eager dispatch's value back.
+    CUDA_ASSERT(cudaMemset(s.total.p, 0xFF, sizeof(int64_t)));
+    ASSERT_NO_FATAL_FAILURE(s.dispatch(1, true));
+    EXPECT_EQ(s.output.total, unique_recv(g_rank)) << "graph replay, rank=" << g_rank;
+    ASSERT_NO_FATAL_FAILURE(s.backward());
+}
+
+// FLAT expert_counters are per-expert hit counts, not EM zone sizes. Under the DROP policy the
+// count path used to clamp each expert against the budget left after the preceding experts'
+// hits; with every token hitting two local experts that prefix exceeds the rank-level budget
+// even though nothing is dropped, zeroing the later experts. Checked at UpdateHandle (unfused
+// publish), after a plain dispatch and after graph replays (LERM recount).
+TEST_F(HtCompactProbTest, FlatDropPolicyExpertCountsAreHitCounts) {
+    SKIP_IF_PULL_PUSH();
+    if (enabled("NCCL_EP_HT_EM_LOCAL_DUP") || enabled("NCCL_EP_HT_EM_NVLINK_DUP"))
+        GTEST_SKIP() << "EM duplication modes need more recv budget than the exact FLAT fixture";
+    constexpr int topk = 8, experts = 256, tokens = 4;
+    const int epr = experts / g_nranks;
+    std::vector<int32_t> expected_hits(epr, 0);
+    int capacity = 0;
+    for (int rank = 0; rank < g_nranks; ++rank) {
+        int unique = 0;
+        for (int source = 0; source < g_nranks; ++source) for (int t = 0; t < tokens; ++t) {
+            bool hit = false;
+            for (int k = 0; k < topk; ++k) {
+                const int64_t e = route(source, t, k, topk, experts, 0);
+                if (e < 0 || e / epr != rank) continue;
+                hit = true;
+                if (rank == g_rank) ++expected_hits[static_cast<int>(e % epr)];
+            }
+            unique += hit ? 1 : 0;
+        }
+        capacity = std::max(capacity, unique);
+    }
+    ASSERT_GT(capacity, 0);
+    ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, capacity, true, tokens, &group_));
+    State s;
+    ASSERT_NO_FATAL_FAILURE(s.initialize(group_, false, false, topk, experts, capacity));
+    DeviceBuffer<int32_t> hits;
+    ASSERT_NO_FATAL_FAILURE(hits.allocate(epr));
+    ncclEpTensor_t* hits_tensor = nullptr;
+    ASSERT_NO_FATAL_FAILURE(s.tensor(&hits_tensor, 1, ncclInt32, hits.p, epr));
+    s.info.expert_counters = hits_tensor;
+    // The UpdateHandle-time counts need the unfused exchange; the dispatch-time recount is
+    // checked on the same handle afterwards.
+    s.layout_info_at_update = true;
+    const std::vector<int32_t> poison(epr, static_cast<int32_t>(0xA5A5A5A5));
+    auto expect_hits = [&](const char* stage) {
+        std::vector<int32_t> actual;
+        ASSERT_NO_FATAL_FAILURE(hits.download(actual, epr));
+        for (int e = 0; e < epr; ++e) {
+            EXPECT_EQ(actual[e], expected_hits[e]) << stage << " rank=" << g_rank << " local_expert=" << e;
+        }
+    };
+    ASSERT_NO_FATAL_FAILURE(hits.upload(poison));
+    ASSERT_NO_FATAL_FAILURE(s.update(tokens, 0));
+    ASSERT_NO_FATAL_FAILURE(expect_hits("UpdateHandle"));
+    ASSERT_NO_FATAL_FAILURE(hits.upload(poison));
+    ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
+    EXPECT_EQ(s.output.total, capacity) << "rank=" << g_rank;
+    if (ht_count_mode_active(s.handle)) {
+        ASSERT_NO_FATAL_FAILURE(expect_hits("dispatch"));
+        ASSERT_NO_FATAL_FAILURE(hits.upload(poison));
+        ASSERT_NO_FATAL_FAILURE(s.dispatch(1, true));
+        ASSERT_NO_FATAL_FAILURE(expect_hits("graph replay"));
+    }
+    ASSERT_NO_FATAL_FAILURE(s.backward());
 }
 
 // All push EM modes: ten local hits per token, reversed source columns, and a

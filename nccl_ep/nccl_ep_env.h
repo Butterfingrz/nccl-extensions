@@ -60,11 +60,15 @@ struct ncclEpEnvConfig {
     // Launch the intra-LSA head and tail sync as separate kernels instead of
     // fusing them into the dispatch/combine kernels. Pull-push only.
     ncclEpEnvVar ht_unfused_sync{"NCCL_EP_HT_UNFUSED_SYNC", ncclEpEnvType::flag};
-    // Count exchange is the default HT EM path; set to fall back to the routing-map
-    // AllGather + scan path instead.
+    // Count exchange is the default HT path for EM local-permute and Flat handles; set to fall
+    // back to the routing-map AllGather + scan path instead. (The EM in the name is historical:
+    // it applies to Flat too.) Honored only under meta_exchange_policy AUTO; see
+    // meta_exchange_force_scan.
     ncclEpEnvVar ht_em_ag_scan_mode{"NCCL_EP_HT_EM_AG_SCAN_MODE", ncclEpEnvType::flag};
     // Count mode fuses the recv layout into dispatch by default; set to force the unfused
     // AllGather + compute_layout_info path (used to compare fused vs. unfused performance).
+    // Applies to EM local-permute and Flat handles alike. Honored only under
+    // meta_exchange_policy AUTO; see meta_exchange_force_unfused.
     ncclEpEnvVar ht_em_count_unfused{"NCCL_EP_HT_EM_COUNT_UNFUSED", ncclEpEnvType::flag};
     // Compact receive-row order: source-compact (default) keeps source top-k order
     // without gaps; expert-ascend sorts by ascending expert ID, also without gaps.
@@ -144,10 +148,5 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg);
 // stderr. Always prints — the caller decides when (e.g. gated on verbose at
 // group init, or unconditionally when reporting a misconfiguration).
 void nccl_ep_env_print(const ncclEpEnvConfig& cfg);
-
-int nccl_ep_resolve_combine_chunk(const ncclEpEnvConfig& cfg, int dispatch_num_sms, int num_lsa_teams);
-int nccl_ep_resolve_dispatch_chunk(const ncclEpEnvConfig& cfg, int combine_chunk, int num_lsa_teams);
-int nccl_ep_select_dispatch_chunk(const ncclEpEnvConfig& cfg, int default_chunk,
-                                 int num_lsa_teams, int dispatch_num_sms, int num_tokens);
 
 #endif  // NCCL_EP_ENV_H_

@@ -73,6 +73,26 @@ const CftDriverApi& cft_driver_api() {
     return api;
 }
 
+// Include alignment slack for an output allocation and an offset within it.
+bool cft_output_reserve_size(
+    size_t tokens,
+    size_t max_token_bytes,
+    size_t ranks,
+    cuuint64_t bind_align,
+    size_t recv_buffer_size,
+    size_t& reserve_size) {
+    if (max_token_bytes == 0 || tokens > SIZE_MAX / max_token_bytes ||
+        tokens * max_token_bytes > SIZE_MAX / ranks) {
+        return false;
+    }
+    const size_t bytes = ranks * tokens * max_token_bytes;
+    if (bind_align > SIZE_MAX / 2 || bytes > SIZE_MAX - 2 * bind_align) {
+        return false;
+    }
+    reserve_size = nccl_ep::align<size_t>(bytes, bind_align) + bind_align;
+    return recv_buffer_size <= SIZE_MAX - reserve_size;
+}
+
 }  // namespace
 #endif
 
@@ -94,6 +114,24 @@ ncclResult_t nccl_ep_cft_destroy(ncclEpLlCftBuffers* lb, int cuda_device_id) {
         api.cuLogicalEndpointIdRelease(static_cast<CUlogicalEndpointId>(peer_le), 1);
     }
     lb->imported_le_ids.clear();
+    // Release the caller-owned output before destroying its endpoint.
+    if (lb->zc_bound) {
+        api.cuLogicalEndpointUnbind(
+            static_cast<CUlogicalEndpointId>(lb->local_le),
+            static_cast<CUdevice>(cuda_device_id),
+            lb->zc_bind_off,
+            lb->zc_bound_size);
+        lb->zc_bound = false;
+    }
+    lb->zc_bound_size = 0;
+    lb->zc_active = false;
+    lb->zc_data_off = 0;
+    lb->zc_bound_win = ncclWindow_t{};
+    lb->zc_bound_data = nullptr;
+    for (auto& dim : lb->zc_bound_shape) {
+        dim = 0;
+    }
+    lb->zc_bound_datatype = ncclBfloat16;
     // Each setup step needs its own cleanup, even if a later step failed.
     if (lb->local_le_bound) {
         api.cuLogicalEndpointUnbind(
@@ -128,6 +166,9 @@ ncclResult_t nccl_ep_cft_destroy(ncclEpLlCftBuffers* lb, int cuda_device_id) {
     lb->slot_stride_bound = 0;
     lb->parity_stride = 0;
     lb->cumul_slots_per_parity = 0;
+    lb->zc_reserve_bytes = 0;
+    lb->zc_bind_off = 0;
+    lb->bind_align = 0;
 #else
     (void)lb;
     (void)cuda_device_id;
@@ -159,6 +200,7 @@ ncclResult_t nccl_ep_cft_init(
     int num_local_experts,
     size_t max_dispatch_tokens_per_rank,
     size_t max_token_bytes,
+    bool zero_copy,
     const char* env_var_name,
     bool verbose,
     cudaStream_t stream) {
@@ -210,30 +252,46 @@ ncclResult_t nccl_ep_cft_init(
         nccl_ep::ll::get_dispatch_hdr_sz(kNumMaxTopK, NCCL_EP_LAYOUT_RANK_MAJOR);
     const size_t slotStrideBound =
         nccl_ep::align<size_t>(maxDispatchHdrBytes + max_token_bytes, 256);
-    const size_t srcRankRegionBytes = max_dispatch_tokens_per_rank * slotStrideBound;
+    // Retain the legacy header-signal area after the message slots for layout compatibility.
+    const size_t srcRankRegionBytes = max_dispatch_tokens_per_rank * slotStrideBound +
+        nccl_ep::align<size_t>(max_dispatch_tokens_per_rank * maxDispatchHdrBytes, 256);
     const size_t data_region = static_cast<size_t>(nRanks) * srcRankRegionBytes;
     static constexpr uint64_t kCntrStride = 256;  // 256B-aligned counters
     const size_t numCumulSlots = static_cast<size_t>(nRanks) * num_local_experts;
-    const uint64_t byte_cntr_base_off  = (data_region + 255) & ~static_cast<uint64_t>(255);
+    const uint64_t byte_cntr_base_off  = nccl_ep::align<uint64_t>(data_region, 256);
     // Separate data and counters for consecutive dispatches.
     const uint64_t parity_stride =
         nccl_ep::align<uint64_t>(byte_cntr_base_off + static_cast<uint64_t>(nRanks) * kCntrStride, 256);
     size_t SZ = 0;
+    size_t zc_reserve = 0;
     if (local_ok && bindAlign > 0) {
         const size_t need = static_cast<size_t>(parity_stride) * 2;
-        SZ = ((need + bindAlign - 1) / bindAlign) * bindAlign;
-        if (SZ == 0) SZ = bindAlign;
+        SZ = nccl_ep::align<size_t>(need, bindAlign);
+        if (SZ == 0) {
+            SZ = bindAlign;
+        }
+        // Reserve space for an output allocation, including an offset within it.
+        if (zero_copy) {
+            local_ok = cft_output_reserve_size(
+                max_dispatch_tokens_per_rank, max_token_bytes, static_cast<size_t>(nRanks),
+                bindAlign, SZ, zc_reserve);
+            if (!local_ok) {
+                fprintf(stderr, "[nccl_ep][ll_cft] rank %d: zero-copy output size exceeds addressable range\n", rank);
+            }
+        }
         // Report an oversized buffer before BindAddr; 0 means no advertised cap.
-        if (maxSize != 0 && SZ > static_cast<size_t>(maxSize)) {
+        if (local_ok && maxSize != 0 && SZ + zc_reserve > static_cast<size_t>(maxSize)) {
             fprintf(stderr,
                     "[nccl_ep][ll_cft] rank %d: CFT recv buffer needs %zu B but the logical "
                     "endpoint caps bindable size at %llu B (nRanks=%d, tokens/rank=%zu, "
                     "slot=%zu B); CFT disabled\n",
-                    rank, SZ, static_cast<unsigned long long>(maxSize), nRanks, max_dispatch_tokens_per_rank,
+                    rank, SZ + zc_reserve, static_cast<unsigned long long>(maxSize), nRanks, max_dispatch_tokens_per_rank,
                     slotStrideBound);
             local_ok = false;
         }
-        prop.size = SZ;
+        if (local_ok) {
+            prop.size = SZ + zc_reserve;
+        }
     }
 
     // Create + map the FABRIC recv buffer.
@@ -452,14 +510,18 @@ ncclResult_t nccl_ep_cft_init(
     lb->src_rank_region_bytes = srcRankRegionBytes;
     lb->slot_stride_bound = slotStrideBound;
     lb->cumul_slots_per_parity = numCumulSlots;
+    lb->bind_align = bindAlign;
+    lb->zc_reserve_bytes = zc_reserve;
+    lb->zc_bind_off = SZ;
+    lb->zc_active = false;
     lb->dispatch_parity = 0;
     lb->initialized = true;
     if (verbose)
         fprintf(stderr,
                 "[nccl_ep][ll_cft] rank %d: initialized (SZ=%zu B, data=%zu MB/parity, "
-                "slot=%zu B, tokens/src=%zu, parity_stride=%llu)\n",
+                "slot=%zu B, tokens/src=%zu, parity_stride=%llu, zc_reserve=%zu B)\n",
                 rank, SZ, data_region >> 20, slotStrideBound, max_dispatch_tokens_per_rank,
-                static_cast<unsigned long long>(parity_stride));
+                static_cast<unsigned long long>(parity_stride), zc_reserve);
 #else
     (void)comm;
     (void)rank;
@@ -468,11 +530,165 @@ ncclResult_t nccl_ep_cft_init(
     (void)num_local_experts;
     (void)max_dispatch_tokens_per_rank;
     (void)max_token_bytes;
+    (void)zero_copy;
     (void)env_var_name;
     (void)verbose;
     (void)stream;
 #endif
     return ncclSuccess;
+}
+
+#if CUDA_VERSION >= 13030
+namespace {
+
+enum class OutputBindStatus : uint64_t { Ready, MissingWindow, Unaligned, TooLarge, BindFailed, NotReady, NoAllocation };
+
+struct OutputBinding {
+    OutputBindStatus status;
+    uint64_t offset;
+    uint64_t bytes;
+};
+
+OutputBindStatus bind_local_output(
+    ncclEpLlCftBuffers* lb, int rank, int cuda_device_id, bool have_window,
+    void* data, size_t tensor_bytes, OutputBinding* binding) {
+    if (!have_window) {
+        return OutputBindStatus::MissingWindow;
+    }
+    if (!lb->initialized || lb->zc_bound) {
+        return OutputBindStatus::BindFailed;
+    }
+    const uint64_t alignment = lb->bind_align;
+    if (alignment == 0 || lb->zc_reserve_bytes == 0 || tensor_bytes == 0) {
+        return OutputBindStatus::TooLarge;
+    }
+
+    // Preserve the tensor's row-zero offset within its containing allocation.
+    CUdeviceptr base = 0;
+    size_t allocation_bytes = 0;
+    if (cuMemGetAddressRange(&base, &allocation_bytes, reinterpret_cast<CUdeviceptr>(data)) != CUDA_SUCCESS) {
+        return OutputBindStatus::NoAllocation;
+    }
+    binding->offset = reinterpret_cast<CUdeviceptr>(data) - base;
+    if (base % alignment != 0 || binding->offset % 16 != 0) {
+        return OutputBindStatus::Unaligned;
+    }
+    if (binding->offset > allocation_bytes || tensor_bytes > allocation_bytes - binding->offset ||
+        binding->offset + tensor_bytes > SIZE_MAX - (alignment - 1)) {
+        return OutputBindStatus::TooLarge;
+    }
+    const size_t bind_size = nccl_ep::align<size_t>(binding->offset + tensor_bytes, alignment);
+    if (bind_size > lb->zc_reserve_bytes || bind_size > allocation_bytes) {
+        return OutputBindStatus::TooLarge;
+    }
+
+    const auto& api = cft_driver_api();
+    const CUresult result = api.cuLogicalEndpointBindAddr(
+        static_cast<CUlogicalEndpointId>(lb->local_le), static_cast<CUdevice>(cuda_device_id),
+        lb->zc_bind_off, reinterpret_cast<void*>(base), bind_size, 0);
+    if (result != CUDA_SUCCESS) {
+        const char* error = nullptr;
+        cuGetErrorString(result, &error);
+        fprintf(stderr, "[nccl_ep][ll_cft] rank %d: binding zero-copy output failed: %s\n",
+                rank, error ? error : "unknown CUDA error");
+        return OutputBindStatus::BindFailed;
+    }
+    lb->zc_bound = true;
+    lb->zc_bound_size = bind_size;
+    return ll_cft_poll_ready(static_cast<CUlogicalEndpointId>(lb->local_le))
+        ? OutputBindStatus::Ready : OutputBindStatus::NotReady;
+}
+
+const char* output_binding_failure(const OutputBinding& binding, const OutputBinding& reference) {
+    static const char* const reasons[] = {
+        "", "requires a window-backed, unquantized rank-major output", "output allocation or offset is misaligned",
+        "output exceeds its allocation or reserved endpoint range", "endpoint binding failed",
+        "endpoint did not become ready", "output is not backed by a cuMem allocation"};
+    if (binding.status != OutputBindStatus::Ready) {
+        return reasons[static_cast<uint64_t>(binding.status)];
+    }
+    if (binding.offset != reference.offset) {
+        return "output offset differs from rank 0";
+    }
+    if (binding.bytes != reference.bytes) {
+        return "output size differs from rank 0";
+    }
+    return nullptr;
+}
+
+void rollback_output_binding(ncclEpLlCftBuffers* lb, int rank, int cuda_device_id) {
+    if (!lb->zc_bound) {
+        return;
+    }
+    const CUresult result = cft_driver_api().cuLogicalEndpointUnbind(
+        static_cast<CUlogicalEndpointId>(lb->local_le), static_cast<CUdevice>(cuda_device_id),
+        lb->zc_bind_off, lb->zc_bound_size);
+    if (result == CUDA_SUCCESS) {
+        lb->zc_bound = false;
+        lb->zc_bound_size = 0;
+    } else {
+        // Retain ownership so group destruction can retry cleanup.
+        fprintf(stderr, "[nccl_ep][ll_cft] rank %d: zero-copy output rollback failed (CUDA %d)\n",
+                rank, static_cast<int>(result));
+    }
+}
+
+}  // namespace
+#endif
+
+// Failed ranks still join the collective before any direct payload writes.
+ncclResult_t nccl_ep_cft_bind_output(
+    ncclEpLlCftBuffers* lb,
+    ncclComm_t comm,
+    int rank,
+    int nRanks,
+    int cuda_device_id,
+    bool have_window,
+    void* data,
+    size_t tensor_bytes,
+    bool verbose,
+    cudaStream_t stream) {
+#if CUDA_VERSION >= 13030
+    std::vector<OutputBinding> bindings(nRanks, OutputBinding{});
+    auto& mine = bindings[rank];
+    mine.bytes = tensor_bytes;
+    mine.status = bind_local_output(lb, rank, cuda_device_id, have_window, data, tensor_bytes, &mine);
+    ncclAllGatherHost(bindings.data(), sizeof(OutputBinding), rank, nRanks, comm, stream);
+    bool all_ready = true;
+    for (int r = 0; r < nRanks; ++r) {
+        const char* reason = output_binding_failure(bindings[r], bindings[0]);
+        if (reason == nullptr) {
+            continue;
+        }
+        all_ready = false;
+        if (rank == 0 || verbose) {
+            fprintf(stderr, "[nccl_ep][ll_cft] zero-copy output on rank %d: %s\n", r, reason);
+        }
+    }
+    if (!all_ready) {
+        rollback_output_binding(lb, rank, cuda_device_id);
+        return ncclInvalidUsage;
+    }
+    lb->zc_active = true;
+    lb->zc_data_off = lb->zc_bind_off + mine.offset;
+    if (verbose) {
+        fprintf(stderr, "[nccl_ep][ll_cft] rank %d: zero-copy ACTIVE (bound=%zu B, output_offset=%llu)\n",
+                rank, lb->zc_bound_size, static_cast<unsigned long long>(lb->zc_data_off));
+    }
+    return ncclSuccess;
+#else
+    (void)lb;
+    (void)comm;
+    (void)rank;
+    (void)nRanks;
+    (void)cuda_device_id;
+    (void)have_window;
+    (void)data;
+    (void)tensor_bytes;
+    (void)verbose;
+    (void)stream;
+    return ncclInvalidUsage;
+#endif
 }
 
 namespace {

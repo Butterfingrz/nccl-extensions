@@ -97,7 +97,7 @@ protected:
         tma_copy_available_ = false;
         if (GetParam() == nullptr ||
             (strcasecmp(GetParam(), "CE") != 0 && strcasecmp(GetParam(), "SIMT") != 0)) {
-            // Use the library's opt-in check, including runtime and build-time CE fallback.
+            // Use the library's opt-in check, including runtime CE fallback.
             const ncclResult_t status = nccl_ep::ht::configure_dispatch_copy_tma();
             ASSERT_TRUE(status == ncclSuccess || status == ncclInvalidUsage);
             tma_copy_available_ = status == ncclSuccess;

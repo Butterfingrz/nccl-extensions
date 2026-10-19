@@ -31,13 +31,21 @@ constexpr const char* kLlDispatchJitEntryName = "nccl_ep_jit_ll_dispatch_kernel"
 // chosen automatically per call by ll_dispatch_select_algo() below -- callers
 // never pick a kernel directly.
 //   kDefault:     the general kernel (every recipe/layout, RDMA/GIN capable).
-//                 Also used for CFT; the LSA-only kernel has no CFT transport.
-//   k2SidedRmLsa: LSA-only rank-major SIMT kernel, quantization: NONE or fused DS_FP8E3M4.
-//                 Token and scale windows independently bypass receive staging.
+//                 Also the CFT fallback: quantized recipes, partial tiles, expert-major,
+//                 non-NVLink groups, and NCCL_EP_LL_CFT_LSA=0.
+//   k2SidedRmLsa: STORE LSA-only rank-major SIMT kernel, quantization: NONE or
+//                 fused DS_FP8E3M4. Token and scale windows independently bypass
+//                 receive staging, selected at runtime.
+//   kCftRmLsa:    CFT LSA-only rank-major kernel, NONE recipe only. Warp 0 issues
+//                 fabric puts. Counted sources publish counts early; ordinary-put
+//                 sources publish after completion. Sender completion mode and
+//                 zero-copy output are JIT specializations. NCCL_EP_LL_CFT_LSA=0
+//                 selects the general CFT kernel instead.
 //   k2SidedRmLsaTma: TMA-pipelined SEND, NONE or fused DS_FP8E3M4, with the same
-//                 direct-output contract. DSFP8 quantizes once per token into
-//                 the existing BF16 stage in place before issuing peer TMA stores.
-enum class LlDispatchAlgo { kDefault, k2SidedRmLsa, k2SidedRmLsaTma };
+//                 direct-output contract, when CFT is disabled. DSFP8 quantizes
+//                 once per token into the existing BF16 stage in place before
+//                 issuing peer TMA stores.
+enum class LlDispatchAlgo { kDefault, k2SidedRmLsa, k2SidedRmLsaTma, kCftRmLsa };
 
 // Picks the most performant kernel for the configuration; overridable via NCCL_EP_DISPATCH_LSA
 // (lsaMode, see NcclEpDispatchLsaMode's doc comment in device/ll_ep_adapter.cuh).
@@ -52,22 +60,40 @@ inline LlDispatchAlgo ll_dispatch_select_algo(
 
     const bool lsaRecipe =
         recipe == NCCL_EP_DISP_QUANT_NONE || recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
-    // Both specialized paths require complete warp-sized input vector tiles.
+    // All LSA paths require complete warp-sized input vector tiles.
     // Partial tiles use the universal kernel, including explicit SIMT/TMA modes.
     const int elemsPerWarp = 32 * static_cast<int>(sizeof(int4)) / (tokenDtype == ncclFloat32 ? 4 : 2);
+    // CFT: the LSA-CFT specialization (NONE recipe) unless NCCL_EP_LL_CFT_LSA=0; partial tiles
+    // and other recipes keep the general CFT kernel.
+    const bool cftUsesLsaKernel = !cftEnabled || (ll_cft_lsa_enabled() && recipe == NCCL_EP_DISP_QUANT_NONE);
     const bool lsaEligible = hidden > 0 && hidden % elemsPerWarp == 0 &&
-        !cftEnabled && nvlinkOnly && lsaRecipe && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
+        cftUsesLsaKernel && nvlinkOnly && lsaRecipe && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
 
-    // Prefer TMA for both supported LSA recipes unless explicitly overridden.
-    if (lsaEligible && lsaMode == NcclEpDispatchLsaMode::kTma) {
+    // CFT owns a separate LSA kernel; both SIMT/TMA overrides retain that
+    // selection. STORE keeps its existing SIMT/TMA choice.
+    if (lsaEligible && cftEnabled) {
+        return LlDispatchAlgo::kCftRmLsa;
+    }
+    // Prefer TMA for both supported STORE LSA recipes.
+    if (lsaEligible && !cftEnabled && lsaMode == NcclEpDispatchLsaMode::kTma) {
         return LlDispatchAlgo::k2SidedRmLsaTma;
     }
-    // Explicit SIMT selection uses the non-TMA LSA kernel.
+    // Explicit SIMT selection uses the STORE SIMT kernel.
     if (lsaEligible) {
         return LlDispatchAlgo::k2SidedRmLsa;
     }
 
     return LlDispatchAlgo::kDefault;
+}
+
+// Zero-copy CFT is implemented only by the LSA kernel. Keep public binding
+// validation tied to the same selector used by cold and warm JIT launches.
+inline bool ll_dispatch_cft_zero_copy_supported(
+    bool nvlinkOnly, ncclEpDispQuant_t recipe, ncclEpLayout_t layout,
+    NcclEpDispatchLsaMode lsaMode, int hidden, ncclDataType_t tokenDtype) {
+    return (tokenDtype == ncclBfloat16 || tokenDtype == ncclFloat16) &&
+        ll_dispatch_select_algo(nvlinkOnly, recipe, layout, /*cftEnabled=*/true,
+                                lsaMode, hidden, tokenDtype) == LlDispatchAlgo::kCftRmLsa;
 }
 
 inline std::string ll_dispatch_jit_source(
@@ -84,22 +110,31 @@ inline std::string ll_dispatch_jit_source(
     bool cftEnabled,
     int numTmaStages,
     int numTmaQuantWarps,
-    bool recordDstInfo) {
+    bool recordDstInfo,
+    bool cftZeroCopy,
+    bool cftCountedPayload,
+    int cftNumWarps,
+    bool cftOneWordMask) {
     const char* layout_literal = ::nccl_ep::jit::layout_literal(layout);
     const char* topk_type = topkIdxIsInt64 ? "int64_t" : "int32_t";
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(tokenDtype);
 
-    // The JIT source must reference the same arg struct definition that the
-    // host packs. Including device/ll_ep_adapter.cuh keeps the layout in sync;
-    // ll_ep.cuh pulls in all kernel templates and helpers (including
-    // dispatch_kernel_impl_2sided_rm_lsa and dispatch_kernel_impl_2sided_rm_lsa_tma, via
-    // device/ll/ll_dispatch_lsa.cuh).
+    int blockThreads = 1024;
+    if (algo == LlDispatchAlgo::kCftRmLsa) {
+        blockThreads = cftNumWarps * 32;
+    } else if (compactQuant) {
+        blockThreads = kLlDsFp8CompactWarps * 32;
+    }
+
+    // CFT LSA owns its header; other families use the umbrella include.
     std::ostringstream src;
-    src << "#include \"device/ll_ep.cuh\"\n"
+    src << (algo == LlDispatchAlgo::kCftRmLsa
+                ? "#include \"device/ll/ll_dispatch_cft_lsa.cuh\"\n"
+                : "#include \"device/ll_ep.cuh\"\n")
         << "#include \"device/ll_ep_adapter.cuh\"\n"
         << "\n"
         << "extern \"C\" __launch_bounds__("
-        << (compactQuant ? kLlDsFp8CompactWarps * 32 : 1024)
+        << blockThreads
         << ", 1)\n"
         << "__global__ void " << kLlDispatchJitEntryName << "(\n"
         << "    const __grid_constant__ nccl_ep::ll::dispatch_kernel_args_t p) {\n";
@@ -116,10 +151,6 @@ inline std::string ll_dispatch_jit_source(
             << "      " << ::nccl_ep::jit::bool_literal(recordDstInfo) << ">(p);\n";
         break;
     case LlDispatchAlgo::k2SidedRmLsa:
-        // dispatch_kernel_impl_2sided_rm_lsa hardcodes NCCL_EP_LAYOUT_RANK_MAJOR
-        // (the only layout it supports) and takes the same (p) grid-constant
-        // arg struct -- no layout template argument, no positional arg list,
-        // here.
         src << "  nccl_ep::ll::dispatch_kernel_impl_2sided_rm_lsa<\n"
             << "      " << kernel_spec.recipe_source_literal << ",\n"
             << "      " << hidden << ",\n"
@@ -127,6 +158,16 @@ inline std::string ll_dispatch_jit_source(
             << "      " << topk_type << ",\n"
             << "      " << token_dtype_literal << ", " << (stageQuant ? "true" : "false") << ",\n"
             << "      " << ::nccl_ep::jit::bool_literal(recordDstInfo) << ">(p);\n";
+        break;
+    case LlDispatchAlgo::kCftRmLsa:
+        src << "  nccl_ep::ll::dispatch_kernel_impl_cft_rm_lsa<\n"
+            << "      " << hidden << ",\n"
+            << "      " << num_topk << ",\n"
+            << "      " << topk_type << ",\n"
+            << "      " << token_dtype_literal << ",\n"
+            << "      " << ::nccl_ep::jit::bool_literal(cftZeroCopy) << ", "
+            << ::nccl_ep::jit::bool_literal(cftCountedPayload);
+        src << ", " << (cftOneWordMask ? 1 : 8) << ">(p);\n";
         break;
     case LlDispatchAlgo::kDefault:
         src << "  nccl_ep::ll::dispatch_kernel_impl<\n"
@@ -163,22 +204,20 @@ inline ncclResult_t launch_ll_dispatch(
     int tmaQuantWarps,
     int maxDynamicSmem,
     bool recordDstInfo,
+    bool cftZeroCopy,
     const dispatch_kernel_args_t& args,
     cudaStream_t stream,
     bool nucs,
-    bool* dstInfoDisqualifiedOut) {
+    bool* dstInfoDisqualifiedOut,
+    bool cftOneWordMask) {
     const bool cftEnabled = cft_smem_bytes != 0;
     const LlDispatchAlgo algo = ll_dispatch_select_algo(nvlinkOnly, recipe, layout, cftEnabled, lsaMode, hidden, tokenDtype);
-    // The single source of truth for whether this call's kernel selection writes
-    // dstInfo/maxTotalTokens at all (only the two LSA algos do) -- callers must not
-    // re-derive this from lsaMode alone, since kDefault can also be chosen for reasons
-    // other than NCCL_EP_DISPATCH_LSA=universal (see ll_dispatch_select_algo above).
-    // *dstInfoDisqualifiedOut is also an INPUT: a caller that already knows 1-sided must never be
-    // enabled this call (e.g. it's statically unreachable regardless of which kernel runs) seeds it
-    // true beforehand, and that sticks -- this only ever ADDS a disqualifying reason, never clears
-    // one the caller already set.
-    *dstInfoDisqualifiedOut = *dstInfoDisqualifiedOut || algo == LlDispatchAlgo::kDefault;
+    // Only STORE LSA kernels record one-sided-combine metadata.
+    // Preserve any disqualification already established by the caller.
+    *dstInfoDisqualifiedOut = *dstInfoDisqualifiedOut ||
+        (algo != LlDispatchAlgo::k2SidedRmLsa && algo != LlDispatchAlgo::k2SidedRmLsaTma);
     const bool twoSidedRmLsa = algo == LlDispatchAlgo::k2SidedRmLsa;
+    const bool cftRmLsa = algo == LlDispatchAlgo::kCftRmLsa;
     const bool twoSidedRmLsaTma = algo == LlDispatchAlgo::k2SidedRmLsaTma;
     const bool tmaQuant = twoSidedRmLsaTma && recipe == NCCL_EP_DISP_QUANT_DS_FP8E3M4;
     // Non-quantizing variants have no TMA quantization workers. Keep their
@@ -197,9 +236,28 @@ inline ncclResult_t launch_ll_dispatch(
                      requiredTmaWarps, numWarps);
         return ncclInvalidArgument;
     }
+    // General CFT zero-copy is separate from the LSA implementation. Reject
+    // it before both cache paths, including receive-only continuations.
+    if (cftZeroCopy && (!cftEnabled || !cftRmLsa)) {
+        return ncclInvalidUsage;
+    }
+    // Specialize the local sender; each received source still carries its own put form.
+    const bool cftCountedPayload = cftRmLsa && args.cft.countedPayload != 0;
     // Keep the compact thread limit with a one-block launch bound: repeated
     // single- and multi-node tuning did not favor the tighter register budget.
     const bool compactQuant = stageQuant && numWarps <= kLlDsFp8CompactWarps;
+
+    // Validate before either cache path. Mask width never changes the grid,
+    // warp grouping, launch bound, dynamic carve, or source count mode.
+    if (cftOneWordMask &&
+        (!cftEnabled || !cftRmLsa || hidden != 7168 || num_topk != 6 ||
+         tokenDtype != ncclBfloat16 || !topkIdxIsInt64 || args.numRanks != 4 || args.numExperts != 384 ||
+         args.maxTokensPerRank < 2048 || args.maxTokensPerRank > 8192 ||
+         args.numTokens < 0 || args.numTokens > args.maxTokensPerRank ||
+         numSms != 192 || numWarps != 32 || args.numWarpGroups != 2 || args.numWarpsPerGroup != 16 ||
+         ll_lsa_cft_tokens_per_cta(args.maxTokensPerRank, numSms) > 64)) {
+        return ncclInvalidArgument;
+    }
 
     // TMA smem budget: stage-ring + rank-pointer-cache sizing is resolved here (host-side,
     // JIT-variant-selection time) from (hidden, dtype, maxDynamicSmem) only -- see
@@ -233,6 +291,7 @@ inline ncclResult_t launch_ll_dispatch(
     static const int variant_identity_default = 0;
     static const int variant_identity_2sided_rm_lsa = 0;
     static const int variant_identity_2sided_rm_lsa_tma = 0;
+    static const int variant_identity_cft_rm_lsa = 0;
 
     ::nccl_ep::jit::JitKernelVariant variant;
     switch (algo) {
@@ -244,6 +303,10 @@ inline ncclResult_t launch_ll_dispatch(
         variant.kernel_family = "ll_dispatch_2sided_rm_lsa";
         variant.identity = &variant_identity_2sided_rm_lsa;
         break;
+    case LlDispatchAlgo::kCftRmLsa:
+        variant.kernel_family = "ll_dispatch_cft_rm_lsa";
+        variant.identity = &variant_identity_cft_rm_lsa;
+        break;
     case LlDispatchAlgo::kDefault:
     default:
         variant.kernel_family = "ll_dispatch";
@@ -251,8 +314,9 @@ inline ncclResult_t launch_ll_dispatch(
         break;
     }
     variant.entry_name = kLlDispatchJitEntryName;
-    // Derived from the raw parameters so the warm-cache launch path never has
-    // to build the variant-name string.
+    // The family identity separates CFT LSA from STORE and general CFT.
+    // Within each family, derive the key from raw parameters so the warm-cache
+    // launch path never has to build the variant-name string.
     std::uint64_t key = ::nccl_ep::jit::kRuntimeKeySeed;
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(hidden));
     key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(layout));
@@ -271,6 +335,14 @@ inline ncclResult_t launch_ll_dispatch(
         key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(numTmaQuantWarps));
     }
     key = ::nccl_ep::jit::runtime_key_mix(key, recordDstInfo ? 1u : 0u);
+    key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(cftZeroCopy));
+    if (cftRmLsa) {
+        key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(cftCountedPayload));
+        key = ::nccl_ep::jit::runtime_key_mix(key, static_cast<std::uint64_t>(numWarps));
+        if (cftOneWordMask) {
+            key = ::nccl_ep::jit::runtime_key_mix(key, 1u);
+        }
+    }
     variant.runtime_key = key;
     variant.num_blocks = numSms;
     variant.block_dim = numWarps * 32;
@@ -280,7 +352,7 @@ inline ncclResult_t launch_ll_dispatch(
     variant.dynamic_smem_bytes = cftEnabled ? cft_smem_bytes : tmaDynamicSmemBytes;
     variant.nucs = nucs;
     // Always cooperative: kDefault needs its grid-wide SEND/RECV sync;
-    // k2SidedRmLsa/k2SidedRmLsaTma use it for efficient cross-CTA atomic coordination.
+    // All LSA families use it for efficient cross-CTA atomic coordination.
     variant.cooperative = true;
     // Pair SMs into clusters of 2 when possible to share distributed SMEM.
     variant.cluster_dim_x = (numSms % 2 == 0) ? 2 : 1;
@@ -304,6 +376,7 @@ inline ncclResult_t launch_ll_dispatch(
              << "_scale" << kernel_spec.scale_cache_tag
              << (nvlinkOnly ? "_nvlinkonly" : "")
              << (twoSidedRmLsa ? "_2sidedrmlsa" : "")
+             << (cftRmLsa ? "_cftrmlsa" : "")
              << (twoSidedRmLsaTma ? "_2sidedrmlsatma" : "")
              << (twoSidedRmLsaTma ? ("_stages" + std::to_string(numTmaStages)) : "")
              << (tmaQuant ? ("_qwarps" + std::to_string(numTmaQuantWarps)) : "")
@@ -313,10 +386,21 @@ inline ncclResult_t launch_ll_dispatch(
              << (topkIdxIsInt64 ? "_topk64" : "_topk32")
              << ::nccl_ep::jit::token_dtype_name_tag(tokenDtype)
              << (recordDstInfo ? "_dstinfo1s" : "");
+        if (cftZeroCopy) {
+            name << "_zcopy";
+        }
+        if (cftRmLsa) {
+            name << (cftCountedPayload ? "_counted" : "_uncounted");
+            name << "_warps" << numWarps;
+        }
+        if (cftRmLsa && cftOneWordMask) {
+            name << "_maskw1";
+        }
         variant_name = name.str();
         const std::string source = ll_dispatch_jit_source(
             kernel_spec, hidden, num_topk, layout, nvlinkOnly, topkIdxIsInt64, tokenDtype, algo,
-            compactQuant, stageQuant, cftEnabled, numTmaStages, numTmaQuantWarps, recordDstInfo);
+            compactQuant, stageQuant, cftEnabled, numTmaStages, numTmaQuantWarps, recordDstInfo,
+            cftZeroCopy, cftCountedPayload, numWarps, cftOneWordMask);
         variant.variant_name = variant_name;
         variant.source = source;
         status = ::nccl_ep::jit::launch_jit_kernel(

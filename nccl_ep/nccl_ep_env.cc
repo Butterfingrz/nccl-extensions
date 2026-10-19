@@ -5,7 +5,6 @@
  */
 
 #include "nccl_ep_env.h"
-#include "device/ht_ep_configs.cuh"
 
 #include <cerrno>
 #include <cctype>
@@ -125,47 +124,6 @@ void nccl_ep_env_init(ncclEpEnvConfig* cfg) {
     parse_ulong(cfg->combine_num_pipelines);
     parse_ulong(cfg->ll_cft_debug_min_driver);
     parse_ulong(cfg->combine_lsa_threshold);
-}
-
-int nccl_ep_resolve_combine_chunk(const ncclEpEnvConfig& cfg, int dispatch_num_sms, int num_lsa_teams) {
-    auto round_up_32 = [](int v) { return (v + 31) & ~31; };
-    // Preserve the dispatch-grid-based default until independent tuning is validated.
-    int chunk = num_lsa_teams > 1 ? HT_TOKENS_PER_CHUNK_RDMA_DEFAULT
-                                 : round_up_32(NCCL_EP_HT_COMBINE_TOK_PER_GROUP * dispatch_num_sms);
-    const auto& var = cfg.tokens_per_chunk;
-    if (var.is_set && var.value.ul > 0) {
-        const int requested = static_cast<int>(var.value.ul);
-        chunk = round_up_32(requested);
-        if (chunk != requested) {
-            std::fprintf(stderr, "[nccl_ep] %s=%d rounded up to %d (must be a multiple of 32)\n",
-                         var.name, requested, chunk);
-        }
-    }
-    return chunk;
-}
-
-int nccl_ep_resolve_dispatch_chunk(const ncclEpEnvConfig& cfg, int combine_chunk, int num_lsa_teams) {
-    const auto& var = cfg.dispatch_tokens_per_chunk;
-    if (!var.is_set) return combine_chunk;
-    const unsigned long chunk = var.value.ul;
-    if (num_lsa_teams != 1 || chunk < 32 || chunk % 32 != 0 ||
-        chunk > static_cast<unsigned long>(combine_chunk) || combine_chunk % chunk != 0) {
-        if (cfg.rank == 0) {
-            std::fprintf(stderr, "[nccl_ep] %s=%lu ignored (requires one LSA team and a multiple of 32 dividing %d)\n",
-                         var.name, chunk, combine_chunk);
-        }
-        return combine_chunk;
-    }
-    return static_cast<int>(chunk);
-}
-
-int nccl_ep_select_dispatch_chunk(const ncclEpEnvConfig& cfg, int default_chunk,
-                                 int num_lsa_teams, int dispatch_num_sms, int num_tokens) {
-    if (cfg.dispatch_tokens_per_chunk.is_set || cfg.dispatch_num_stages.is_set ||
-        cfg.dispatch_num_pipelines.is_set || num_lsa_teams != 1 || default_chunk != 64 ||
-        dispatch_num_sms < 16 || dispatch_num_sms > 64) return default_chunk;
-    // Measured on VR200/GB200: spread small batches across CTAs without a second chunk per CTA.
-    return num_tokens > 32 && num_tokens <= 32 * dispatch_num_sms ? 32 : default_chunk;
 }
 
 void nccl_ep_env_print(const ncclEpEnvConfig& cfg) {

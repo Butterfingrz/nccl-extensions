@@ -35,8 +35,31 @@ NVCUFLAGS := $(NVCC_GENCODE) \
 
 NVLDFLAGS := -L$(NCCL_EP_LIBDIR) -lnccl_ep -L$(NCCL_LIBDIR) -lnccl -lpthread -lrt -ldl -lcuda
 
-TEST_BINARIES := $(DST_DIR)/test_output_layout $(DST_DIR)/test_handle_maps $(DST_DIR)/test_lifecycle $(DST_DIR)/test_public_struct_abi $(DST_DIR)/test_ht_bwd $(DST_DIR)/test_tensor_create $(DST_DIR)/test_zero_copy $(DST_DIR)/test_ht_stale_routing_map $(DST_DIR)/test_ht_combine_pp_interleave $(DST_DIR)/test_ht_dispatch_pp_interleave $(DST_DIR)/test_ht_overflow_drop $(DST_DIR)/test_quantization_recipe $(DST_DIR)/test_recv_topk_idx_flags $(DST_DIR)/test_elastic_buffer $(DST_DIR)/test_ll_epoch_protocol $(DST_DIR)/test_ll_group_epoch $(DST_DIR)/test_mxfp8_combine $(DST_DIR)/test_mxfp8_combine_conversion \
-                 $(DST_DIR)/test_ht_dispatch_async $(DST_DIR)/test_ht_compact_prob $(DST_DIR)/test_cft_driver_api $(DST_DIR)/test_ll_kernel_selection $(DST_DIR)/test_ht_chunk_config $(DST_DIR)/test_ht_chunk_handle
+TEST_BINARIES := \
+        $(DST_DIR)/test_cft_driver_api \
+        $(DST_DIR)/test_elastic_buffer \
+        $(DST_DIR)/test_handle_maps \
+        $(DST_DIR)/test_ht_bwd \
+        $(DST_DIR)/test_ht_chunk_config \
+        $(DST_DIR)/test_ht_chunk_handle \
+        $(DST_DIR)/test_ht_combine_pp_interleave \
+        $(DST_DIR)/test_ht_compact_prob \
+        $(DST_DIR)/test_ht_dispatch_async \
+        $(DST_DIR)/test_ht_dispatch_pp_interleave \
+        $(DST_DIR)/test_ht_overflow_drop \
+        $(DST_DIR)/test_ht_stale_routing_map \
+        $(DST_DIR)/test_lifecycle \
+        $(DST_DIR)/test_ll_epoch_protocol \
+        $(DST_DIR)/test_ll_group_epoch \
+        $(DST_DIR)/test_ll_kernel_selection \
+        $(DST_DIR)/test_mxfp8_combine \
+        $(DST_DIR)/test_mxfp8_combine_conversion \
+        $(DST_DIR)/test_output_layout \
+        $(DST_DIR)/test_public_struct_abi \
+        $(DST_DIR)/test_quantization_recipe \
+        $(DST_DIR)/test_recv_topk_idx_flags \
+        $(DST_DIR)/test_tensor_create \
+        $(DST_DIR)/test_zero_copy
 
 .PHONY: all clean
 all: $(TEST_BINARIES)
@@ -50,6 +73,8 @@ $(DST_DIR)/test_ht_compact_prob.o: $(NCCL_EP_SRCDIR)/device/ht_ep_adapter.cuh $(
 $(DST_DIR)/test_ht_dispatch_async: NVLDFLAGS := $(NCCL_EP_LIBDIR)/libnccl_ep.a $(filter-out -lnccl_ep,$(NVLDFLAGS))
 $(DST_DIR)/test_ht_dispatch_async: $(NCCL_EP_LIBDIR)/libnccl_ep.a
 $(DST_DIR)/test_ht_dispatch_async.o: $(NCCL_EP_SRCDIR)/device/ht_ep_adapter.cuh
+
+$(DST_DIR)/test_ht_chunk_config.o: $(NCCL_EP_SRCDIR)/ht_chunk_config.hpp $(NCCL_EP_SRCDIR)/nccl_ep_env.h $(NCCL_EP_SRCDIR)/device/ht_ep_configs.cuh
 
 # Exercise optional driver API lookup without a GPU or production test hooks.
 CFT_DRIVER_WRAPS := cudaGetDriverEntryPointByVersion cudaGetLastError cudaRuntimeGetVersion \

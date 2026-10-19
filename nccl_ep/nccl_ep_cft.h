@@ -54,6 +54,21 @@ struct ncclEpLlCftBuffers {
     // concurrent updates. Each parity's hardware counters accumulate across dispatches.
     uint64_t* cumul_byte_expect_dev = nullptr;
     size_t cumul_slots_per_parity = 0;      // nRanks * numLocalExperts
+
+    // Zero-copy keeps two bindings on local_le: internal headers/counters
+    // (local_le_bound) and caller-owned payload output (zc_bound).
+    // The output window and allocation must stay alive until group destruction.
+    uint64_t bind_align = 0;
+    uint64_t zc_reserve_bytes = 0;
+    uint64_t zc_bind_off = 0;
+    bool zc_active = false;          // collective bind succeeded on every rank
+    bool zc_bound = false;           // this rank owns a binding to release
+    size_t zc_bound_size = 0;
+    uint64_t zc_data_off = 0;        // endpoint offset of output row zero
+    ncclWindow_t zc_bound_win{};
+    void* zc_bound_data = nullptr;
+    size_t zc_bound_shape[3] = {};
+    ncclDataType_t zc_bound_datatype = ncclBfloat16;
 };
 
 // Defined in nccl_ep.cc.
@@ -155,7 +170,22 @@ ncclResult_t nccl_ep_cft_init(
     int num_local_experts,
     size_t max_dispatch_tokens_per_rank,
     size_t max_token_bytes,
+    bool zero_copy,
     const char* env_var_name,
+    bool verbose,
+    cudaStream_t stream);
+
+// Bind the output collectively before the first zero-copy dispatch. A failure
+// returns an error on every rank. The binding stays fixed until group destruction.
+ncclResult_t nccl_ep_cft_bind_output(
+    ncclEpLlCftBuffers* lb,
+    ncclComm_t comm,
+    int rank,
+    int nRanks,
+    int cuda_device_id,
+    bool have_window,
+    void* data,
+    size_t tensor_bytes,
     bool verbose,
     cudaStream_t stream);
 

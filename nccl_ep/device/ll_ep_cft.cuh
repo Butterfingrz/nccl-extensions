@@ -77,8 +77,9 @@ __device__ __forceinline__ bool cftPairUsesCft(bool cftEnabled, int srcRank, int
 
 // JIT tile geometry. Keep the host's dynamic shared-memory sizing in
 // ll_ep_adapter.cu consistent with these constants.
-template <int kHidden, int kNumTopk, ncclEpLayout_t kLayout>
+template <int kHidden, int kNumTopk, ncclEpLayout_t kLayout, bool kCftZeroCopy>
 struct CftTileGeometry {
+    static constexpr bool kZeroCopy = kCftZeroCopy;
     // Double buffering overlaps the next payload load with the current put.
     // Only one TMA load is in flight: each iteration waits for its own load
     // before issuing the next, since independent copies need not finish in order.
@@ -87,6 +88,8 @@ struct CftTileGeometry {
     static constexpr int kTileHdrBytes =
         static_cast<int>(align<size_t>(get_dispatch_hdr_sz<kLayout>(kNumTopk), 128));
     static constexpr int kTileBytes = kHidden * kCftElementBytes + kTileHdrBytes;
+    // Separate puts use a 128 B-aligned payload source; the staged put is contiguous.
+    static constexpr size_t kPayloadOffset = kZeroCopy ? kTileHdrBytes : get_dispatch_hdr_sz<kLayout>(kNumTopk);
     static constexpr size_t kTilesBytes = static_cast<size_t>(kRingDepth) * kTileBytes;
     // Completion budget in 16 B units. Reserve one worst-case token below
     // the 2^20-unit phase limit because the check runs after each submit.
@@ -103,6 +106,7 @@ struct CftMessageLayout {
     size_t hiddenBytes;   // token payload the TMA load/store and the puts carry
     size_t payloadBytes;  // hidden + scales (== hidden under CFT)
     size_t msgBytes;      // hdrBytes + payloadBytes: the counted put's size
+    int maxTokensPerRank; // source-rank stride in the zero-copy output
 };
 
 // Warp-0 sender state. Tiles, endpoint IDs, and destination scratch use
@@ -157,15 +161,19 @@ __device__ __forceinline__ CftSendContext<Geometry> cftCarveSendContext(
 // payloads use TMA from the staged tile; fabric loopback is unsupported.
 struct CftSelfDestination {
     uint8_t* recvBase;       // header section: slot s at recvBase + s * hdrBytes
-    size_t hdrSectionBytes;  // maxTokensPerRank * hdrBytes: the payload section starts here
+    uint8_t* payloadBase;   // payload slot zero, either internal storage or the bound output
 };
 
+template <bool kCftZeroCopy>
 __device__ __forceinline__ CftSelfDestination cftSelfDestination(
-    void* recvBuf, int currRank, int numRanks, size_t srcRankRegionBytes, int maxTokensPerRank, size_t hdrBytes) {
+    void* recvBuf, void* outData, int currRank, int numRanks, size_t srcRankRegionBytes,
+    int maxTokensPerRank, size_t hdrBytes, size_t hiddenBytes) {
     CftSelfDestination self;
     self.recvBase = static_cast<uint8_t*>(recvBuf) +
         static_cast<size_t>(relativeRankSlot(currRank, currRank, numRanks)) * srcRankRegionBytes;
-    self.hdrSectionBytes = static_cast<size_t>(maxTokensPerRank) * hdrBytes;
+    self.payloadBase = kCftZeroCopy
+        ? static_cast<uint8_t*>(outData) + static_cast<size_t>(currRank) * maxTokensPerRank * hiddenBytes
+        : self.recvBase + static_cast<size_t>(maxTokensPerRank) * hdrBytes;
     return self;
 }
 
@@ -220,7 +228,8 @@ __device__ __forceinline__ void cftInitSender(
 // receive base once per CTA.
 __device__ __forceinline__ void cftCheckBulkAlignment(const CftSelfDestination& self, const CftMessageLayout& msg) {
     EP_DEVICE_ASSERT((msg.hdrBytes % 16) == 0 && (msg.hiddenBytes % 16) == 0 &&
-                     (reinterpret_cast<uintptr_t>(self.recvBase) % 16) == 0);
+                     (reinterpret_cast<uintptr_t>(self.recvBase) % 16) == 0 &&
+                     (reinterpret_cast<uintptr_t>(self.payloadBase) % 16) == 0);
 }
 
 // Sender: stage (TMA load into a ring slot)
@@ -232,7 +241,7 @@ template <class Geometry>
 __device__ __forceinline__ void cftStagePayload(
     CftSendContext<Geometry>& ctx, int slot, const int4* srcToken, const CftMessageLayout& msg) {
     nccl_ep::cft::cft_tma_expect_tx(&ctx.tmaMbars[slot], static_cast<unsigned>(msg.hiddenBytes));
-    nccl_ep::cft::cft_tma_g2s(ctx.tile(slot) + msg.hdrBytes, srcToken, static_cast<unsigned>(msg.hiddenBytes),
+    nccl_ep::cft::cft_tma_g2s(ctx.tile(slot) + Geometry::kPayloadOffset, srcToken, static_cast<unsigned>(msg.hiddenBytes),
                               &ctx.tmaMbars[slot]);
 }
 
@@ -313,19 +322,19 @@ __device__ __forceinline__ unsigned cftPrepareToken(
 // Sender: put (lane 0)
 
 // Publish the tile, then send once per destination. Self uses a TMA payload
-// store into the split receive layout; peers receive counted [header | payload]
-// puts into the fabric buffer's current parity copy. Completion reports are
-// drained by cftSettleIfOverBudget and cftDrainSender.
+// store. Zero-copy sends headers to the internal buffer and payloads to the
+// output; staged CFT sends a combined message. Completion reports are drained
+// by cftSettleIfOverBudget and cftDrainSender.
 template <class Geometry>
 __device__ __forceinline__ void cftPutToken(
     CftSendContext<Geometry>& ctx, const cft_dispatch_args_t& cft, const CftSelfDestination& self,
     const CftMessageLayout& msg, const int* dscratch, const uint8_t* tile, unsigned winMask, uint64_t byteCntrOff,
-    int currRank) {
+    int currRank, bool skipHdr, bool uncountedPayload) {
     // Publish the header before the fabric puts and local TMA store read it.
     nccl_ep::cft::memFence(ncclCoopThread{}, cuda::memory_order_release, nccl_ep::cft::ProxyType::Generic,
                            nccl_ep::cft::ProxyType::Fabric, nccl_ep::cft::FenceScope::Cta);
     const int nDests = __popc(winMask);
-    // Keep a single fabric.try_put site to avoid unnecessary code growth.
+    // Keep the destination loop rolled to limit code growth.
 #pragma unroll 1
     for (int d = 0; d < nDests; ++d) {
         const int dstRank = dscratch[2 * d];
@@ -333,18 +342,40 @@ __device__ __forceinline__ void cftPutToken(
         if (dstRank == currRank) {
             // Reuse the staged payload for self; commit one bulk group per token.
             nccl_ep::cft::cft_tma_s2g(
-                self.recvBase + self.hdrSectionBytes + static_cast<size_t>(slotIdx) * msg.payloadBytes,
-                tile + msg.hdrBytes, static_cast<unsigned>(msg.hiddenBytes));
+                self.payloadBase + static_cast<size_t>(slotIdx) * msg.payloadBytes,
+                tile + Geometry::kPayloadOffset, static_cast<unsigned>(msg.hiddenBytes));
             nccl_ep::cft::cft_bulk_commit();
         } else {
-            // Peer fabric buffers use interleaved messages and absolute source ranks.
-            // Both sides select parity using the group dispatch counter.
-            const uint64_t dataOff = cft.parityOff
-                                   + static_cast<uint64_t>(currRank) * cft.srcRankRegionBytes
-                                   + static_cast<uint64_t>(slotIdx) * msg.msgBytes;
-            // cftReleaseTile submits the token and arms its completion tracking.
-            ctx.fabric.putCounted(ncclCoopThread{}, ctx.leMirror[dstRank], dataOff, byteCntrOff, tile,
-                                  static_cast<unsigned>(msg.msgBytes));
+            const uint64_t regionOff = cft.parityOff + static_cast<uint64_t>(currRank) * cft.srcRankRegionBytes;
+            if constexpr (Geometry::kZeroCopy) {
+                // Counted sources use the same per-source byte counter for headers and payloads.
+                const uint64_t hdrOff = regionOff + static_cast<uint64_t>(slotIdx) * msg.hdrBytes;
+                const uint64_t payloadOff = cft.outputOffset +
+                    (static_cast<uint64_t>(currRank) * msg.maxTokensPerRank + slotIdx) * msg.hiddenBytes;
+                // LSA-CFT header batching sends the headers of a slot range in one put later.
+                if (!skipHdr) {
+                    ctx.fabric.putCounted(ncclCoopThread{}, ctx.leMirror[dstRank], hdrOff, byteCntrOff, tile,
+                                          static_cast<unsigned>(msg.hdrBytes));
+                }
+                if (uncountedPayload) {
+                    // LSA publishes readiness after both payload and routing headers complete.
+                    ctx.fabric.put(ncclCoopThread{}, ctx.leMirror[dstRank], payloadOff,
+                                   tile + Geometry::kPayloadOffset, static_cast<unsigned>(msg.hiddenBytes));
+                } else {
+                    ctx.fabric.putCounted(ncclCoopThread{}, ctx.leMirror[dstRank], payloadOff, byteCntrOff,
+                                          tile + Geometry::kPayloadOffset, static_cast<unsigned>(msg.hiddenBytes));
+                }
+            } else {
+                const uint64_t dataOff = regionOff + static_cast<uint64_t>(slotIdx) * msg.msgBytes;
+                if (uncountedPayload) {
+                    // LSA publishes readiness after the complete message arrives.
+                    ctx.fabric.put(ncclCoopThread{}, ctx.leMirror[dstRank], dataOff, tile,
+                                   static_cast<unsigned>(msg.msgBytes));
+                } else {
+                    ctx.fabric.putCounted(ncclCoopThread{}, ctx.leMirror[dstRank], dataOff, byteCntrOff, tile,
+                                          static_cast<unsigned>(msg.msgBytes));
+                }
+            }
         }
     }
 }
@@ -384,11 +415,10 @@ __device__ __forceinline__ void cftSettleIfOverBudget(
     }
 }
 
-// Lane 0 drains once after the token loop. Wait for local TMA writes and
-// fence async -> generic before reaching the grid barrier or kernel boundary,
-// which publishes the payload to the self receiver. Per-token warp syncs
-// order generic header stores before that same barrier. Local-store waits
-// are unbounded; the subsequent fabric drain uses the group timeout.
+// Complete local TMA writes and fence async -> generic, then drain Fabric reports.
+// The caller publishes self readiness through a grid/kernel boundary (general)
+// or a CTA barrier and self-count release/acquire (LSA). Local-store waits are
+// unbounded; the Fabric drain uses the group timeout.
 template <class Geometry>
 __device__ __forceinline__ void cftDrainSender(
     CftSendContext<Geometry>& ctx, uint64_t timeoutCycles, int* asyncErrorFlag, int currRank) {
@@ -433,7 +463,8 @@ __device__ __forceinline__ void cftSendToken(
             }
         }
         if (ok && winMask != 0u) {
-            cftPutToken(ctx, cft, self, msg, dscratch, tile, winMask, byteCntrOff, currRank);
+            cftPutToken(ctx, cft, self, msg, dscratch, tile, winMask, byteCntrOff, currRank,
+                        /*skipHdr=*/false, /*uncountedPayload=*/false);
             cftReleaseTile(ctx);
             cftSettleIfOverBudget(ctx, timeoutCycles, asyncErrorFlag, currRank);
         }

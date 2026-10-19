@@ -45,6 +45,16 @@ ctypedef enum ncclEpZeroCopyMode_t "ncclEpZeroCopyMode_t":
     NCCL_EP_ZERO_COPY_OFF "NCCL_EP_ZERO_COPY_OFF"
     NCCL_EP_ZERO_COPY_ON "NCCL_EP_ZERO_COPY_ON"
 
+ctypedef enum ncclEpHtFlow_t "ncclEpHtFlow_t":
+    NCCL_EP_HT_FLOW_AUTO "NCCL_EP_HT_FLOW_AUTO" = 0
+    NCCL_EP_HT_FLOW_PUSH_PULL "NCCL_EP_HT_FLOW_PUSH_PULL"
+    NCCL_EP_HT_FLOW_PULL_PUSH "NCCL_EP_HT_FLOW_PULL_PUSH"
+
+ctypedef enum ncclEpMetaExchangePolicy_t "ncclEpMetaExchangePolicy_t":
+    NCCL_EP_META_EXCHANGE_AUTO "NCCL_EP_META_EXCHANGE_AUTO" = 0
+    NCCL_EP_META_EXCHANGE_REQUIRE_FUSED "NCCL_EP_META_EXCHANGE_REQUIRE_FUSED"
+    NCCL_EP_META_EXCHANGE_FORCE_SCAN "NCCL_EP_META_EXCHANGE_FORCE_SCAN"
+
 ctypedef enum ncclEpExpertIdKind_t "ncclEpExpertIdKind_t":
     NCCL_EP_EXPERT_ID_AUTO "NCCL_EP_EXPERT_ID_AUTO" = 0
     NCCL_EP_EXPERT_ID_LOCAL "NCCL_EP_EXPERT_ID_LOCAL" = 1
@@ -193,6 +203,8 @@ ctypedef struct ncclEpGroupConfig_t 'ncclEpGroupConfig_t':
     unsigned char padding_v2[4]
     unsigned int dispatch_num_sms
     unsigned int combine_num_sms
+    ncclEpHtFlow_t ht_flow
+    ncclEpMetaExchangePolicy_t meta_exchange_policy
 
 
 ###############################################################################

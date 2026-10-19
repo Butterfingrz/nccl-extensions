@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include "nccl_device.h"
 #include "ep_enums.h"
@@ -23,8 +24,9 @@ namespace ll {
 // NCCL_EP_DISPATCH_LSA env var (see nccl_ep_env.h): "simt" -> kSimt (dispatch_kernel_impl_2sided_rm_lsa),
 // "tma" -> kTma (dispatch_kernel_impl_2sided_rm_lsa_tma, the default), "universal" -> kUniversal (forces
 // the general dispatch_kernel_impl in ll_ep.cuh even when the call would otherwise be LSA-eligible).
-// kUniversal always wins regardless of eligibility. Both LSA families support NONE and
-// fused DS_FP8E3M4; non-LSA-eligible calls and partial input warp tiles use the general kernel.
+// kUniversal always wins regardless of eligibility. Both STORE LSA families support NONE and
+// fused DS_FP8E3M4. Eligible CFT calls use their separate LSA kernel in either kSimt or kTma
+// mode; non-LSA-eligible calls and partial input warp tiles use the general kernel.
 // See ll_dispatch_select_algo in device/jit/ll_dispatch_jit.cuh.
 enum class NcclEpDispatchLsaMode { kSimt, kTma, kUniversal };
 
@@ -61,6 +63,66 @@ inline bool ll_dispatch_stage_quant(int hidden, int max_shared_bytes) {
 
 // CFT currently stages BF16/FP16 payload elements.
 constexpr int kCftElementBytes = sizeof(uint16_t);
+
+// NCCL_EP_LL_CFT_LSA (default on): rank-major CFT dispatch runs the LSA-CFT
+// kernel (ll/ll_dispatch_cft_lsa.cuh) and pairs with the LSA combine.
+// Set it to 0 to force staged general CFT + general combine; CFT zero-copy requires LSA.
+inline bool ll_cft_lsa_enabled() {
+    static const bool v = [] {
+        const char* e = std::getenv("NCCL_EP_LL_CFT_LSA");
+        return e == nullptr || *e == '\0' || *e != '0';
+    }();
+    return v;
+}
+
+// Uses the actual dispatch selector so public output binding and launch agree.
+// General CFT zero-copy is unsupported; STORE zero-copy is unaffected.
+bool ll_cft_zero_copy_supported(
+    bool nvlinkOnly, ncclEpDispQuant_t recipe, ncclEpLayout_t layout,
+    NcclEpDispatchLsaMode lsaMode, int hidden, ncclDataType_t tokenDtype);
+
+// LSA-CFT sources with at most this many tokens use counted writes and publish counts early.
+// Larger sends use ordinary writes and publish after completion. Receivers learn
+// each source's form from bit 31 of its packed count word; 0 disables counted sends.
+constexpr int kLlLsaCftCountedMaxTokensDefault = 128;
+inline int ll_lsa_cft_counted_max_tokens() {
+    static const int v = [] {
+        const char* e = std::getenv("NCCL_EP_LL_CFT_COUNTED_MAX_TOKENS");
+        return (e == nullptr || *e == '\0') ? kLlLsaCftCountedMaxTokensDefault : std::atoi(e);
+    }();
+    return v;
+}
+
+// Size receive warps from capacity: even zero-token ranks may receive peer traffic.
+// Keep a sender/helper pair and the validated per-group warp ceiling.
+inline int ll_lsa_cft_choose_warps_per_group(
+    int currentWarpsPerGroup, int maxTokensPerRank, int numLocalExperts) {
+    const int tokensPerGroup = static_cast<int>(
+        nccl_ep::ceil_div<int64_t>(maxTokensPerRank, numLocalExperts));
+    int requested = 2;
+    while (requested < currentWarpsPerGroup && requested < tokensPerGroup) {
+        requested *= 2;
+    }
+    return std::min(currentWarpsPerGroup, requested);
+}
+
+// LSA-CFT per-CTA dynamic shared memory for the precomputed destination list:
+// list[tokensPerCta][numTopk] destination ranks plus nd[tokensPerCta] counts.
+// Shared by the host sizing (ll_ep_adapter.cu) and the device carve.
+__host__ __device__ constexpr int ll_lsa_cft_tokens_per_cta(int maxTokensPerRank, int numSms) {
+    return nccl_ep::ceil_div(maxTokensPerRank, numSms);
+}
+__host__ __device__ constexpr int ll_lsa_cft_list_bytes(int maxTokensPerRank, int numSms, int numTopk) {
+    return (ll_lsa_cft_tokens_per_cta(maxTokensPerRank, numSms) * numTopk +
+            ll_lsa_cft_tokens_per_cta(maxTokensPerRank, numSms)) * static_cast<int>(sizeof(int));
+}
+// Space for one CTA's routing-header batches, used by zero-copy sends.
+__host__ __device__ constexpr int ll_lsa_cft_hdr_batch_bytes(int maxTokensPerRank, int numSms, int numTopk, int hdrBytes) {
+    return ll_lsa_cft_tokens_per_cta(maxTokensPerRank, numSms) * numTopk * hdrBytes;
+}
+constexpr int kLlLsaCftMaxTokensPerCta = 512;   // 8 x 64-bit token masks per destination
+constexpr int kLlLsaCftCtaShift = 20;           // packed count word: flag << 31 | arrivals << 20 | tokens
+constexpr int kLlLsaCftArrivalBits = 11;        // Remote: 1 arrival; self: 2 * numSms (< 2048).
 
 // Two token-parity banks of 32 (rank, slot) pairs. Shared by host sizing and
 // the device layout; allocated only when CFT is active.
@@ -143,6 +205,8 @@ struct cft_dispatch_args_t {
                                         // (tokensPerRank * worst-case slot stride)
     uint64_t*       recvByteCounters;   // this rank's byte counter array [numRanks * (256/8)], parity-resolved
     uint64_t*       cumulByteExpect;    // device [numRanks*numLocalExperts]: cumulative expected bytes, parity-resolved
+    uint64_t        outputOffset;       // peer endpoint offset of zero-copy output row zero
+    int             countedPayload;      // LSA-CFT: 1 = this rank's payload puts are counted in this dispatch
 };
 
 struct dispatch_kernel_args_t {
@@ -371,6 +435,8 @@ struct DispatchParams {
     int* rankArrivedCnt;
     int* rankDone;
     int numDeviceSms;
+    unsigned int deviceSm = 0;       // Host-only mask-specialization eligibility.
+    unsigned int deviceSmCount = 0;  // Physical SM count, distinct from the requested budget.
     int* rankMask = nullptr;
     int* asyncErrorFlag = nullptr;
     uint64_t timeoutCycles = NUM_TIMEOUT_CYCLES;
@@ -424,6 +490,8 @@ struct DispatchParams {
     size_t          cftSrcRankRegionBytes = 0;
     uint64_t*       cftRecvByteCounters = nullptr;
     uint64_t*       cftCumulByteExpect = nullptr;
+    bool            cftZeroCopy = false; // selects the JIT specialization after collective output binding
+    uint64_t        cftOutputOffset = 0;
 };
 
 struct CombineParams {
@@ -485,6 +553,8 @@ struct CombineParams {
     // CFT dispatch requires combine to clear each consumed finish flag.
     // The general combine kernel provides that protocol.
     bool cftEnabled = false;
+    // Keep forced-general CFT dispatch paired with its consumer-clearing combine.
+    NcclEpDispatchLsaMode lsaMode = NcclEpDispatchLsaMode::kTma;
 
     // Per-call behavior toggles that select the JIT kernel specialization.
     bool useLogFmt = false;

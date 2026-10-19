@@ -1090,9 +1090,13 @@ struct dispatch_push_count_kparams_t {
     const uint64_t* token_dst_rank_bitmap = nullptr;        // [max_tokens] per-token global dest-rank bitmap
     uint8_t* const* recv_tables_ptrs = nullptr;             // [lsa_team_size] peer count-table regions
     int recv_max_slots = 0;                                 // slots per sub-table in the peer region
-    // When set, the fused meta build clamps published per-expert offsets/counts to
+    // When set, the fused meta build clamps published EM per-expert offsets/counts to
     // recv_max_slots so over-budget tokens drop; the pre-drop total stays in num_recv_out.
     bool allow_overflow_drop = false;
+    // Flat layout: no EM zones. The publish writes only num_recv_out and caller_recv_total
+    // (rank-level dedup count); per-expert caller counts come from the post-dispatch LERM
+    // recount (launch_lerm_flat_copy) and caller_offsets are not written.
+    bool is_flat = false;
     // Receiver EM tables published by block 0 (zone offsets, unpadded counts, caller outputs).
     int64_t* expert_token_offsets_out = nullptr;            // [experts_per_rank + 1]
     int32_t* per_expert_counts_out = nullptr;               // [experts_per_rank] unpadded counts
@@ -4508,6 +4512,7 @@ struct dispatch_push_map_publish_ctx_t {
     void* caller_recv_total;
     bool caller_out_is_int64;
     int em_alignment;
+    bool is_flat;
 };
 
 // Warp-uniform FLAT slot base per dest rank for one (stream, chunk): the stream
@@ -4694,7 +4699,7 @@ __device__ __forceinline__ void dispatch_push_map_build_s2d(
                         // be consuming earlier-published chunks concurrently) to hit it blind as a
                         // raw assert with no actionable message.
                         if (!ctx.allow_overflow_drop && slot_overflows(slot, ctx.recv_max_slots)) {
-                            printf("ncclEp HT EM count dispatch: recv slot %d exceeds "
+                            printf("ncclEp HT count dispatch: recv slot %d exceeds "
                                    "max_recv_tokens_per_rank %d; increase "
                                    "ncclEpGroupConfig_t::max_recv_tokens_per_rank or set "
                                    "NCCL_EP_OVERFLOW_DROP\n", slot, ctx.recv_max_slots);
@@ -4839,6 +4844,7 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
     void* caller_counts = pub.caller_counts;
     void* caller_recv_total = pub.caller_recv_total;
     const bool caller_out_is_int64 = pub.caller_out_is_int64;
+    const bool is_flat = pub.is_flat;
     auto cnt_rank_row = [&](int s) -> const int32_t* {
         return ctx.count_rows + (size_t)s * count_row_ints;
     };
@@ -4853,9 +4859,9 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
             // TRAP: over-budget recv count under a non-DROP overflow policy aborts here with an
             // actionable message before the permute reads the FLAT/LERM buffers (scan-mode parity).
             if (!ctx.allow_overflow_drop && tot > ctx.recv_max_slots) {
-                printf("ncclEp HT EM count dispatch: recv tokens %d exceed max_recv_tokens_per_rank "
+                printf("ncclEp HT count dispatch: recv tokens %d exceed max_recv_tokens_per_rank "
                        "%d; increase ncclEpGroupConfig_t::max_recv_tokens_per_rank or set "
-                       "NCCL_EP_OVERFLOW_DROP\n", tot, (int)ctx.recv_max_slots);
+                       "overflow_policy = NCCL_EP_OVERFLOW_DROP\n", tot, static_cast<int>(ctx.recv_max_slots));
                 __trap();
             }
             // DROP: this FLAT recv count drives the permute's per-slot loop over the
@@ -4864,8 +4870,19 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
             if (num_recv_out)
                 *num_recv_out =
                     (ctx.allow_overflow_drop && tot > ctx.recv_max_slots) ? ctx.recv_max_slots : tot;
+            // Flat: recv total is the rank-level dedup count (pre-drop; see is_flat in
+            // dispatch_push_count_kparams_t), not the per-expert sum below.
+            if (caller_recv_total && is_flat) {
+                if (caller_out_is_int64) {
+                    *static_cast<int64_t*>(caller_recv_total) = tot;
+                } else {
+                    *static_cast<int32_t*>(caller_recv_total) = tot;
+                }
+            }
         }
-        if (expert_token_offsets_out) {
+        // EM per-expert zone publish (padded prefix offsets, counts, caller outputs). Flat has
+        // no zones: its per-expert counts are recounted from the LERM after dispatch.
+        if (!is_flat && (expert_token_offsets_out || caller_offsets || caller_counts)) {
             __shared__ int64_t s_pub_off[64 * MASK_WORDS + 1];
             __shared__ int32_t s_raw_cnt[64 * MASK_WORDS];
             const int em_align = (em_alignment > 1) ? em_alignment : 1;
@@ -4892,7 +4909,8 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
                 }
                 s_pub_off[experts_per_rank] = cum;
                 // TRAP: padded EM total over budget under a non-DROP policy (may overflow via
-                // alignment padding even when the FLAT count fits) aborts with scan-mode parity.
+                // alignment padding even when the per-rank count fits) aborts with scan-mode
+                // parity.
                 if (!drop && cum > cap) {
                     printf("ncclEp HT EM count dispatch: padded recv tokens %lld exceed "
                            "max_recv_tokens_per_rank %lld; increase "
@@ -4900,12 +4918,18 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
                            (long long)cum, (long long)cap);
                     __trap();
                 }
-                expert_token_offsets_out[experts_per_rank] = (drop && cum > cap) ? cap : cum;
-                // recv_total_counter reports the pre-drop padded total (unclamped cum);
-                // equals the unpadded FLAT recv total when em_alignment == 1.
-                if (caller_recv_total) {
-                    if (caller_out_is_int64) *static_cast<int64_t*>(caller_recv_total) = cum;
-                    else *static_cast<int32_t*>(caller_recv_total) = (int32_t)cum;
+                if (expert_token_offsets_out) {
+                    expert_token_offsets_out[experts_per_rank] = (drop && cum > cap) ? cap : cum;
+                    // recv_total_counter reports the pre-drop padded EM total (unclamped cum),
+                    // one slot per (token, local-expert) hit. Flat's caller_recv_total is
+                    // written from the rank-level tot above instead -- see that comment.
+                    if (caller_recv_total) {
+                        if (caller_out_is_int64) {
+                            *static_cast<int64_t*>(caller_recv_total) = cum;
+                        } else {
+                            *static_cast<int32_t*>(caller_recv_total) = static_cast<int32_t>(cum);
+                        }
+                    }
                 }
             }
             __syncwarp();
@@ -4918,8 +4942,12 @@ __device__ __forceinline__ void dispatch_push_map_publish_outputs(
                 const int32_t out_actual = drop ? (int32_t)((int64_t)s_raw_cnt[e] < room ? s_raw_cnt[e] : room)
                                                 : s_raw_cnt[e];
                 const int64_t out_padded = drop ? (padded < room ? padded : room) : padded;
-                expert_token_offsets_out[e] = expert_pub_off;
-                if (per_expert_counts_out) per_expert_counts_out[e] = out_actual;
+                if (expert_token_offsets_out) {
+                    expert_token_offsets_out[e] = expert_pub_off;
+                    if (per_expert_counts_out) {
+                        per_expert_counts_out[e] = out_actual;
+                    }
+                }
                 if (caller_offsets) {
                     if (caller_out_is_int64) static_cast<int64_t*>(caller_offsets)[e] = expert_pub_off;
                     else static_cast<int32_t*>(caller_offsets)[e] = (int32_t)expert_pub_off;
@@ -5021,6 +5049,7 @@ __device__ __forceinline__ void dispatch_push_map_warp(
     pub.caller_recv_total = p.caller_recv_total;
     pub.caller_out_is_int64 = p.caller_out_is_int64;
     pub.em_alignment = p.em_alignment;
+    pub.is_flat = p.is_flat;
     dispatch_push_map_publish_outputs<EXPERTS_PER_RANK>(ctx, pub, map_warp);
 }
 
@@ -6331,6 +6360,12 @@ constexpr int kLocalPermuteThreads =
 constexpr int kLocalPermuteReduceSlotsPerBlock = 8;
 constexpr int kLocalPermuteReduceThreads = 128 * kLocalPermuteReduceSlotsPerBlock;
 constexpr int kLocalPermuteReduceBlocksPerSM = 1;
+// combine_reduce: one warp per attn token; each lane loads kCombineReduceUnroll int4 from each of
+// kCombineReduceRankGroup partials before accumulating.
+constexpr int kCombineReduceSlotsPerBlock = 32;
+constexpr int kCombineReduceThreads = 32 * kCombineReduceSlotsPerBlock;
+constexpr int kCombineReduceUnroll = 2;
+constexpr int kCombineReduceRankGroup = 4;
 // combine_push block-size upper bound for __launch_bounds__ (24 warps). The real block is sized
 // at launch to fit the per-warp smem row buffer (see combine_push_slots_per_block); the kernel
 // reads blockDim.x at runtime.
@@ -8286,13 +8321,16 @@ __device__ __forceinline__ void combine_reduce(
     int top_k,
     const int32_t* retained_slots) {
     constexpr int kRowBytes = HiddenInt4 * 16;
-    constexpr int kThreadsPerSlot = 128;
-    constexpr int kSlotsPerBlock = kLocalPermuteReduceSlotsPerBlock;
-    constexpr int kElemsPerThread = (HiddenInt4 + kThreadsPerSlot - 1) / kThreadsPerSlot;
+    constexpr int kSlotsPerBlock = kCombineReduceSlotsPerBlock;
+    constexpr int kUnroll = kCombineReduceUnroll;
+    constexpr int kRankGroup = kCombineReduceRankGroup;
+    constexpr int kChunkInt4 = kUnroll * 32;
+    constexpr int kNumChunks = (HiddenInt4 + kChunkInt4 - 1) / kChunkInt4;
+    constexpr bool kExactChunks = (HiddenInt4 % kChunkInt4) == 0;
+    constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
 
     const int tid = threadIdx.x;
-    const int slot_in_block = tid / kThreadsPerSlot;
-    const int slot_thread = tid % kThreadsPerSlot; // thread index within its slot (0..kThreadsPerSlot), not a warp lane
+    const int slot_in_block = tid / 32;
     const int slot_stride = kSlotsPerBlock * static_cast<int>(gridDim.x);
 
     // One expert per warp lane, so num_topk must fit the warp width.
@@ -8326,74 +8364,84 @@ __device__ __forceinline__ void combine_reduce(
         const bool rank_leader = rank_valid && ((__ffs(static_cast<int>(same_rank)) - 1) == wlane);
         const unsigned present_ranks = __ballot_sync(0xFFFFFFFFu, rank_leader);
 
-        // Backward: srcpos slot `slot_thread` was pushed by the rank hosting that expert
+        // Backward: srcpos slot `wlane` was pushed by the rank hosting that expert
         // (src_rank_of_lane), co-located in that rank's token staging row pad (offset kRowBytes).
         // Out-of-team / unrouted slots yield zero.
         if constexpr (BACKWARD_COMBINE) {
-            if (slot_thread < top_k) {
+            if (wlane < top_k) {
                 float w = 0.0f;
                 if (src_rank_of_lane >= 0) {
                     const float* prob_row = reinterpret_cast<const float*>(
                         staging + (static_cast<size_t>(t) * lsa_team_size + src_rank_of_lane) *
                                       comb_stage_stride_bytes(kRowBytes, /*reserve_prob=*/true) + kRowBytes);
-                    w = prob_row[slot_thread];
+                    w = prob_row[wlane];
                 }
-                combined_topk_weights[static_cast<size_t>(t) * top_k + slot_thread] = w;
+                combined_topk_weights[static_cast<size_t>(t) * top_k + wlane] = w;
             }
         }
 
         int4* dst_int4 = reinterpret_cast<int4*>(attn_output + static_cast<size_t>(t) * kRowBytes);
         const size_t base_row = static_cast<size_t>(t) * lsa_team_size;
+        const size_t stage_stride = comb_stage_stride_bytes(kRowBytes, BACKWARD_COMBINE);
 
-        constexpr int kHiddenVec = (kElemsPerThread < 4) ? kElemsPerThread : 4;
-        for (int nn_base = 0; nn_base < kElemsPerThread; nn_base += kHiddenVec) {
-            int js[kHiddenVec];
-            bool valid_u[kHiddenVec];
+#pragma unroll 1
+        for (int c = 0; c < kNumChunks; c++) {
+            int js[kUnroll];
+            bool valid_u[kUnroll];
 #pragma unroll
-            for (int u = 0; u < kHiddenVec; u++) {
-                const int nn = nn_base + u;
-                js[u] = slot_thread + nn * kThreadsPerSlot;
-                valid_u[u] = (nn < kElemsPerThread) && (js[u] < HiddenInt4);
+            for (int u = 0; u < kUnroll; u++) {
+                js[u] = (c * kUnroll + u) * 32 + wlane;
+                valid_u[u] = kExactChunks || (js[u] < HiddenInt4);
             }
 
-            float2 acc[kHiddenVec][4];
+            float2 acc[kUnroll][kPairs];
 #pragma unroll
-            for (int u = 0; u < kHiddenVec; u++) {
+            for (int u = 0; u < kUnroll; u++) {
 #pragma unroll
-                for (int p = 0; p < 4; p++) {
+                for (int p = 0; p < kPairs; p++) {
                     acc[u][p].x = 0.0f;
                     acc[u][p].y = 0.0f;
                 }
             }
 
-            for (unsigned bl = present_ranks; bl != 0u; bl &= (bl - 1u)) {
-                const int r = __shfl_sync(0xFFFFFFFFu, src_rank_of_lane, __ffs(static_cast<int>(bl)) - 1);
-                const int4* src =
-                    reinterpret_cast<const int4*>(staging + (base_row + r) *
-                        comb_stage_stride_bytes(kRowBytes, BACKWARD_COMBINE));
-                int4 buf[kHiddenVec];
+            unsigned bl = present_ranks;
+            while (bl != 0u) {
+                int4 buf[kRankGroup][kUnroll];
+                bool have[kRankGroup];
 #pragma unroll
-                for (int u = 0; u < kHiddenVec; u++) {
-                    if (valid_u[u]) buf[u] = src[js[u]];
+                for (int g = 0; g < kRankGroup; g++) {
+                    const int lead = __ffs(static_cast<int>(bl)) - 1;
+                    have[g] = lead >= 0;
+                    const int r = __shfl_sync(0xFFFFFFFFu, src_rank_of_lane, have[g] ? lead : 0);
+                    bl &= (bl - 1u);
+                    if (have[g]) {
+                        const int4* src = reinterpret_cast<const int4*>(staging + (base_row + r) * stage_stride);
+#pragma unroll
+                        for (int u = 0; u < kUnroll; u++) {
+                            if (valid_u[u]) buf[g][u] = src[js[u]];
+                        }
+                    }
                 }
 #pragma unroll
-                for (int u = 0; u < kHiddenVec; u++) {
-                    if (!valid_u[u]) continue;
-                    constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
+                for (int g = 0; g < kRankGroup; g++) {
+                    if (!have[g]) continue;
 #pragma unroll
-                    for (int p = 0; p < kPairs; p++) {
-                        float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&buf[u], p);
-                        acc[u][p].x += f.x;
-                        acc[u][p].y += f.y;
+                    for (int u = 0; u < kUnroll; u++) {
+                        if (!valid_u[u]) continue;
+#pragma unroll
+                        for (int p = 0; p < kPairs; p++) {
+                            float2 f = nccl_ep::ld_token_pair<kTokenDtype>(&buf[g][u], p);
+                            acc[u][p].x += f.x;
+                            acc[u][p].y += f.y;
+                        }
                     }
                 }
             }
 
 #pragma unroll
-            for (int u = 0; u < kHiddenVec; u++) {
+            for (int u = 0; u < kUnroll; u++) {
                 if (!valid_u[u]) continue;
                 int4 out;
-                constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
 #pragma unroll
                 for (int p = 0; p < kPairs; p++) {
                     nccl_ep::st_token_pair<kTokenDtype>(&out, p, acc[u][p]);

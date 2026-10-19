@@ -253,11 +253,21 @@ TEST_F(OutputLayoutTest, FlatLayout) {
 
     // Each rank sends 2 tokens to this rank's experts (1 per expert × 2 experts).
     // Total received = 2 ranks × 2 tokens = 4.
-    unsigned int num_recv = 0;
-    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
-    EXPECT_EQ(num_recv, 4u);
+    // Fused count mode publishes the FLAT recv count inside dispatch, so it is only readable
+    // afterwards; scan and unfused count wire it at UpdateHandle time. The routing is fixed, so
+    // under fused count dispatch into the known 4 slots and check the published count after.
+    unsigned int num_recv = 4;
+    if (!ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+        EXPECT_EQ(num_recv, 4u);
+    }
 
     auto slots = run_dispatch(h, static_cast<int>(num_recv), /*expert_major=*/false);
+    if (ht_count_fused_active(h)) {
+        unsigned int published = 0;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &published));
+        EXPECT_EQ(published, 4u) << "FLAT recv count published by fused dispatch";
+    }
 
     // rank-major: tokens from the lower-numbered contributing rank in [0,1],
     //            tokens from the higher-numbered rank in [2,3].
@@ -364,11 +374,17 @@ TEST_F(OutputLayoutTest, CombineFlat) {
     ncclEpHandle_t h = make_handle(nullptr);
     ASSERT_NE(h, nullptr);
 
-    unsigned int num_recv = 0;
-    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
-    EXPECT_EQ(num_recv, 4u);
+    // Fused count mode publishes the recv count inside dispatch (see RankMajorLayout).
+    if (!ht_count_fused_active(h)) {
+        unsigned int num_recv = 0;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+        EXPECT_EQ(num_recv, 4u);
+    }
 
     auto combined = run_dispatch_combine(h, /*expert_major=*/false);
+    unsigned int published = 0;
+    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &published));
+    EXPECT_EQ(published, 4u) << "FLAT recv count after dispatch";
 
     for (int i = 0; i < kNumTokens; ++i) {
         float expected = static_cast<float>(g_rank * kNumTokens + i + 1);
@@ -518,6 +534,40 @@ TEST_F(OutputLayoutTest, TotalCounterDeviceFLAT) {
 
     ncclEpTensorDestroy(t_total);
     cudaFree(d_total);
+    NCCL_ASSERT(ncclEpHandleDestroy(h));
+}
+
+// FLAT: expert_counters alone (no recv_total_counter) must still be written at handle time.
+// Count mode routes the Flat caller tensor separately from EM's, so it has to select the
+// unfused exchange on its own; a poison fill catches the tensor being left untouched.
+TEST_F(OutputLayoutTest, ExpertCountersDeviceFLAT) {
+    SKIP_IF_PULL_PUSH();
+    const int E_local = kNumExperts / g_nranks;  // 2
+    int32_t* d_cnt;
+    CUDA_ASSERT(cudaMalloc(&d_cnt, E_local * sizeof(int32_t)));
+    CUDA_ASSERT(cudaMemset(d_cnt, 0xA5, E_local * sizeof(int32_t)));
+
+    ncclEpTensor_t* t_cnt;
+    NCCL_ASSERT(epTensorCreate(&t_cnt, 1, ncclInt32, d_cnt, E_local));
+
+    ncclEpLayoutInfo_t layout = NCCL_EP_LAYOUT_INFO_INIT;
+    layout.expert_counters = t_cnt;
+    ncclEpHandle_t h = make_handle(nullptr, &layout);
+    ASSERT_NE(h, nullptr);
+    CUDA_ASSERT(cudaDeviceSynchronize());
+
+    std::vector<int32_t> h_cnt(E_local);
+    CUDA_ASSERT(cudaMemcpy(h_cnt.data(), d_cnt, E_local * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    for (int e = 0; e < E_local; ++e) {
+        EXPECT_EQ(h_cnt[e], 2) << "FLAT expert_counters[" << e << "]: 2 ranks × 1 token per local expert";
+    }
+
+    unsigned int num_recv = 0;
+    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+    EXPECT_EQ(num_recv, 4u) << "expert_counters selects the unfused exchange, so the count is valid here";
+
+    ncclEpTensorDestroy(t_cnt);
+    cudaFree(d_cnt);
     NCCL_ASSERT(ncclEpHandleDestroy(h));
 }
 
@@ -1529,12 +1579,21 @@ TEST_F(TopK2MixedRoutingTest, FlatLayout) {
     // Same-rank pair (ranks 0,1): token sent once despite 2 local experts targeted.
     // Cross-rank pair (ranks 2,3): T2 and T3 each from 4 sources = 8 tokens.
     const unsigned int expected = (g_rank <= 1) ? 4u : 8u;
-    unsigned int num_recv = 0;
-    NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
-    EXPECT_EQ(num_recv, expected);
+    // Fused count mode publishes the FLAT recv count inside dispatch, so it is only readable
+    // afterwards; scan and unfused count wire it at UpdateHandle time. The routing is fixed, so
+    // under fused count dispatch into the known slot count and check the published count after.
+    unsigned int num_recv = expected;
+    if (!ht_count_fused_active(h)) {
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &num_recv));
+        EXPECT_EQ(num_recv, expected);
+    }
 
     auto slots = run_dispatch2(h, static_cast<int>(num_recv), /*expert_major=*/false);
-
+    if (ht_count_fused_active(h)) {
+        unsigned int published = 0;
+        NCCL_ASSERT(ncclEpHandle_test_getNumRecvTokens(h, &published));
+        EXPECT_EQ(published, expected) << "FLAT recv count published by fused dispatch";
+    }
     std::set<float> got(slots.begin(), slots.end());
     EXPECT_EQ(got, expected_recv_set());
     NCCL_ASSERT(ncclEpHandleDestroy(h));

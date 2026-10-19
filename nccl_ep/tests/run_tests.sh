@@ -154,6 +154,12 @@ for entry in "${SUITES[@]}"; do
     run_suite "${bin}" "${desc}"
 done
 
+# The LSA-CFT selection switch (NCCL_EP_LL_CFT_LSA, device/ll_ep_adapter.cuh) is read once per
+# process: re-run the selection suite with it off so both selector rules stay covered.
+if [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_ll_kernel_selection" ]]; then
+    NCCL_EP_LL_CFT_LSA=0 run_suite "test_ll_kernel_selection" "LL Kernel Selection Tests (CFT LSA off)"
+fi
+
 # LL epoch-ring regression suites. These need an exact world size rather than
 # one rank per GPU, so they are invoked here instead of from SUITES above:
 #

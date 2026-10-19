@@ -307,7 +307,7 @@ all NCCL EP outputs elsewhere.
 
 `NCCL_EP_DISPATCH_TOKENS_PER_CHUNK` overrides the HT dispatch chunk without changing combine. It applies only within one LSA team. Use a positive multiple of 32 that divides the shared `NCCL_EP_TOKENS_PER_CHUNK` value (or its resolved default). Invalid requests are warned about and retain the shared chunk.
 
-When unset, forward push dispatch selects chunk 32 for `32 < actual_tokens_per_rank <= 32 * dispatch_CTAs`, with 16–64 dispatch CTAs, shared chunk 64 and no dispatch pipeline/stage overrides. This applies to FLAT and expert-major local-permute layouts within one LSA team. Other configurations retain the shared chunk. Selection occurs in `ncclEpUpdateHandle` and uses the input tensor's row count, not group capacity. Graph replay retains the captured selection. `NCCL_EP_ENV_VERBOSE=1` reports the group defaults and each handle's resolved chunks. This controls communication scheduling, not the application's batch size.
+When unset, NCCL EP selects the dispatch chunk automatically. Set `NCCL_EP_ENV_VERBOSE=1` to report the resolved chunks.
 
 Make sure to set the generic environment according to the
 [Set the environment](#set-the-environment) section.

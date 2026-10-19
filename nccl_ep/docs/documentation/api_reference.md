@@ -221,9 +221,10 @@ is detected and where `recv_total_counter` is written. See
 ### `ncclEpHandleMemSize()`
 
 ```c
-// Query the device bytes required for a handle's routing buffers, for callers
-// that want to supply handle memory themselves via the handle_mem argument of
-// ncclEpInitHandle / ncclEpCreateHandle.
+// Query the device bytes required for a handle's persistent routing state, for
+// callers that want to supply handle memory themselves via the handle_mem argument
+// of ncclEpInitHandle / ncclEpCreateHandle. Group-owned update-only scan workspace
+// is allocated lazily by ncclEpInitHandle and is not included in size_out.
 //
 // Arguments:
 //   ep_group  - [IN]  A valid EP group

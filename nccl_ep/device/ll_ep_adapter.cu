@@ -19,9 +19,66 @@
 namespace nccl_ep {
 namespace ll {
 
-// Forward-declare the host-side `ceil_div` helper used here. `common.hpp`
-// provides templated ceil_div in namespace nccl_ep; we reuse it via ADL.
+// Reuse the host/device sizing helper from common.hpp.
 using ::nccl_ep::ceil_div;
+
+bool ll_cft_zero_copy_supported(
+    bool nvlinkOnly, ncclEpDispQuant_t recipe, ncclEpLayout_t layout,
+    NcclEpDispatchLsaMode lsaMode, int hidden, ncclDataType_t tokenDtype) {
+    return jit::ll_dispatch_cft_zero_copy_supported(
+        nvlinkOnly, recipe, layout, lsaMode, hidden, tokenDtype);
+}
+
+namespace {
+
+int cft_counted_payload(const DispatchParams& params) {
+    const int maxTok = ll_lsa_cft_counted_max_tokens();
+    const int countedPayload = (maxTok > 0 && params.numTokens <= maxTok) ? 1 : 0;
+    static bool announced = false;
+    if (maxTok > 0 && !announced && std::getenv("NCCL_EP_DEBUG") != nullptr) {
+        announced = true;
+        std::fprintf(stderr, "[nccl_ep][ll_cft] rank %d: adaptive put form: counted payload for dispatches with <= %d tokens (this dispatch: %d tokens -> %s)\n",
+                     params.currRank, maxTok, params.numTokens, countedPayload ? "counted" : "uncounted");
+    }
+    return countedPayload;
+}
+
+ncclResult_t cft_dispatch_smem_bytes(
+    const DispatchParams& params, bool lsaCft, int numSms, int* smemBytes) {
+    // Match the device's two-slot stage, peer IDs and destination scratch.
+    const int tileHdrBytes =
+        static_cast<int>(align<size_t>(get_dispatch_hdr_sz(params.numTopk, params.layout), 128));
+    const int tileBytes = params.hidden * kCftElementBytes + tileHdrBytes;
+    int bytes = 2 * tileBytes;
+    bytes += static_cast<int>(align<size_t>(params.numRanks * sizeof(uint32_t), 16));
+    bytes += kCftDestScratchBytes;
+    if (lsaCft) {
+        const int tokensPerCta = ll_lsa_cft_tokens_per_cta(params.maxTokensPerRank, numSms);
+        if (tokensPerCta > kLlLsaCftMaxTokensPerCta || params.maxTokensPerRank >= (1 << kLlLsaCftCtaShift) ||
+            2 * numSms >= (1 << kLlLsaCftArrivalBits) || params.numRanks > 72) {
+            std::fprintf(stderr,
+                         "ncclEpDispatch: LL LSA-CFT limits exceeded (tokens/CTA %d > %d, max tokens %d, SMs %d, ranks %d); "
+                         "use staged output with NCCL_EP_LL_CFT_LSA=0\n",
+                         tokensPerCta, kLlLsaCftMaxTokensPerCta, params.maxTokensPerRank, numSms, params.numRanks);
+            return ncclInvalidArgument;
+        }
+        bytes += ll_lsa_cft_list_bytes(params.maxTokensPerRank, numSms, params.numTopk);
+        bytes = static_cast<int>(align<size_t>(bytes, 16));
+        bytes += ll_lsa_cft_hdr_batch_bytes(
+            params.maxTokensPerRank, numSms, params.numTopk,
+            static_cast<int>(get_dispatch_hdr_sz(params.numTopk, params.layout)));
+    }
+    if (bytes > params.maxDynamicSmem) {
+        std::fprintf(stderr,
+                     "ncclEpDispatch: LL CFT requires %d bytes of shared memory, device limit is %d bytes\n",
+                     bytes, params.maxDynamicSmem);
+        return ncclInvalidArgument;
+    }
+    *smemBytes = bytes;
+    return ncclSuccess;
+}
+
+}  // namespace
 
 // ============================================================================
 // LL dispatch wrapper
@@ -37,6 +94,12 @@ ncclResult_t call_dispatch(
     ncclEpDispQuant_t recipe,
     cudaStream_t stream,
     bool nucs) {
+    if (params.cftZeroCopy &&
+        (params.cftPeerLeIds == nullptr || !ll_cft_zero_copy_supported(
+            params.nvlinkOnly, recipe, params.layout, params.lsaMode, params.hidden, params.tokenDtype))) {
+        std::fprintf(stderr, "ncclEpDispatch: CFT zero-copy requires the LSA dispatch kernel\n");
+        return ncclInvalidUsage;
+    }
     if (params.numTopk <= 0 || params.numTopk > MAX_NUM_TOPK) {
         std::fprintf(stderr, "ncclEpDispatch: LL top-k %d is outside [1, %d]\n", params.numTopk, MAX_NUM_TOPK);
         return ncclInvalidArgument;
@@ -56,9 +119,11 @@ ncclResult_t call_dispatch(
             numWarpsPerGroup = compactWarpsPerGroup;
         }
     }
-    if (numWarpGroups <= 0 || numWarpsPerGroup <= 0) return ncclInvalidUsage;
+    if (numWarpGroups <= 0 || numWarpsPerGroup <= 0) {
+        return ncclInvalidUsage;
+    }
 
-    const int numWarps = numWarpGroups * numWarpsPerGroup;
+    int numWarps = numWarpGroups * numWarpsPerGroup;
     // One warp group per expert sets the receive grid; sends share that grid.
     // Widening it may displace overlapped model work, so benchmark with that
     // work present before changing the grid.
@@ -127,6 +192,8 @@ ncclResult_t call_dispatch(
     args.cft.srcRankRegionBytes = params.cftSrcRankRegionBytes;
     args.cft.recvByteCounters   = params.cftRecvByteCounters;
     args.cft.cumulByteExpect    = params.cftCumulByteExpect;
+    args.cft.outputOffset       = params.cftOutputOffset;
+    args.cft.countedPayload = cft_counted_payload(params);
 
     DispatchKernelSpec kernel_spec;
     ncclResult_t r = resolveDispatchKernelSpec(
@@ -138,26 +205,35 @@ ncclResult_t call_dispatch(
     // Select the CFT JIT variant only for supported dispatch configurations.
     const bool cft_active = (params.cftPeerLeIds != nullptr) &&
                             (recipe == NCCL_EP_DISP_QUANT_NONE) &&
-                            (params.recvDataWindow == ncclWindow_t{}) &&
+                            (params.cftZeroCopy || params.recvDataWindow == ncclWindow_t{}) &&
                             (params.rcvScalesWin == ncclWindow_t{}) &&
                             (params.rankMask == nullptr) &&
                             (params.tokenDtype != ncclFloat32);
 
+    const bool lsa_cft_active = cft_active &&
+        jit::ll_dispatch_select_algo(params.nvlinkOnly, recipe, params.layout, /*cftEnabled=*/true, params.lsaMode,
+                                     params.hidden, params.tokenDtype) == jit::LlDispatchAlgo::kCftRmLsa;
+    if (lsa_cft_active) {
+        numWarpsPerGroup = ll_lsa_cft_choose_warps_per_group(
+            numWarpsPerGroup, params.maxTokensPerRank, params.numExperts / params.numRanks);
+        numWarps = numWarpGroups * numWarpsPerGroup;
+        args.numWarpsPerGroup = numWarpsPerGroup;
+    }
+
+    // The qualified E384 grid fits at most 43 tokens/CTA in one mask word.
+    const bool cftOneWordMask = lsa_cft_active &&
+        params.deviceSm == 107 && params.deviceSmCount == 212 &&
+        params.numDeviceSms == static_cast<int>(params.deviceSmCount) &&
+        params.numRanks == 4 && params.numExperts == 384 && params.hidden == 7168 &&
+        params.numTopk == 6 && params.tokenDtype == ncclBfloat16 && params.topkIdxIsInt64 &&
+        params.maxTokensPerRank >= 2048 && params.maxTokensPerRank <= 8192 &&
+        numWarpGroups == 2 && numSms == 192 && numWarps == 32 && numWarpsPerGroup == 16;
+
     int cft_smem_bytes = 0;
     if (cft_active) {
-        // Match CftTileGeometry::kTileHdrBytes and its two-slot staging ring.
-        const int tile_hdr_bytes =
-            static_cast<int>(align<size_t>(get_dispatch_hdr_sz(params.numTopk, params.layout), 128));
-        const int tile_bytes = params.hidden * kCftElementBytes + tile_hdr_bytes;
-        cft_smem_bytes = 2 * tile_bytes;
-        // Peer IDs and destination scratch follow the tiles.
-        cft_smem_bytes += static_cast<int>(align<size_t>(params.numRanks * sizeof(uint32_t), 16));
-        cft_smem_bytes += kCftDestScratchBytes;
-        if (cft_smem_bytes > params.maxDynamicSmem) {
-            std::fprintf(stderr,
-                         "ncclEpDispatch: LL CFT requires %d bytes of shared memory, device limit is %d bytes\n",
-                         cft_smem_bytes, params.maxDynamicSmem);
-            return ncclInvalidArgument;
+        r = cft_dispatch_smem_bytes(params, lsa_cft_active, numSms, &cft_smem_bytes);
+        if (r != ncclSuccess) {
+            return r;
         }
     }
 
@@ -178,10 +254,12 @@ ncclResult_t call_dispatch(
         params.tmaQuantWarps,
         params.maxDynamicSmem,
         params.recordDstInfo,
+        cft_active && params.cftZeroCopy,
         args,
         stream,
         nucs,
-        params.dstInfoDisqualifiedOut);
+        params.dstInfoDisqualifiedOut,
+        cftOneWordMask);
 }
 
 // ============================================================================
@@ -228,11 +306,11 @@ ncclResult_t call_combine(const CombineParams& params, cudaStream_t stream, bool
     // request it still can't honor (e.g. 1-sided enforced but not oneSidedEligible).
     const bool lsa_eligible = jit::ll_combine_lsa_eligible(
         params.nvlinkOnly, params.quantizationRecipe, params.useLogFmt, params.layout, params.cftEnabled,
-        params.hidden, params.tokenDtype);
+        params.hidden, params.tokenDtype, params.lsaMode);
     // oneSidedEligible implies lsaEligible by construction (AND-ed on top, never asserted
     // independently) -- see CombineParams::groupZeroCopyOn's doc comment for why these two extra
     // conditions live here rather than being precomputed by the caller.
-    const bool one_sided_eligible = lsa_eligible && params.tokenDtype == ncclBfloat16 &&
+    const bool one_sided_eligible = lsa_eligible && !params.cftEnabled && params.tokenDtype == ncclBfloat16 &&
         params.groupZeroCopyOn && params.inDataWindow != ncclWindow_t{} && !params.dispatch1SidedDisqualified;
     const LlCombineKernel combine_kernel =
         jit::ll_combine_select_kernel(/*enforced_lsa=*/params.enforced, lsa_eligible, one_sided_eligible);

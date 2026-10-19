@@ -18,6 +18,14 @@ const int32_t* ncclEpHandle_test_getSparseToDenseMap(ncclEpHandle_t handle);
 // FWD inline weights + IDs: selected payload width in words, or zero on fallback.
 int ncclEpHandle_test_getCompactProbWireFloats(ncclEpHandle_t handle);
 
+// Returns the HT scan-only workspace pointers wired into a handle. These buffers
+// are group-owned and may be reused after ncclEpUpdateHandle completes.
+void ncclEpHandle_test_getScanScratch(
+    ncclEpHandle_t handle,
+    const void** token_rank_mask,
+    const void** preprocessing_scan_tmp,
+    const int32_t** token_to_recv_slot);
+
 // Returns num_topk stored in the handle.
 int ncclEpHandle_test_getNumTopk(ncclEpHandle_t handle);
 

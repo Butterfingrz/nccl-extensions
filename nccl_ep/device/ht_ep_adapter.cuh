@@ -94,7 +94,7 @@ void build_count_metadata(
     int num_sms,               // grid cap = scan preprocessing SM count; kernel grid-strides
     cudaStream_t stream);
 
-// compute_layout_info: unfused count path (EM). Reduces the world-AllGathered
+// compute_layout_info: unfused count path (EM and Flat). Reduces the world-AllGathered
 // per-source count rows into per-expert recv counts and writes the caller layout
 // tensors. The reduction is order-independent, so it is valid whether count mode's
 // current single-LSA-team constraint holds or is later lifted to multiple LSA teams
@@ -116,6 +116,8 @@ void compute_layout_info(
     int32_t* em_actual_counts_out, // handle authoritative counts, nullable
     void* recv_total_counter,      // caller recv_total_counter, nullable
     int32_t* num_tokens_for_experts, // handle FLAT recv count (unpadded); nullable
+    bool is_flat,                  // Flat layout: recv budget check and recv_total_counter use the
+                                   // rank-level count, not the per-expert sum (no EM zones)
     cudaStream_t stream);
 
 // ============================================================================
@@ -436,6 +438,23 @@ void launch_dispatch_permute(
     // to EM slots in place. This also supports scan metadata, without LERM copies.
     bool flat2em_expert_ids);
 
+// Flat count-mode dispatch has no per-expert zones to permute into, so it skips
+// launch_dispatch_permute entirely; this persists the MAP-warp-published LERM row
+// (lerm_in) into the handle's private local_expert_routing_map (lerm_out) so combine
+// reads the same private copy EM local-permute gives it. max_recv_tokens sizes the
+// launch grid (upper bound); num_recv_tokens_dev (device int32) bounds the copy loop.
+// caller_counts (nullable, int32 [experts_per_rank], caller must zero it first) receives
+// the delivered per-expert hit count accumulated from the copied rows: the Flat
+// ncclEpLayoutInfo_t::expert_counters at dispatch time.
+void launch_lerm_flat_copy(
+    bool* lerm_out,
+    const bool* lerm_in,
+    const int32_t* num_recv_tokens_dev,
+    int experts_per_rank,
+    int max_recv_tokens,
+    int32_t* caller_counts,
+    cudaStream_t stream);
+
 // Pull EM dispatch (MNNVL): each receiver reads its source rows and topk weights
 // directly from the source ranks' input buffers over NVLink and scatters them into
 // EM zones. peer_input_ptrs / peer_weight_ptrs are device arrays [lsa_team_size] of
@@ -648,6 +667,7 @@ struct DispatchPushCountParams {
     void* caller_recv_total = nullptr;                      // caller recv_total_counter scalar (pre-drop padded total), nullable
     bool caller_out_is_int64 = false;
     int em_alignment = 1;
+    bool is_flat = false;                                   // see dispatch_push_count_kparams_t::is_flat
 };
 
 // All parameters needed for dispatch kernel, needed redifine because those in ht_ep.cuh are with template on data type.

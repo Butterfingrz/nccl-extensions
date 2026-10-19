@@ -75,7 +75,6 @@ public:
 //==============================================================================
 
 #ifndef SETUP_LAUNCH_CONFIG
-#ifndef DISABLE_SM90_FEATURES
 #if CUDART_VERSION >= 13030
 #define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream, enable_nucs) \
     cudaLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream, nullptr, 0}; \
@@ -106,28 +105,8 @@ public:
     cfg.numAttrs = 2; \
     (void)(enable_nucs)
 #endif
-#else
-#define SETUP_LAUNCH_CONFIG(sms, threads, stream, enable_nucs) \
-    int __num_sms = (sms); \
-    int __num_threads = (threads); \
-    auto __stream = (stream); \
-    (void)(enable_nucs)
-#endif
 #endif
 
 #ifndef LAUNCH_KERNEL
-#ifndef DISABLE_SM90_FEATURES
 #define LAUNCH_KERNEL(config, kernel, ...) CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
-#else
-#define LAUNCH_KERNEL(config, kernel, ...) \
-    do { \
-        kernel<<<__num_sms, __num_threads, 0, __stream>>>(__VA_ARGS__); \
-        cudaError_t e = cudaGetLastError(); \
-        if (e != cudaSuccess) { \
-            EPException cuda_exception("CUDA", __FILE__, __LINE__, cudaGetErrorString(e)); \
-            fprintf(stderr, "%s\n", cuda_exception.what()); \
-            throw cuda_exception; \
-        } \
-    } while (0)
-#endif
 #endif

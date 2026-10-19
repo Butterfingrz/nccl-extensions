@@ -183,6 +183,85 @@ template void build_count_metadata<int64_t>(
     uint64_t*, int32_t*, int, bool*, int, int, cudaStream_t);
 
 // ============================================================================
+// Flat count-mode LERM populate (see launch_lerm_flat_copy in the header).
+// One thread per kept recv slot: copies the slot's packed LERM row and, when the
+// caller asked for per-expert counts, tallies the row's set bits per local expert
+// (block-shared partials, one atomicAdd per expert per block). Rows at or beyond
+// the device recv count were dropped (DROP) or never routed, so the tally is the
+// delivered (post-drop) hit count.
+// ============================================================================
+__global__ void lerm_flat_copy_kernel(
+    uint64_t* __restrict__ lerm_out,
+    const uint64_t* __restrict__ lerm_in,
+    const int32_t* __restrict__ num_recv_tokens_dev,
+    int lerm_words,
+    int experts_per_rank,
+    int32_t* __restrict__ caller_counts) {
+    extern __shared__ int32_t s_expert_hits[]; // [experts_per_rank], used when caller_counts
+    if (caller_counts) {
+        for (int e = threadIdx.x; e < experts_per_rank; e += blockDim.x) {
+            s_expert_hits[e] = 0;
+        }
+        __syncthreads();
+    }
+    const int32_t num_recv = *num_recv_tokens_dev;
+    for (int32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+         slot < num_recv;
+         slot += gridDim.x * blockDim.x) {
+        const size_t base = static_cast<size_t>(slot) * lerm_words;
+        for (int w = 0; w < lerm_words; w++) {
+            const uint64_t word = lerm_in[base + w];
+            lerm_out[base + w] = word;
+            if (caller_counts) {
+                uint64_t bits = word;
+                while (bits != 0) {
+                    const int bit = __ffsll(static_cast<long long>(bits)) - 1;
+                    // The producer only sets bits below experts_per_rank (see build_lerm).
+                    EP_DEVICE_ASSERT(w * 64 + bit < experts_per_rank);
+                    atomicAdd(&s_expert_hits[w * 64 + bit], 1);
+                    bits &= bits - 1;
+                }
+            }
+        }
+    }
+    if (caller_counts) {
+        __syncthreads();
+        for (int e = threadIdx.x; e < experts_per_rank; e += blockDim.x) {
+            if (s_expert_hits[e] != 0) {
+                atomicAdd(&caller_counts[e], s_expert_hits[e]);
+            }
+        }
+    }
+}
+
+void launch_lerm_flat_copy(
+    bool* lerm_out,
+    const bool* lerm_in,
+    const int32_t* num_recv_tokens_dev,
+    int experts_per_rank,
+    int max_recv_tokens,
+    int32_t* caller_counts,
+    cudaStream_t stream) {
+    EP_HOST_ASSERT(lerm_out != nullptr && lerm_in != nullptr && num_recv_tokens_dev != nullptr &&
+           "launch_lerm_flat_copy: required buffers must be non-null");
+    const int lerm_words = nccl_ep::bit_words(experts_per_rank);
+    constexpr int block_threads = 256;
+    const int max_blocks = nccl_ep::ceil_div(max_recv_tokens, block_threads);
+    const int grid = std::min(max_blocks, 65535);
+    if (grid < 1) {
+        return;
+    }
+    const size_t smem = caller_counts ? static_cast<size_t>(experts_per_rank) * sizeof(int32_t) : 0;
+    lerm_flat_copy_kernel<<<grid, block_threads, smem, stream>>>(
+        reinterpret_cast<uint64_t*>(lerm_out),
+        reinterpret_cast<const uint64_t*>(lerm_in),
+        num_recv_tokens_dev,
+        lerm_words,
+        experts_per_rank,
+        caller_counts);
+}
+
+// ============================================================================
 // compute_layout_info (unfused count path): reduces the world-AllGathered
 // per-source count rows into this rank's per-expert recv counts and emits the
 // caller layout tensors. Order-independent, so valid whether count mode's current
@@ -206,20 +285,26 @@ __global__ void compute_layout_info_kernel(
     EM_OUT_T* em_out_offsets,         // caller expert_offsets
     int32_t* em_actual_counts_out,    // handle authoritative per-expert counts
     void* recv_total_counter,
-    int32_t* num_tokens_for_experts) {  // handle FLAT recv count (unpadded); nullable
+    int32_t* num_tokens_for_experts,    // handle FLAT recv count (unpadded); nullable
+    bool is_flat) {                     // Flat layout: no EM zones, budget/total use the rank-level count
     extern __shared__ int32_t s_raw[]; // [2 * experts_per_rank + 1]: expert_total | expert_base | overflow_flag
     ::ht_ep::scan_flat_smem_t smem{};
     smem.expert_total = s_raw;
     smem.expert_base = s_raw + experts_per_rank;
     smem.overflow_flag = s_raw + 2 * experts_per_rank;
     const size_t row_ints = (size_t)num_src_ranks + (size_t)num_experts;
-    if (threadIdx.x == 0 && num_tokens_for_experts) {
-        // Unpadded FLAT recv total: sum this rank's per-rank block entry across all source
-        // rows (matches the fused push-count path's num_recv_out; see dispatch_push_map_publish_outputs).
-        int32_t tot = 0;
-        for (int s = 0; s < num_src_ranks; s++) tot += cached_cnt_rows[(size_t)s * row_ints + my_rank];
-        *num_tokens_for_experts =
-            (allow_overflow_drop && tot > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : tot;
+    // Unpadded FLAT recv total: sum this rank's per-rank block entry across all source
+    // rows (matches the fused push-count path's num_recv_out; see dispatch_push_map_publish_outputs).
+    // Only thread 0 computes it; em_populate_cnt_tensors reads it on thread 0 as well.
+    int32_t tot = 0;
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < num_src_ranks; s++) {
+            tot += cached_cnt_rows[(size_t)s * row_ints + my_rank];
+        }
+        if (num_tokens_for_experts) {
+            *num_tokens_for_experts =
+                (allow_overflow_drop && tot > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : tot;
+        }
     }
     for (int e = threadIdx.x; e < experts_per_rank; e += blockDim.x) {
         // my_rank is the world rank, so my experts are [my_rank*epr, ...) in the world-global
@@ -238,7 +323,8 @@ __global__ void compute_layout_info_kernel(
     ::ht_ep::em_populate_cnt_tensors<EM_OUT_T>(
         smem, experts_per_rank, em_alignment, em_internal_offsets,
         em_padded_out_counts, em_out_offsets, em_actual_counts_out,
-        recv_total_counter, out_is_int64, max_recv_tokens_per_rank, allow_overflow_drop);
+        recv_total_counter, out_is_int64, max_recv_tokens_per_rank, allow_overflow_drop,
+        is_flat, tot);
 }
 
 void compute_layout_info(
@@ -257,6 +343,7 @@ void compute_layout_info(
     int32_t* em_actual_counts_out,
     void* recv_total_counter,
     int32_t* num_tokens_for_experts,
+    bool is_flat,
     cudaStream_t stream)
 {
     assert(num_experts == num_src_ranks * experts_per_rank);
@@ -270,14 +357,14 @@ void compute_layout_info(
             em_alignment, max_recv_tokens_per_rank, allow_overflow_drop, out_is_int64,
             em_internal_offsets, static_cast<int64_t*>(em_padded_out_counts),
             static_cast<int64_t*>(em_out_offsets), em_actual_counts_out, recv_total_counter,
-            num_tokens_for_experts);
+            num_tokens_for_experts, is_flat);
     } else {
         compute_layout_info_kernel<int32_t><<<1, block, smem_bytes, stream>>>(
             cached_cnt_rows, num_src_ranks, num_experts, experts_per_rank, my_rank,
             em_alignment, max_recv_tokens_per_rank, allow_overflow_drop, out_is_int64,
             em_internal_offsets, static_cast<int32_t*>(em_padded_out_counts),
             static_cast<int32_t*>(em_out_offsets), em_actual_counts_out, recv_total_counter,
-            num_tokens_for_experts);
+            num_tokens_for_experts, is_flat);
     }
 }
 
@@ -1464,6 +1551,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.dispatch_push_count.caller_recv_total = params.dispatch_push_count.caller_recv_total;
     kp.dispatch_push_count.caller_out_is_int64 = params.dispatch_push_count.caller_out_is_int64;
     kp.dispatch_push_count.em_alignment = params.dispatch_push_count.em_alignment;
+    kp.dispatch_push_count.is_flat = params.dispatch_push_count.is_flat;
 
     // Pass device communicator and windows
     kp.dcomm = params.dcomm;
@@ -2244,7 +2332,6 @@ __global__ void dispatch_copy_epilogue_kernel(
     dispatch_copy_segment(scale_src, scale_dst, static_cast<size_t>(count) * scale_row_bytes);
 }
 
-#ifndef DISABLE_SM90_FEATURES
 constexpr int kDispatchCopyStages = 8;
 constexpr size_t kDispatchCopyTileBytes = 16384;
 
@@ -2302,10 +2389,8 @@ __global__ void dispatch_copy_epilogue_tma_kernel(
     dispatch_copy_segment_tma(token_src, token_dst, static_cast<size_t>(count) * token_row_bytes, tiles, barriers);
     dispatch_copy_segment_tma(scale_src, scale_dst, static_cast<size_t>(count) * scale_row_bytes, tiles, barriers);
 }
-#endif
 
 ncclResult_t configure_dispatch_copy_tma() {
-#ifndef DISABLE_SM90_FEATURES
     const cudaError_t status = cudaFuncSetAttribute(
         dispatch_copy_epilogue_tma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
         kDispatchCopyStages * kDispatchCopyTileBytes);
@@ -2314,9 +2399,6 @@ ncclResult_t configure_dispatch_copy_tma() {
         return ncclInvalidUsage;
     }
     return status == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
-#else
-    return ncclInvalidUsage;
-#endif
 }
 
 void launch_dispatch_copy_epilogue(
@@ -2333,14 +2415,12 @@ void launch_dispatch_copy_epilogue(
     assert(token_src == nullptr || token_row_bytes <= SIZE_MAX / capacity);
     assert(scale_src == nullptr || scale_row_bytes <= SIZE_MAX / capacity);
     assert(copy_sms > 0 && mode != DispatchCopyMode::kCe);
-#ifndef DISABLE_SM90_FEATURES
     if (mode == DispatchCopyMode::kTma) {
         dispatch_copy_epilogue_tma_kernel<<<copy_sms, 32, kDispatchCopyStages * kDispatchCopyTileBytes, stream>>>(
             flat_count, em_count, capacity, staging_capacity,
             token_src, token_dst, token_row_bytes, scale_src, scale_dst, scale_row_bytes);
         return;
     }
-#endif
     dispatch_copy_epilogue_kernel<<<copy_sms, 1024, 0, stream>>>(
         flat_count, em_count, capacity, staging_capacity,
         token_src, token_dst, token_row_bytes, scale_src, scale_dst, scale_row_bytes);

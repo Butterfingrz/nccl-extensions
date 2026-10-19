@@ -7,7 +7,7 @@
 #include <set>
 
 namespace {
-constexpr int capacity = 1024;
+constexpr int capacity = 16384;
 constexpr int hidden = 128;
 constexpr int topk = 2;
 
@@ -27,9 +27,10 @@ struct Tensor {
 };
 
 int tokens_for(int rank, int round, int handle) {
-    if (round < 3) return ((round + handle) % 2) ? 1024 : 128;
-    constexpr int counts[] = {0, 33, 512, 513, 768, 1024, 32, 65};
-    return counts[(rank + round - 3 + handle * 3) % 8];
+    if (round < 3) return ((round + handle) % 2) ? capacity : 128;
+    constexpr std::array<int, 16> counts = {
+        0, 1, 31, 32, 33, 512, 513, 1024, 1025, 2048, 2049, 4096, 4097, 8192, 8193, capacity};
+    return counts[(rank + (round - 3) * 4 + handle * 8) % counts.size()];
 }
 
 int expert_for(int src, int token, int slot, int handle) {
@@ -50,7 +51,7 @@ struct State {
     ncclEpTensor_t* mem = nullptr;
     void* storage = nullptr;
     size_t bytes = 0;
-    Tensor idx, input, weights, recv, recv_weights, recv_idx, output, total, counts, offsets;
+    Tensor idx, input, weights, recv, recv_weights, recv_idx, output, grad_weights, total, counts, offsets;
     ncclEpLayoutInfo_t layout = NCCL_EP_LAYOUT_INFO_INIT;
     ~State() {
         if (handle) ncclEpHandleDestroy(handle);
@@ -74,6 +75,7 @@ struct State {
         recv_weights.init(ncclFloat32, recv_capacity * topk * sizeof(float), recv_capacity, em ? 0 : topk);
         recv_idx.init(ncclInt64, recv_capacity * topk * sizeof(int64_t), recv_capacity, topk);
         output.init(ncclBfloat16, capacity * hidden * 2, capacity, hidden);
+        grad_weights.init(ncclFloat32, capacity * topk * sizeof(float), capacity, topk);
         total.init(ncclInt64, sizeof(int64_t), 1);
         counts.init(ncclInt64, 2 * sizeof(int64_t), 2);
         offsets.init(ncclInt64, 2 * sizeof(int64_t), 2);
@@ -96,28 +98,38 @@ struct State {
         CUDA_ASSERT(cudaMemcpy(idx.data, routing.data(), routing.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
         CUDA_ASSERT(cudaMemcpy(input.data, values.data(), values.size() * 2, cudaMemcpyHostToDevice));
         CUDA_ASSERT(cudaMemcpy(weights.data, probs.data(), probs.size() * sizeof(float), cudaMemcpyHostToDevice));
-        for (auto* t : {idx.t, input.t, weights.t, output.t}) t->sizes[0] = n;
+        for (auto* t : {idx.t, input.t, weights.t, output.t, grad_weights.t}) t->sizes[0] = n;
         NCCL_ASSERT(ncclEpUpdateHandle(handle, idx.t, unfused ? &layout : nullptr, g_stream));
         CUDA_ASSERT(cudaStreamSynchronize(g_stream));
     }
-    void run(bool em) {
+    void run(bool em, bool backward) {
         ncclEpDispatchInputs_t in = NCCL_EP_DISPATCH_INPUTS_INIT;
         ncclEpDispatchOutputs_t out = NCCL_EP_DISPATCH_OUTPUTS_INIT;
         ncclEpDispatchConfig_t cfg = NCCL_EP_DISPATCH_CONFIG_INIT;
         in.tokens = input.t;
-        in.topk_weights = weights.t;
+        in.topk_weights = backward ? nullptr : weights.t;
         out.tokens = recv.t;
-        out.topk_weights = recv_weights.t;
-        if (!em) out.topk_idx = recv_idx.t;
+        out.topk_weights = backward ? nullptr : recv_weights.t;
+        if (!em && !backward) out.topk_idx = recv_idx.t;
+        cfg.pass_direction = backward ? NCCL_EP_BWD_PASS : NCCL_EP_FWD_PASS;
+        CUDA_ASSERT(cudaMemsetAsync(recv.data, 0xFF, capacity * g_nranks * topk * hidden * 2, g_stream));
+        CUDA_ASSERT(cudaMemsetAsync(output.data, 0xFF, capacity * hidden * 2, g_stream));
+        CUDA_ASSERT(cudaMemsetAsync(grad_weights.data, 0xFF, capacity * topk * sizeof(float), g_stream));
         NCCL_ASSERT(ncclEpDispatch(handle, &in, &out, &layout, &cfg, g_stream));
         NCCL_ASSERT(ncclEpComplete(handle, nullptr, g_stream));
         ncclEpCombineInputs_t ci = NCCL_EP_COMBINE_INPUTS_INIT;
         ncclEpCombineOutputs_t co = NCCL_EP_COMBINE_OUTPUTS_INIT;
+        ncclEpCombineConfig_t ccfg = NCCL_EP_COMBINE_CONFIG_INIT;
         ci.tokens = recv.t;
         co.tokens = output.t;
-        NCCL_ASSERT(ncclEpCombine(handle, &ci, &co, nullptr, g_stream));
+        ccfg.pass_direction = cfg.pass_direction;
+        if (backward) {
+            ci.topk_weights = recv_weights.t;
+            co.topk_weights = grad_weights.t;
+        }
+        NCCL_ASSERT(ncclEpCombine(handle, &ci, &co, &ccfg, g_stream));
     }
-    void check(int round, int id, bool em) {
+    void check(int round, int id, bool em, bool backward) {
         int64_t total_rows = -1, expert_counts[2], expert_offsets[2];
         CUDA_ASSERT(cudaMemcpy(&total_rows, total.data, sizeof(int64_t), cudaMemcpyDeviceToHost));
         CUDA_ASSERT(cudaMemcpy(expert_counts, counts.data, sizeof(expert_counts), cudaMemcpyDeviceToHost));
@@ -153,6 +165,11 @@ struct State {
             for (int h = 0; h < hidden; ++h)
                 errors += __bfloat162float(combined[i * hidden + h]) != topk * value_for(g_rank, i, h, round, id);
         EXPECT_EQ(errors, 0);
+        if (backward) {
+            std::vector<float> grads(capacity * topk);
+            CUDA_ASSERT(cudaMemcpy(grads.data(), grad_weights.data, grads.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < n * topk; ++i) EXPECT_EQ(grads[i], 0.5f);
+        }
         unsigned char guards[512];
         CUDA_ASSERT(cudaMemcpy(guards, storage, 256, cudaMemcpyDeviceToHost));
         CUDA_ASSERT(cudaMemcpy(guards + 256, static_cast<char*>(storage) + 256 + bytes, 256, cudaMemcpyDeviceToHost));
@@ -181,23 +198,25 @@ TEST_P(HtChunkHandle, MixedRanksReuseAndGraphs) {
             for (int id = 0; id < 2; ++id) states[id].update(round, id, unfused || !em);
             for (int id = 0; id < 2; ++id) {
                 auto& s = states[id];
-                s.run(em);
-                CUDA_ASSERT(cudaStreamSynchronize(g_stream));
-                s.check(round, id, em);
-                cudaGraph_t graph;
-                cudaGraphExec_t exec;
-                CUDA_ASSERT(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeGlobal));
-                s.run(em);
-                CUDA_ASSERT(cudaStreamEndCapture(g_stream, &graph));
-                CUDA_ASSERT(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
-                for (int replay = 0; replay < 3; ++replay) {
-                    CUDA_ASSERT(cudaMemsetAsync(s.output.data, 0xFF, capacity * hidden * 2, g_stream));
-                    CUDA_ASSERT(cudaGraphLaunch(exec, g_stream));
+                for (bool backward : {false, true}) {
+                    SCOPED_TRACE(backward);
+                    s.run(em, backward);
                     CUDA_ASSERT(cudaStreamSynchronize(g_stream));
-                    s.check(round, id, em);
+                    s.check(round, id, em, backward);
+                    cudaGraph_t graph;
+                    cudaGraphExec_t exec;
+                    CUDA_ASSERT(cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeGlobal));
+                    s.run(em, backward);
+                    CUDA_ASSERT(cudaStreamEndCapture(g_stream, &graph));
+                    CUDA_ASSERT(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+                    for (int replay = 0; replay < 3; ++replay) {
+                        CUDA_ASSERT(cudaGraphLaunch(exec, g_stream));
+                        CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+                        s.check(round, id, em, backward);
+                    }
+                    CUDA_ASSERT(cudaGraphExecDestroy(exec));
+                    CUDA_ASSERT(cudaGraphDestroy(graph));
                 }
-                CUDA_ASSERT(cudaGraphExecDestroy(exec));
-                CUDA_ASSERT(cudaGraphDestroy(graph));
             }
         }
     }

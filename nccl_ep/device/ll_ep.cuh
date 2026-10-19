@@ -611,7 +611,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
     __shared__ int sharedNumTokensSentPerRank[kNumMaxWarpGroups];
 
 #if NCCL_EP_CFT_DEVICE_SUPPORTED
-    using CftGeom = CftTileGeometry<kHidden, kNumTopk, kLayout>;
+    using CftGeom = CftTileGeometry<kHidden, kNumTopk, kLayout, false>;
     CftSendContext<CftGeom> cftSend;
     if constexpr (kCft) {
         EP_DEVICE_ASSERT(cft.peerLeIds != nullptr && recvDataWindow == ncclWindow_t{} &&
@@ -655,8 +655,9 @@ __device__ __forceinline__ void dispatch_kernel_impl(const dispatch_kernel_args_
 #if NCCL_EP_CFT_DEVICE_SUPPORTED
         // Stage the first token; later payloads are staged by cftSendToken.
         const CftSelfDestination cftSelf =
-            cftSelfDestination(recvBuf, currRank, numRanks, srcRankRegionBytes, maxTokensPerRank, dispatch_hdr_sz);
-        const CftMessageLayout cftMsg{dispatch_hdr_sz, hiddenBytes, payloadBytes, numBytesPerMsg};
+            cftSelfDestination<false>(recvBuf, outDataBuf, currRank, numRanks, srcRankRegionBytes,
+                                      maxTokensPerRank, dispatch_hdr_sz, hiddenBytes);
+        const CftMessageLayout cftMsg{dispatch_hdr_sz, hiddenBytes, payloadBytes, numBytesPerMsg, maxTokensPerRank};
         if constexpr (kCft) {
             if (warpId == 0 && laneId == 0) {
                 cftCheckBulkAlignment(cftSelf, cftMsg);

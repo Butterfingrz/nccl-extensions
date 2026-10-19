@@ -51,6 +51,25 @@ namespace nccl_ep {
 constexpr int kWarpSize = 32; // CUDA hardware warp width.
 constexpr int kBf16PerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
 
+// Compiler ordering only; does not emit a hardware fence.
+__device__ __forceinline__ void compiler_fence() {
+    asm volatile("" ::: "memory");
+}
+
+template <typename T>
+__device__ __forceinline__ T ld_read_only_global(const T* ptr) {
+    return __ldg(ptr);
+}
+
+__device__ __forceinline__ int atomic_add_relaxed_global(int* ptr, int value) {
+    return atomicAdd(ptr, value);
+}
+
+__device__ __forceinline__ unsigned long long atomic_or_relaxed_shared(
+    unsigned long long* ptr, unsigned long long value) {
+    return atomicOr(ptr, value);
+}
+
 //==============================================================================
 // Type Traits and Helper Types
 //==============================================================================
@@ -885,8 +904,6 @@ get_channel_task_range(int num_tokens, int num_sms, int sm_id, int& token_start_
 // SM90-Specific Features (TMA, Mbarriers)
 //==============================================================================
 
-#ifndef DISABLE_SM90_FEATURES
-
 __device__ __forceinline__ uint32_t elect_one_sync() {
     uint32_t pred = 0;
     asm volatile("{\n"
@@ -1029,7 +1046,5 @@ template <int N = 0>
 __device__ __forceinline__ void tma_store_wait_complete() {
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(N) : "memory");
 }
-
-#endif // DISABLE_SM90_FEATURES
 
 } // namespace nccl_ep

@@ -72,7 +72,7 @@ extern "C" {
 //       .tokens = my_tokens,
 //   };
 // ============================================================================
-#define NCCL_EP_API_VERSION 3
+#define NCCL_EP_API_VERSION 4
 #define NCCL_EP_MAGIC 0xC00FFFEEu
 
 #define NCCL_EP_STRUCT_INIT(type_, magic_) \
@@ -335,6 +335,21 @@ typedef struct {
     unsigned int dispatch_num_sms;
     // Combine SM budget. NCCL_EP_AUTO inherits the resolved shared budget.
     unsigned int combine_num_sms;
+    // HT dispatch/combine flow. All ranks must resolve to the same flow;
+    // inconsistent API or environment configuration is unsupported. An
+    // explicit value is authoritative. AUTO preserves the built-in push/pull
+    // default and permits the NCCL_EP_HT_PULL_PUSH environment
+    // override.
+    // PUSH_PULL and PULL_PUSH support flat and expert-major layouts;
+    // PULL_PUSH requires a single LSA domain.
+    ncclEpHtFlow_t ht_flow;
+    // HT metadata exchange. All ranks must resolve to the same policy;
+    // inconsistent API or environment configuration is unsupported. An
+    // explicit policy is authoritative. AUTO permits legacy environment
+    // overrides, fuses with dispatch when supported, and keeps existing
+    // fallbacks otherwise. REQUIRE_FUSED rejects handles/calls that need
+    // early exchange or scan; FORCE_SCAN selects the legacy scan path.
+    ncclEpMetaExchangePolicy_t meta_exchange_policy;
 } ncclEpGroupConfig_t;
 
 #define NCCL_EP_GROUP_CONFIG_INIT \
@@ -353,12 +368,15 @@ typedef struct {
 
 #define NCCL_EP_GROUP_CONFIG_V3_LAST_FIELD combine_num_sms
 #define NCCL_EP_GROUP_CONFIG_V3_SIZE 120u
-#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 3
+#define NCCL_EP_GROUP_CONFIG_V4_LAST_FIELD meta_exchange_policy
+#define NCCL_EP_GROUP_CONFIG_V4_SIZE 128u
+#define NCCL_EP_GROUP_CONFIG_CURRENT_VERSION 4
 
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 1);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 2);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 3);
+NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpGroupConfig_t, NCCL_EP_GROUP_CONFIG, 4);
 
 // Opaque type forward declaration
 typedef struct ncclEpGroup* ncclEpGroup_t;
@@ -396,11 +414,16 @@ typedef struct {
     ncclEpTensor_t* expert_counters;     // 1D [num_local_experts] int32 (or int64 for HT EM)
                                          //   HT (handle time): per-expert recv counts. Flat: unpadded int32.
                                          //                     EM: padded counts (sum equals output slot count).
+  //   HT Flat: number of received slots whose recv_topk_idx row names the local expert (a
+  //   token routed to several local experts counts once in each). Under
+  //   NCCL_EP_OVERFLOW_DROP the handle-time value is pre-drop; the dispatch-time value
+  //   (layout_info passed to ncclEpDispatch) is the delivered, post-drop count.
   //   LL/expert-major layout: per-expert received token counts (dispatch time).
     ncclEpTensor_t* src_rank_counters; // 1D [num_ranks] int32
   //   LL/rank-major layout only: per-source-rank token counts (dispatch time).
     ncclEpTensor_t* expert_offsets; // 1D [num_local_experts] int32 or int64
   //   HT (Handle time), expert-major layout only: prefix sum of padded per-expert counts.
+  //   Ignored for the Flat layout (no per-expert zones), at handle and dispatch time alike.
     ncclEpTensor_t* recv_total_counter; // 1D [1] int32 or int64
   //   HT (Handle time): scalar total recv token count.
   //     * Flat layout: unpadded.
@@ -596,7 +619,9 @@ typedef struct {
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI(ncclEpHandleState_t, NCCL_EP_HANDLE_STATE);
 NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpHandleState_t, NCCL_EP_HANDLE_STATE, 1);
 
-// Query the device bytes required for a handle's routing buffers.
+// Query the device bytes required for a handle's persistent routing state.
+// Group-owned update-only scan workspace is allocated lazily by ncclEpInitHandle
+// and is not included in size_out.
 //
 // Arguments:
 //   ep_group  - [IN]  A valid EP group
@@ -664,10 +689,12 @@ ncclResult_t ncclEpInitHandle(
 // For forward dispatch: handle_mem may be snapshotted any time after
 // ncclEpUpdateHandle completes on the source stream.
 //
-// For expert-major backward dispatch: handle_mem must be snapshotted after the
-// matching forward ncclEpDispatch has completed, with the copy ordered after
-// that work. ncclEpUpdateHandle alone does not write the per-token maps that
-// backward dispatch reads.
+// For backward dispatch or combine in count mode (expert-major local-permute
+// and Flat; see ncclEpDispatch's layout_info notes): handle_mem must be
+// snapshotted after the matching forward ncclEpDispatch has completed, with
+// the copy ordered after that work. ncclEpUpdateHandle alone does not write
+// the per-token maps that backward dispatch and combine read. Outside count
+// mode the per-token maps are complete after ncclEpUpdateHandle.
 //
 // Arguments:
 //   handle     - [OUT] Newly imported handle
@@ -744,7 +771,9 @@ ncclResult_t ncclEpCreateHandle(
 
 ncclResult_t ncclEpHandleDestroy(ncclEpHandle_t handle);
 
-// Query the device bytes required for a handle's routing buffers.
+// Query the device bytes required for a handle's persistent routing state.
+// Group-owned update-only scan workspace is allocated lazily by ncclEpInitHandle
+// and is not included in size_out.
 //
 // Arguments:
 //   ep_group  - [IN]  A valid EP group
@@ -954,9 +983,15 @@ NCCL_EP_STATIC_ASSERT_STRUCT_ABI_BOUNDARY(ncclEpDispatchConfig_t, NCCL_EP_DISPAT
 //                                layout_info->src_rank_counters[`r`] (see below).
 //   layout_info   - [IN,OUT] Named local tensors for layout-specific counters (see ncclEpLayoutInfo_t).
 //                              * For HT mode normally NULL: the counter information is available through
-//                                ncclEpUpdateHandle. Exception: HT expert-major count mode may instead
-//                                pass expert_counters and recv_total_counter here, published by dispatch
-//                                itself rather than ncclEpUpdateHandle.
+//                                ncclEpUpdateHandle. Exception: HT count mode (expert-major local-permute
+//                                and Flat) may instead pass expert_counters and recv_total_counter here,
+//                                published by dispatch itself rather than ncclEpUpdateHandle. Supplying
+//                                any of these to ncclEpUpdateHandle selects the unfused count exchange
+//                                (they are then written there, before dispatch); omitting them keeps
+//                                the fused exchange, in which the recv count is known only after the
+//                                first forward dispatch. Outside count mode (multiple LSA teams,
+//                                NCCL_EP_HT_EM_AG_SCAN_MODE, EM duplication modes) dispatch leaves
+//                                these tensors untouched; request them from ncclEpUpdateHandle there.
 //                              * For LL mode, layout-specific counter tensors must be provided (see ncclEpLayoutInfo_t doc).
 //                                * Expert-major layout: expert_counters tensor is required.
 //                                * Rank-major layout: src_rank_counters is optional; when provided,

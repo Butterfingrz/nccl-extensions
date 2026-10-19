@@ -38,11 +38,11 @@ constexpr int kLlCombineMaxUnrolls = 4;
 //                 eligibility.
 //   k2SidedRmLsa: LSA-only rank-major kernel that stages payload through
 //                 RDMA buffers on both send and receive. Selected for every
-//                 LSA-only, NONE-recipe, rank-major call with CFT disabled
-//                 and a hidden size divisible by the receive tile.
+//                 LSA-only, NONE-recipe, rank-major call paired with STORE or CFT LSA
+//                 dispatch and a hidden size divisible by the receive tile.
 //   k1SidedRmLsa: LSA-only rank-major kernel that pulls each token's result directly out of the
 //                 owning rank's inData window instead of sending it back. Requires everything
-//                 k2SidedRmLsa requires plus BF16 tokens and "1sided" to have been enforced.
+//                 k2SidedRmLsa requires plus STORE transport, BF16 tokens and enforced "1sided".
 //   kAutoRmLsa:   LSA-only rank-major wrapper that makes the 1-sided-vs-2-sided pick on-device, at
 //                 kernel entry, from dispatch's already-decided want1SidedBuf (dispatch itself
 //                 compares every active peer's count against combineLsaThreshold) -- no host
@@ -55,13 +55,15 @@ constexpr int kLlCombineMaxUnrolls = 4;
 // re-deriving it from raw params -- that duplication is exactly what let the two diverge before.
 inline bool ll_combine_lsa_eligible(
     bool nvlinkOnly, ncclEpCombQuant_t qrecipe, bool useLogFmt, ncclEpLayout_t layout,
-    bool cftEnabled, int hidden, ncclDataType_t tokenDtype) {
-    // CFT dispatch skips the next-bank wipe. Pair it with the general combine
-    // kernel, which clears consumed flags; the LSA kernel leaves them set.
+    bool cftEnabled, int hidden, ncclDataType_t tokenDtype,
+    NcclEpDispatchLsaMode lsaMode) {
+    // General CFT does not clear the next bank and must use general combine.
+    const bool dispatchWipesNextBank = !cftEnabled ||
+        (ll_cft_lsa_enabled() && lsaMode != NcclEpDispatchLsaMode::kUniversal);
     const int elemBytes = tokenDtype == ncclFloat32 ? 4 : 2;
     const int elemsPerTile = combine_smem::kWarpSize * combine_smem::kNumRecvUnrolls *
         combine_smem::elements_per_int4(elemBytes);
-    return hidden > 0 && hidden % elemsPerTile == 0 && !cftEnabled && nvlinkOnly &&
+    return hidden > 0 && hidden % elemsPerTile == 0 && dispatchWipesNextBank && nvlinkOnly &&
         qrecipe == NCCL_EP_COMB_QUANT_NONE && !useLogFmt && layout == NCCL_EP_LAYOUT_RANK_MAJOR;
 }
 
@@ -72,7 +74,7 @@ inline bool ll_combine_lsa_eligible(
 //
 // enforced_lsa only governs the pick WITHIN the LSA domain (1-sided vs. 2-sided vs. auto) --
 // NCCL_EP_COMBINE_LSA says nothing about whether this call is even in that domain. So when the call
-// isn't LSA-eligible at all (wrong topology/layout/recipe/CFT), an enforced LSA kernel falls back to
+// isn't LSA-eligible at all (wrong topology/layout/recipe or general CFT), an enforced LSA kernel falls back to
 // kDefault silently, same as an unenforced call would. kInvalid is reserved for a request that IS
 // in the LSA domain but still can't be honored (e.g. 1-sided enforced, lsaEligible but not
 // oneSidedEligible) -- that's an actionable misconfiguration, not an out-of-domain no-op.
