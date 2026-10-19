@@ -353,6 +353,10 @@ __device__ __forceinline__ void wait_acquire_block_shared(unsigned* ptr, unsigne
     }
 }
 
+__device__ __forceinline__ void memory_fence_seq_cst_sys() {
+    __threadfence_system();
+}
+
 __device__ __forceinline__ void memory_fence() {
     asm volatile("fence.acq_rel.sys;" ::: "memory");
 }

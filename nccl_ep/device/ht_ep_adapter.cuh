@@ -507,8 +507,6 @@ ncclResult_t launch_dispatch_pull(
     const int32_t* own_row,
     const uint16_t* own_topk_snapshot,
     uint8_t* own_meta_staging,
-    int32_t* layout_slot_base,
-    int32_t* layout_expert_base,
     const int32_t* cached_cnt_rows,
     // Caller's dispatch-time layout_info outputs (mirrors dispatch_push_count's caller_offsets/
     // caller_counts/caller_recv_total); null when the caller didn't request them.

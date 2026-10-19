@@ -1260,8 +1260,8 @@ struct combine_kernel_param_t : combine_kernel_param_base_t {
 // __syncthreads(); will use the 0 named barriers, so we want to avoid that.
 // We want to use 1 for intra-LSA reduction warp group, >= 2 for cross-LSA-team reduction warp group,
 // RDMA warp group currently only contains 1 warp so does not use named bar yet, if it need to use, it should use 2 + NUM_OF_DATA_PIPELINE_PER_BLOCK.
-__forceinline__ __device__ void arrive_and_wait(uint32_t num_threads, uint32_t barrier_id = 0) {
-    asm volatile("bar.sync %0, %1;" : : "r"(barrier_id), "r"(num_threads));
+__forceinline__ __device__ void arrive_and_wait(uint32_t num_threads, uint32_t barrier_id) {
+    nccl_ep::named_barrier_sync(barrier_id, num_threads);
 }
 
 // Map a data channel onto its GIN context, skipping the reserved contexts.
@@ -6774,6 +6774,8 @@ constexpr int kPullDispatchMaxActive = 32;
 // Fused pull-count: two MAP warps build the recv-slot/EM maps in-kernel. Barrier 0 is
 // reserved for block-wide sync; the MAP warps use barrier 1.
 constexpr int kPullDispatchMapWarps = 2;
+// Static smem of the MAP layout scan; counted in the host smem budget.
+constexpr size_t kPullDispatchMapScanBytes = kPullDispatchMapWarps * sizeof(int);
 constexpr int kPullMapBarrierId = 1;
 
 // Max NVLink single-LSA-team ranks. The peer-pointer arrays live inline in the kernel
@@ -6846,12 +6848,10 @@ __device__ __forceinline__ void lsa_grid_head_gate_elected(
     }
 }
 
-// ready: the value the head gate publishes/waits for. Fused pull-count publishes its
-// metadata before this gate and signals ready=2 so a straggler that only observed the
-// (unrelated) ready=1 value from a prior dispatch on this flag cannot proceed early.
-__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_t* head_sync_flag, int ready = 1) {
-    const bool leader = elect_first_block(head_sync_flag, static_cast<uint32_t>(ready + 1));
-    lsa_grid_head_gate_elected(dcomm, head_sync_flag, leader, ready);
+__device__ __forceinline__ void lsa_grid_head_gate(ncclDevComm_t* dcomm, uint32_t* head_sync_flag) {
+    constexpr int kReady = 1;
+    const bool leader = elect_first_block(head_sync_flag, static_cast<uint32_t>(kReady + 1));
+    lsa_grid_head_gate_elected(dcomm, head_sync_flag, leader, kReady);
 }
 
 // Block-uniform LSA grid tail barrier shared by pull dispatch and push combine.
@@ -6902,7 +6902,7 @@ struct dispatch_pull_param_t {
     // Intra-LSA head/tail sync: source ready before any peer read, reads done before reuse.
     ncclDevComm_t* dcomm;
     uint32_t* head_sync_flag;                   // grid head gate (idle counter during dispatch)
-    uint32_t* grid_barrier_counter;             // tail elect-last-block
+    uint32_t* grid_barrier_counter;             // head (fused) and tail elect-last-block
     // When set, head/tail sync runs as separate kernels; this kernel skips the inline sync.
     bool unfused_sync;
 
@@ -6921,9 +6921,6 @@ struct dispatch_pull_param_t {
     const int32_t* own_row;             // [lsa_team_size + num_experts]
     const uint16_t* own_topk_snapshot;  // [tokens_per_rank, top_k] this rank's packed topk
     uint8_t* own_meta_staging;          // local inbox with one metadata row per source rank
-    // CTA 0 publishes layout bases for the rest of the grid.
-    int32_t* layout_slot_base;          // [lsa_team_size]
-    int32_t* layout_expert_base;        // [experts_per_rank]
     const int32_t* cached_cnt_rows;     // optional handle-local AllGather from UpdateHandle
     // Caller's dispatch-time layout_info outputs (mirrors dispatch_push_count_kparams_t); null
     // when the caller didn't request them at this ncclEpDispatch call.
@@ -6974,45 +6971,8 @@ __device__ __forceinline__ void dispatch_pull_pad_fill(
     }
 }
 
-// CTA 0, or the elected fused head CTA, publishes metadata (the standalone publish kernel uses
-// dispatch_pull_map_publish_grid below).
-__device__ __forceinline__ void dispatch_pull_map_publish(
-    const int32_t* __restrict__ own_row, const uint16_t* __restrict__ own_topk,
-    const uint8_t* const* __restrict__ meta_ptrs, size_t row_stride, int topk_off_bytes,
-    int tokens_per_rank, int top_k, int my_rank, int nRanks, bool elected_cta = false) {
-    if (!elected_cta && blockIdx.x != 0) return;
-    const int count_ints = own_row ? topk_off_bytes / sizeof(int32_t) : 0;
-    for (int i = threadIdx.x; i < count_ints; i += blockDim.x) {
-        const int32_t v = own_row[i];
-        for (int r = 0; r < nRanks; ++r) {
-            volatile int32_t* dst = reinterpret_cast<volatile int32_t*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride);
-            dst[i] = v;
-        }
-    }
-    const int total = tokens_per_rank * top_k;
-    if ((topk_off_bytes & 15) == 0) {
-        for (int i = threadIdx.x; i < total / 8; i += blockDim.x) {
-            const uint4 v = reinterpret_cast<const uint4*>(own_topk)[i];
-            for (int r = 0; r < nRanks; ++r) {
-                int4* dst = reinterpret_cast<int4*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
-                nccl_ep::st_na_relaxed(dst + i, reinterpret_cast<const int4&>(v));
-            }
-        }
-    }
-    const int tail = (topk_off_bytes & 15) == 0 ? (total / 8) * 8 : 0;
-    for (int i = tail + threadIdx.x; i < total; i += blockDim.x) {
-        const uint16_t v = own_topk[i];
-        for (int r = 0; r < nRanks; ++r) {
-            volatile uint16_t* dst = reinterpret_cast<volatile uint16_t*>(const_cast<uint8_t*>(meta_ptrs[r]) + my_rank * row_stride + topk_off_bytes);
-            dst[i] = v;
-        }
-    }
-    __threadfence_system();
-}
-
-// Grid-strided dispatch_pull_map_publish for the standalone publish kernel (unfused sync): every CTA of the launch
-// takes a share of the (peer, element) stores, rank-major so consecutive threads write consecutive addresses of one
-// peer. The kernel boundary orders all of them before the head-sync kernel that follows on the same stream.
+// Grid-strided metadata publish shared by the standalone publish kernel and the fused pull dispatch.
+// Callers order the stores before the head sync.
 __device__ __forceinline__ void dispatch_pull_map_publish_grid(
     const int32_t* __restrict__ own_row, const uint16_t* __restrict__ own_topk,
     const uint8_t* const* __restrict__ meta_ptrs, size_t row_stride, int topk_off_bytes,
@@ -7054,11 +7014,15 @@ __device__ __forceinline__ void dispatch_pull_map_publish_grid(
             dst[i] = own_topk[i];
         }
     }
-    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        nccl_ep::memory_fence_seq_cst_sys();
+    }
 }
 
 // Two MAP warps build maps and publish completed chunk ranges.
-// CTA 0 computes the layout once and releases it to the other blocks.
+// Every block derives the layout from the published counts; CTA 0 also writes the global
+// outputs and releases them to the pad warps.
 __device__ __forceinline__ void dispatch_pull_map_warp(
     int topk_off_bytes,
     int32_t* __restrict__ recv_slot_to_src,
@@ -7071,10 +7035,7 @@ __device__ __forceinline__ void dispatch_pull_map_warp(
     int32_t* __restrict__ expert_cursor,
     int32_t* __restrict__ layout_ready,
     int32_t* __restrict__ s_base,
-    int32_t* __restrict__ s_expert_total,
     int32_t* __restrict__ s_expert_base,
-    int32_t* __restrict__ g_slot_base,    // block 0 publishes s_base here; every other block reads it
-    int32_t* __restrict__ g_expert_base,  // block 0 publishes s_expert_base here; every other block reads it
     int top_k,
     int experts_per_rank,
     int lsa_team_size,
@@ -7110,105 +7071,143 @@ __device__ __forceinline__ void dispatch_pull_map_warp(
         return *src;
     };
 
-    // Build the shared recv-slot and per-expert layout once.
-    if (blockIdx.x == 0) {
-        // Load source counts in parallel, then reduce the local-expert columns.
-        for (int e = tid; e < epr; e += nMapThreads) s_expert_total[e] = 0;
-        for (int r = tid; r < nRanks; r += nMapThreads) {
-            s_base[r] = peer_count(r, my_rank);
-        }
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
-        for (int i = tid; i < nRanks * epr; i += nMapThreads) {
-            const int r = i / epr;
-            const int e = i % epr;
-            atomicAdd(&s_expert_total[e], peer_count(r, nRanks + expert_base_gid + e));
-        }
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+    const bool is_layout_writer = (blockIdx.x == 0);
+    for (int r = tid; r < nRanks; r += nMapThreads) {
+        s_base[r] = peer_count(r, my_rank);
+    }
 
-        // Rank-major recv slots and aligned per-expert output zones.
-        if (tid == 0) {
-            int cum = 0;
-            for (int r = 0; r < nRanks; r++) {
-                const int count = s_base[r];
-                s_base[r] = cum;
-                cum += count;
+    __shared__ int s_warp_total[kPullDispatchMapWarps];
+    static_assert(sizeof(s_warp_total) == kPullDispatchMapScanBytes, "update kPullDispatchMapScanBytes");
+    const int align = (em_alignment > 1) ? em_alignment : 1;
+    int carry = 0;
+    for (int tile = 0; tile < epr; tile += nMapThreads) {
+        const int k = tile + tid;
+        int c = 0;
+        if (k < epr) {
+            for (int r = 0; r < nRanks; ++r) {
+                c += peer_count(r, nRanks + expert_base_gid + k);
             }
-            const int true_total = cum;
-            const bool overflow = true_total > max_recv_tokens_per_rank;
-            if (overflow && !allow_overflow_drop) {
+        }
+        const int padded = (align > 1 && c > 0) ? nccl_ep::align(c, align) : c;
+        // Block-wide inclusive scan of the padded zone sizes.
+        int v = padded;
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int n = __shfl_up_sync(0xffffffffu, v, off);
+            if (lane >= off) {
+                v += n;
+            }
+        }
+        if (lane == 31) {
+            s_warp_total[map_idx] = v;
+        }
+        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+        int warp_prefix = carry;
+        int tile_total = 0;
+        for (int w = 0; w < kPullDispatchMapWarps; ++w) {
+            const int warp_total = s_warp_total[w];
+            if (w < map_idx) {
+                warp_prefix += warp_total;
+            }
+            tile_total += warp_total;
+        }
+        const int ecum = warp_prefix + v - padded;
+        if (k < epr) {
+            s_expert_base[k] = ecum;
+        }
+        if (is_layout_writer && k < epr) {
+            int room = padded;
+            if (allow_overflow_drop) {
+                room = (ecum < max_recv_tokens_per_rank) ? (max_recv_tokens_per_rank - ecum) : 0;
+            }
+            const int zone_base =
+                (allow_overflow_drop && ecum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : ecum;
+            expert_token_offsets[k] = zone_base;
+            if (per_expert_counts_active) {
+                int out_actual = c;
+                if (allow_overflow_drop) {
+                    out_actual = (c < room) ? c : room;
+                }
+                per_expert_counts_active[k] = out_actual;
+            }
+            // Report padded layout sizes; active counts above exclude padding.
+            if (caller_offsets || caller_counts) {
+                int out_padded = padded;
+                if (allow_overflow_drop) {
+                    out_padded = (padded < room) ? padded : room;
+                }
+                if (caller_offsets) {
+                    if (caller_out_is_int64) {
+                        static_cast<int64_t*>(caller_offsets)[k] = zone_base;
+                    } else {
+                        static_cast<int32_t*>(caller_offsets)[k] = zone_base;
+                    }
+                }
+                if (caller_counts) {
+                    if (caller_out_is_int64) {
+                        static_cast<int64_t*>(caller_counts)[k] = out_padded;
+                    } else {
+                        static_cast<int32_t*>(caller_counts)[k] = out_padded;
+                    }
+                }
+            }
+        }
+        carry += tile_total;
+        // s_warp_total is rewritten by the next tile.
+        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+    }
+
+    // Rank-major recv slots; tid 0 also publishes the totals.
+    if (tid == 0) {
+        int cum = 0;
+        for (int r = 0; r < nRanks; r++) {
+            const int count = s_base[r];
+            s_base[r] = cum;
+            cum += count;
+        }
+        const int true_total = cum;
+        const bool overflow = true_total > max_recv_tokens_per_rank;
+        if (overflow && !allow_overflow_drop) {
+            if (is_layout_writer) {
                 printf("ncclEpDispatch: HT fused pull-count FLAT recv tokens %d > max_recv_tokens_per_rank %d; "
                        "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
                        "or set ncclEpGroupConfig_t::overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
                        true_total, max_recv_tokens_per_rank);
-                __trap();
             }
-            // Also clamp to flat_recv_capacity: slots beyond it were never written by the MAP phase.
-            const int capped_total = overflow ? max_recv_tokens_per_rank : true_total;
-            *num_recv_tokens_dev = (capped_total < flat_recv_capacity) ? capped_total : flat_recv_capacity;
-
-            const int align = (em_alignment > 1) ? em_alignment : 1;
-            int ecum = 0;
-            for (int k = 0; k < epr; k++) {
-                const int c = s_expert_total[k];
-                s_expert_base[k] = ecum;
-                const int padded = (align > 1 && c > 0) ? ((c + align - 1) / align) * align : c;
-                const int room = (allow_overflow_drop)
-                    ? ((ecum < max_recv_tokens_per_rank) ? (max_recv_tokens_per_rank - ecum) : 0)
-                    : padded;
-                const int zone_base =
-                    (allow_overflow_drop && ecum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : ecum;
-                expert_token_offsets[k] = zone_base;
-                if (per_expert_counts_active) {
-                    int out_actual = c;
-                    if (allow_overflow_drop) out_actual = (c < room) ? c : room;
-                    per_expert_counts_active[k] = out_actual;
-                }
-                // Caller's layout_info API reports the padded zone (not the raw count
-                // per_expert_counts_active carries), matching dispatch_push_map_warp's caller_counts.
-                if (caller_offsets || caller_counts) {
-                    const int out_padded = allow_overflow_drop ? ((padded < room) ? padded : room) : padded;
-                    if (caller_offsets) {
-                        if (caller_out_is_int64) static_cast<int64_t*>(caller_offsets)[k] = zone_base;
-                        else static_cast<int32_t*>(caller_offsets)[k] = zone_base;
-                    }
-                    if (caller_counts) {
-                        if (caller_out_is_int64) static_cast<int64_t*>(caller_counts)[k] = out_padded;
-                        else static_cast<int32_t*>(caller_counts)[k] = out_padded;
-                    }
-                }
-                ecum += padded;
-            }
-            // TRAP: padded EM total over budget under a non-DROP policy (may overflow via
-            // alignment padding even when the FLAT count fits) aborts with scan-mode parity.
-            if (!allow_overflow_drop && ecum > max_recv_tokens_per_rank) {
+            __trap();
+        }
+        const int ecum = carry;
+        // TRAP: padded EM total over budget under a non-DROP policy (may overflow via
+        // alignment padding even when the FLAT count fits) aborts with scan-mode parity.
+        if (!allow_overflow_drop && ecum > max_recv_tokens_per_rank) {
+            if (is_layout_writer) {
                 printf("ncclEpDispatch: HT fused pull-count padded EM total %d > max_recv_tokens_per_rank %d; "
                        "increase ncclEpGroupConfig_t::max_recv_tokens_per_rank "
                        "or set ncclEpGroupConfig_t::overflow_policy = NCCL_EP_OVERFLOW_DROP\n",
                        ecum, max_recv_tokens_per_rank);
-                __trap();
             }
+            __trap();
+        }
+        if (is_layout_writer) {
+            // Also clamp to flat_recv_capacity: slots beyond it were never written by the MAP phase.
+            const int capped_total = overflow ? max_recv_tokens_per_rank : true_total;
+            *num_recv_tokens_dev = (capped_total < flat_recv_capacity) ? capped_total : flat_recv_capacity;
             expert_token_offsets[epr] = (ecum > max_recv_tokens_per_rank) ? max_recv_tokens_per_rank : ecum;
             // recv_total_counter reports the pre-drop padded total (unclamped ecum); equals the
             // unpadded FLAT recv total when em_alignment == 1. Matches dispatch_push_map_warp.
             if (caller_recv_total) {
-                if (caller_out_is_int64) *static_cast<int64_t*>(caller_recv_total) = ecum;
-                else *static_cast<int32_t*>(caller_recv_total) = ecum;
+                if (caller_out_is_int64) {
+                    *static_cast<int64_t*>(caller_recv_total) = ecum;
+                } else {
+                    *static_cast<int32_t*>(caller_recv_total) = ecum;
+                }
             }
         }
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
-
-        for (int r = tid; r < nRanks; r += nMapThreads) g_slot_base[r] = s_base[r];
-        for (int k = tid; k < epr; k += nMapThreads) g_expert_base[k] = s_expert_base[k];
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
-        if (tid == 0) {
-            // Publish the completed layout before other blocks read it.
-            nccl_ep::st_release_sys_global(layout_ready, 1);
-        }
-    } else {
-        while (nccl_ep::ld_acquire_sys_global(layout_ready) == 0) {}
-        for (int r = tid; r < nRanks; r += nMapThreads) s_base[r] = g_slot_base[r];
-        for (int k = tid; k < epr; k += nMapThreads) s_expert_base[k] = g_expert_base[k];
-        arrive_and_wait(nMapThreads, kPullMapBarrierId);
+    }
+    arrive_and_wait(nMapThreads, kPullMapBarrierId);
+    if (is_layout_writer && tid == 0) {
+        // Publish the completed layout for the pad warps.
+        nccl_ep::st_release_sys_global(layout_ready, 1);
     }
 
     // Each warp reads 32 contiguous tokens from one source rank. Cycling ranks
@@ -7368,8 +7367,6 @@ __device__ __forceinline__ void dispatch_pull(
     const int32_t* __restrict__ own_row = dp.own_row;
     const uint16_t* __restrict__ own_topk_snapshot = dp.own_topk_snapshot;
     uint8_t* __restrict__ own_meta_staging = dp.own_meta_staging;
-    int32_t* __restrict__ layout_slot_base = dp.layout_slot_base;
-    int32_t* __restrict__ layout_expert_base = dp.layout_expert_base;
     const int32_t* __restrict__ cached_cnt_rows = dp.cached_cnt_rows;
     void* __restrict__ caller_offsets = dp.caller_offsets;
     void* __restrict__ caller_counts = dp.caller_counts;
@@ -7418,10 +7415,9 @@ __device__ __forceinline__ void dispatch_pull(
     }
     Policy::block_init_fence();
 
-    // Fused pull-count MAP smem: [s_base(lsa_team_size) | s_expert_total(epr) | s_expert_base(epr)],
+    // Fused pull-count MAP smem: [s_base(lsa_team_size) | s_expert_base(epr)],
     // laid out right after the pull warps' Policy/ScalePolicy staging region. Unused when kMapWarps == 0.
     int32_t* s_map_base = nullptr;
-    int32_t* s_map_expert_total = nullptr;
     int32_t* s_map_expert_base = nullptr;
     int2* s_chunk_ranges = nullptr;
     if constexpr (kFusedMap) {
@@ -7430,9 +7426,8 @@ __device__ __forceinline__ void dispatch_pull(
             (kScaleTma ? static_cast<size_t>(kPayloadWarps) * ScalePolicy::smem_bytes_per_warp : 0);
         int32_t* s_map = reinterpret_cast<int32_t*>(s_policy + kPolicyTotalBytes);
         s_map_base = s_map;
-        s_map_expert_total = s_map_base + lsa_team_size;
-        s_map_expert_base = s_map_expert_total + experts_per_rank;
-        const size_t map_bytes = static_cast<size_t>(lsa_team_size + 2 * experts_per_rank) * sizeof(int32_t);
+        s_map_expert_base = s_map_base + lsa_team_size;
+        const size_t map_bytes = static_cast<size_t>(lsa_team_size + experts_per_rank) * sizeof(int32_t);
         s_chunk_ranges = reinterpret_cast<int2*>(s_policy + kPolicyTotalBytes +
             ((map_bytes + alignof(int2) - 1) & ~size_t(alignof(int2) - 1)));
     }
@@ -7541,15 +7536,23 @@ __device__ __forceinline__ void dispatch_pull(
         // When unfused, a standalone publish kernel and head-sync kernel already did this.
         if (!unfused_sync) {
             constexpr int kMapReady = 2;
-            const bool head_leader =
-                elect_first_block(head_sync_flag, static_cast<uint32_t>(kMapReady + 1));
+            dispatch_pull_map_publish_grid(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot,
+                meta_ptrs, meta_stride, topk_off_bytes, tokens_per_rank, top_k, my_rank,
+                lsa_team_size);
+            const bool head_leader = elect_last_block(reinterpret_cast<const int*>(grid_barrier_counter),
+                                                      static_cast<int>(gridDim.x));
             if (head_leader) {
-                if (threadIdx.x == 0) *layout_ready = 0;
-                __syncthreads();
-                dispatch_pull_map_publish(cached_cnt_rows ? nullptr : own_row, own_topk_snapshot,
-                    meta_ptrs, meta_stride, topk_off_bytes, tokens_per_rank, top_k, my_rank,
-                    lsa_team_size, /*elected_cta=*/true);
-                __syncthreads();
+                if (threadIdx.x == 0) {
+                    *layout_ready = 0;
+                    atomicExch(grid_barrier_counter, 0u);
+                }
+                // Reset the slot cursors (and the trailing arrival counter) before any block claims.
+                for (int i = threadIdx.x; i < lsa_team_size; i += blockDim.x) {
+                    rank_cursor[i] = 0;
+                }
+                for (int i = threadIdx.x; i <= experts_per_rank; i += blockDim.x) {
+                    expert_cursor[i] = 0;
+                }
             }
             lsa_grid_head_gate_elected(dcomm, head_sync_flag, head_leader, kMapReady);
         }
@@ -7562,21 +7565,26 @@ __device__ __forceinline__ void dispatch_pull(
             dispatch_pull_map_warp(
                 topk_off_bytes, recv_slot_to_src, srcpos_map, flat2em_slot_map,
                 num_recv_tokens_dev, expert_token_offsets, per_expert_counts_active, rank_cursor,
-                expert_cursor, layout_ready, s_map_base, s_map_expert_total,
-                s_map_expert_base, layout_slot_base, layout_expert_base, top_k, experts_per_rank,
+                expert_cursor, layout_ready, s_map_base, s_map_expert_base, top_k, experts_per_rank,
                 lsa_team_size, tokens_per_rank, my_rank,
                 max_recv_tokens_per_rank, flat_recv_capacity, em_alignment, allow_overflow_drop,
                 caller_offsets, caller_counts, caller_recv_total, caller_out_is_int64,
                 map_idx, lane, own_meta_staging, meta_stride, s_chunk_ranges, s_chunks_ready,
                 cached_cnt_rows);
-        } else {
-            while (nccl_ep::ld_acquire_sys_global(layout_ready) == 0) {}
+        } else if (is_pad) {
+            if (lane == 0) {
+                while (nccl_ep::ld_acquire_sys_global(layout_ready) == 0) {
+                }
+            }
+            __syncwarp();
         }
     }
 
-    const int num_recv = *num_recv_tokens_dev;
-    const int64_t em_padded_total = expert_token_offsets[experts_per_rank];
-    EP_DEVICE_ASSERT(caller_num_recv_tokens >= em_padded_total);
+    // Fused map: each block holds the layout in smem; only the pad warps wait for the global outputs.
+    if (!kFusedMap || is_pad) {
+        const int64_t em_padded_total = expert_token_offsets[experts_per_rank];
+        EP_DEVICE_ASSERT(caller_num_recv_tokens >= em_padded_total);
+    }
 
     if (is_pad) {
         dispatch_pull_pad_fill<HiddenInt4, kFwd, kPullDispatchThreadsPerSlot, kPullDispatchPadWarps>(
@@ -7615,6 +7623,7 @@ __device__ __forceinline__ void dispatch_pull(
                 }
             }
         } else {
+            const int num_recv = *num_recv_tokens_dev;
             const int num_waves = (num_recv + kNWarps - 1) / kNWarps;
             for (int wave = 0; wave < num_waves; ++wave) {
                 const int token = gwarp * num_waves + wave;
@@ -8950,9 +8959,9 @@ __device__ __forceinline__ void combine_push_flat(const combine_push_param_t& p)
 
 namespace ht_ep {
 
-// Shared layout scratch: source-rank bases, expert totals, and expert bases.
+// Shared layout scratch: source-rank bases and expert bases.
 __host__ __device__ __forceinline__ size_t dispatch_pull_map_smem_ints(int nRanks, int epr) {
-    return static_cast<size_t>(nRanks) + 2u * static_cast<size_t>(epr);
+    return static_cast<size_t>(nRanks) + static_cast<size_t>(epr);
 }
 
 }  // namespace ht_ep

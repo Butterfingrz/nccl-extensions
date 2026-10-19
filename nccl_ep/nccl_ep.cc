@@ -941,9 +941,8 @@ struct ncclEpGroup {
 
     // Fused pull-count MAP-build scratch (group-shared; zeroed and consumed within a single
     // dispatch, so group-scoping stays 1F1B-safe like em_permute_cursors).
-        int32_t* pull_recv_cursor = nullptr;  // [lsa_team_size + num_local_experts + 1] rank + expert cursors, plus trailing arrival counter
-        int32_t* pull_layout_ready = nullptr; // single grid-wide "layout published" flag
-        int32_t* pull_map_layout = nullptr;   // [lsa_team_size + num_local_experts] CTA0-published slot/expert bases
+        // [lsa_team_size + num_local_experts + 2]: rank + expert cursors, arrival counter, "layout published" flag
+        int32_t* pull_recv_cursor = nullptr;
 
     // RDMA buffers (multi-LSA-team only)
         uint64_t* dispatch_gin_G2S_flags;
@@ -1583,21 +1582,14 @@ init_ht_intranode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, 
     // Group-shared count-mode / EM local-permute scratch (zeroed/written per dispatch).
     alloc_ht_count_scratch(ep_group);
 
-    // Pull-count map-build cursors (per-rank recv + per-expert EM); zeroed per UpdateHandle.
+    // Pull-count map-build cursors (per-rank recv + per-expert EM); zeroed per dispatch.
     // +1 trailing int: DROP-mode phantom-row fixup's grid arrival counter (mirrors
     // em_permute_cursors above; see allow_overflow_drop's doc comment on
     // local_permute_dup_param_t in ht_ep.cuh).
     if (group_pull_count_capable) {
         CUDA_CHECK(ep_group->alloc.alloc_fn(
             reinterpret_cast<void**>(&ep_group->ht_buffers.pull_recv_cursor),
-            static_cast<size_t>(lsa_ranks + num_local_experts + 1) * sizeof(int32_t), ep_group->alloc.context));
-        // Payload consumers wait for CTA 0 to publish the receiver layout.
-        CUDA_CHECK(ep_group->alloc.alloc_fn(
-            reinterpret_cast<void**>(&ep_group->ht_buffers.pull_layout_ready),
-            sizeof(int32_t), ep_group->alloc.context));
-        CUDA_CHECK(ep_group->alloc.alloc_fn(
-            reinterpret_cast<void**>(&ep_group->ht_buffers.pull_map_layout),
-            static_cast<size_t>(lsa_ranks + num_local_experts) * sizeof(int32_t), ep_group->alloc.context));
+            static_cast<size_t>(lsa_ranks + num_local_experts + 2) * sizeof(int32_t), ep_group->alloc.context));
     }
 
     // =========================================================================
@@ -1724,14 +1716,6 @@ static ncclResult_t destroy_ht_intranode(ncclEpGroup_t ep_group) {
     if (ep_group->ht_buffers.pull_recv_cursor) {
         ep_group->alloc.free_fn(ep_group->ht_buffers.pull_recv_cursor, ep_group->alloc.context);
         ep_group->ht_buffers.pull_recv_cursor = nullptr;
-    }
-    if (ep_group->ht_buffers.pull_layout_ready) {
-        ep_group->alloc.free_fn(ep_group->ht_buffers.pull_layout_ready, ep_group->alloc.context);
-        ep_group->ht_buffers.pull_layout_ready = nullptr;
-    }
-    if (ep_group->ht_buffers.pull_map_layout) {
-        ep_group->alloc.free_fn(ep_group->ht_buffers.pull_map_layout, ep_group->alloc.context);
-        ep_group->ht_buffers.pull_map_layout = nullptr;
     }
 
     // Free merged completion flags local allocation
@@ -6843,25 +6827,23 @@ ncclResult_t ncclEpDispatch(
                 }
                 // Pull-count: the recv-map rebuild (Phase 0 + Phase 1) runs inside this dispatch
                 // launch's MAP warp group, never in UpdateHandle, so the cursors/flags it claims
-                // through need a fresh per-call zero here.
+                // through need a fresh per-call zero (done by the fused head gate in-kernel).
                 const uint8_t* const* pull_meta_ptrs = nullptr;
                 int pull_topk_off_bytes = 0;
                 int32_t* pull_rank_cursor = nullptr;
                 int32_t* pull_expert_cursor = nullptr;
                 int32_t* pull_layout_ready = nullptr;
-                int32_t* pull_layout_slot_base = nullptr;
-                int32_t* pull_layout_expert_base = nullptr;
                 if (pull_count_rebuild) {
                     const size_t count_row_ints = ht_pull_count_row_ints(group, handle->layout);
                     pull_meta_ptrs = reinterpret_cast<const uint8_t* const*>(group->ht_buffers.pull_meta_ptrs);
                     pull_topk_off_bytes = static_cast<int>(count_row_ints * sizeof(int32_t));
                     pull_rank_cursor = group->ht_buffers.pull_recv_cursor;
                     pull_expert_cursor = group->ht_buffers.pull_recv_cursor + lsa_ranks;
-                    pull_layout_ready = group->ht_buffers.pull_layout_ready;
-                    pull_layout_slot_base = group->ht_buffers.pull_map_layout;
-                    pull_layout_expert_base = group->ht_buffers.pull_map_layout + lsa_ranks;
-                    // +1: the phantom-row fixup's grid arrival counter (trailing slot).
-                    if (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR) {
+                    pull_layout_ready = pull_expert_cursor + group->num_local_experts + 1;
+                    // Flat builds no cursors; inline EM resets them in its head gate.
+                    if (handle->layout == NCCL_EP_LAYOUT_EXPERT_MAJOR &&
+                        nccl_ep_env_flag_on(group->env.ht_unfused_sync)) {
+                        // +1: the phantom-row fixup's grid arrival counter (trailing slot).
                         CUDA_CHECK(cudaMemsetAsync(
                             pull_rank_cursor, 0,
                             static_cast<size_t>(lsa_ranks + group->num_local_experts + 1) * sizeof(int32_t), stream));
@@ -6985,8 +6967,6 @@ ncclResult_t ncclEpDispatch(
                     pull_count_rebuild ? handle->ht.dispatch_push_count.own_row : nullptr,
                     pull_count_rebuild ? static_cast<const uint16_t*>(handle->ht.topk_idx) : nullptr,
                     pull_count_rebuild ? group->ht_buffers.pull_meta_staging : nullptr,
-                    pull_layout_slot_base,
-                    pull_layout_expert_base,
                     pull_count_rebuild && !handle->ht.dispatch_push_count.fused_meta_dispatch
                         ? handle->ht.dispatch_push_count.cached_cnt_rows : nullptr,
                     pull_caller_offsets,

@@ -573,7 +573,8 @@ inline int pull_dispatch_warps(int hidden_int4, int scale_tma_row_bytes, size_t 
                                bool flat) {
     const size_t total_budget = smem_optin / static_cast<size_t>(std::max(1, blocks_per_sm));
     const size_t counter_bytes = map_only_warps > 0
-        ? (::ht_ep::kPullDispatchMapWarps + 1) * sizeof(unsigned) : 0;
+        ? (::ht_ep::kPullDispatchMapWarps + 1) * sizeof(unsigned) +
+          ::ht_ep::kPullDispatchMapScanBytes : 0;
     for (int warps = ::ht_ep::kPullDispatchMaxPullWarps; warps > map_only_warps; --warps) {
         const int payload_warps = warps - map_only_warps;
         size_t static_bytes = payload_warps * pull_static_smem_bytes_per_warp() + counter_bytes;
@@ -752,7 +753,7 @@ launch_dispatch_pull_variant(int num_blocks, int blocks_per_sm, ::ht_ep::dispatc
     variant.dynamic_smem_bytes = pull_dynamic_smem_bytes(hidden_int4, scale_tma_row_bytes, payload_warps) +
         static_cast<int>(map_smem_bytes);
     variant.nucs = nucs;
-    variant.require_full_residency = param.flat && fused_map && !param.unfused_sync;
+    variant.require_full_residency = fused_map && !param.unfused_sync;
     variant.cooperative = variant.require_full_residency;
 
     std::string error;

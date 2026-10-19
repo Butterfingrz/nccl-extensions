@@ -2580,8 +2580,6 @@ ncclResult_t launch_dispatch_pull(
     const int32_t* own_row,
     const uint16_t* own_topk_snapshot,
     uint8_t* own_meta_staging,
-    int32_t* layout_slot_base,
-    int32_t* layout_expert_base,
     const int32_t* cached_cnt_rows,
     void* caller_offsets,
     void* caller_counts,
@@ -2652,8 +2650,6 @@ ncclResult_t launch_dispatch_pull(
         p.own_row = own_row;
         p.own_topk_snapshot = own_topk_snapshot;
         p.own_meta_staging = own_meta_staging;
-        p.layout_slot_base = layout_slot_base;
-        p.layout_expert_base = layout_expert_base;
         p.cached_cnt_rows = cached_cnt_rows;
         p.caller_offsets = caller_offsets;
         p.caller_counts = caller_counts;
