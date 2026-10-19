@@ -5199,6 +5199,7 @@ void printUsage(const char* programName, int myRank) {
             "                             Ignored in LL mode.\n");
         printf("  --zcopy                 Use ncclMemAlloc buffers + windows for supported direct token/scale paths\n");
         printf("  --overflow-drop          HT: NCCL_EP_OVERFLOW_DROP instead of trapping on overflow\n");
+        printf("  --ht-flow <f>            HT flow: auto (default) | push-pull | pull-push\n");
         printf("  --meta-exchange-policy <p>  HT: metadata exchange policy: auto (default) | require-fused | force-scan\n");
         printf("  --max-num-sms <N>       Shared dispatch/combine SM fallback (0 = auto, default: 0)\n");
         printf("  --dispatch-num-sms <N>  Dispatch SM budget (0 = inherit shared budget)\n");
@@ -5276,6 +5277,7 @@ int main(int argc, char* argv[]) {
     size_t expert_major_alignment = 0;  // 0 = no padding; >1 aligns each expert zone
     unsigned int max_recv_tokens_per_rank = UINT_MAX;  // HT only; UINT_MAX = unset -> bench auto; 0 = lib auto (worst case)
     bool overflow_drop = false;  // HT only; NCCL_EP_OVERFLOW_DROP instead of the library default (trap)
+    ncclEpHtFlow_t ht_flow = NCCL_EP_HT_FLOW_AUTO;  // HT only; --ht-flow
     ncclEpMetaExchangePolicy_t meta_exchange_policy = NCCL_EP_META_EXCHANGE_AUTO;  // HT only; --meta-exchange-policy
     bool zcopy = false;  // Use ncclMemAlloc + windows for supported direct token/scale paths
     unsigned int max_num_sms = NCCL_EP_AUTO;  // Automatic SM assignment for different EP stages
@@ -5347,6 +5349,7 @@ int main(int argc, char* argv[]) {
         {"backward", no_argument, 0, 'B'},
         {"overflow-drop", no_argument, 0, 1008},
         {"meta-exchange-policy", required_argument, 0, 1010},
+        {"ht-flow", required_argument, 0, 1011},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -5597,6 +5600,21 @@ int main(int argc, char* argv[]) {
             } else {
                 if (myRank == 0) {
                     printf("Error: Invalid --meta-exchange-policy '%s'. Use 'auto', 'require-fused', or 'force-scan'\n", optarg);
+                }
+                MPI_Finalize();
+                return 1;
+            }
+            break;
+        case 1011:  // --ht-flow
+            if (strcmp(optarg, "auto") == 0) {
+                ht_flow = NCCL_EP_HT_FLOW_AUTO;
+            } else if (strcmp(optarg, "push-pull") == 0) {
+                ht_flow = NCCL_EP_HT_FLOW_PUSH_PULL;
+            } else if (strcmp(optarg, "pull-push") == 0) {
+                ht_flow = NCCL_EP_HT_FLOW_PULL_PUSH;
+            } else {
+                if (myRank == 0) {
+                    printf("Error: Invalid --ht-flow '%s'. Use 'auto', 'push-pull', or 'pull-push'\n", optarg);
                 }
                 MPI_Finalize();
                 return 1;
@@ -5917,6 +5935,9 @@ int main(int argc, char* argv[]) {
         printf("  Profile mode:    %s\n", profile_mode ? "enabled" : "disabled");
         printf("  NVLink:          %s\n", disable_nvlink ? "disabled (force RDMA intranode, LL only)" : "enabled");
         printf("  Validate mode:   %s\n", validate_data ? "enabled" : "disabled");
+        printf("  HT flow:         %s\n",
+               ht_flow == NCCL_EP_HT_FLOW_PUSH_PULL ? "push-pull" :
+               ht_flow == NCCL_EP_HT_FLOW_PULL_PUSH ? "pull-push" : "auto");
         printf("  Meta exchange:   %s\n",
                meta_exchange_policy == NCCL_EP_META_EXCHANGE_REQUIRE_FUSED ? "require-fused" :
                meta_exchange_policy == NCCL_EP_META_EXCHANGE_FORCE_SCAN    ? "force-scan" : "auto");
@@ -6037,6 +6058,7 @@ int main(int argc, char* argv[]) {
     }
     config.max_recv_tokens_per_rank = max_recv_tokens_per_rank;
     if (overflow_drop) config.overflow_policy = NCCL_EP_OVERFLOW_DROP;
+    config.ht_flow = ht_flow;
     config.meta_exchange_policy = meta_exchange_policy;
     config.max_num_sms = max_num_sms;
     config.zero_copy = zcopy ? NCCL_EP_ZERO_COPY_ON : NCCL_EP_ZERO_COPY_AUTO;
