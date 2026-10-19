@@ -685,6 +685,7 @@ inline ncclResult_t launch_combine_reduce_stage(
     static const int variant_identity = 0;
     assert((row_bytes % 16) == 0);
     const int hidden_int4 = row_bytes / 16;
+    const int block_dim = flat ? ::ht_ep::kLocalPermuteReduceThreads : ::ht_ep::kCombineReduceThreads;
     const char* token_dtype_literal = ::nccl_ep::jit::token_dtype_literal(token_dtype);
     const char* backward_literal = backward ? "true" : "false";
 
@@ -702,11 +703,12 @@ inline ncclResult_t launch_combine_reduce_stage(
         std::ostringstream src;
         src << "#include \"device/ht_ep.cuh\"\n"
             << "\n"
-            << "extern \"C\" __launch_bounds__(" << ::ht_ep::kCombineReduceThreads << ", 1)\n"
+            << "extern \"C\" __launch_bounds__(" << block_dim << ", 1)\n"
             << "__global__ void " << kCombineReduceJitEntryName << "(\n"
             << "    const __grid_constant__ ::ht_ep::combine_reduce_param_t p) {\n"
             << "  ::ht_ep::combine_reduce<" << hidden_int4 << ", " << token_dtype_literal << ", "
-            << backward_literal << ", " << ::nccl_ep::jit::bool_literal(param.retained_slots != nullptr) << ">(\n"
+            << backward_literal << ", " << ::nccl_ep::jit::bool_literal(param.retained_slots != nullptr)
+            << ", " << ::nccl_ep::jit::bool_literal(flat) << ">(\n"
             << "      reinterpret_cast<uint8_t*>(p.attn_output),\n"
             << "      reinterpret_cast<const uint8_t*>(p.staging),\n"
             << "      p.topk_idx,\n"
@@ -740,7 +742,7 @@ inline ncclResult_t launch_combine_reduce_stage(
         }
     }
     variant.num_blocks = num_blocks;
-    variant.block_dim = ::ht_ep::kCombineReduceThreads;
+    variant.block_dim = block_dim;
     variant.dynamic_smem_bytes = 0;
 
     std::string error;

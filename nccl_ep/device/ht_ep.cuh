@@ -8305,7 +8305,8 @@ struct combine_reduce_param_t {
 // [t*team_size + 0..team_size) into attn_output[t]. Which partials exist is derived from
 // this rank's own routing (topk_idx): token t has a partial from rank R iff one of its
 // top-k experts lives on R -- unwritten slots are skipped (no staging zero-init needed).
-template <int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE, bool CheckRetained>
+template <int HiddenInt4, ncclDataType_t kTokenDtype, bool BACKWARD_COMBINE,
+          bool CheckRetained, bool Flat>
 __device__ __forceinline__ void combine_reduce(
     uint8_t* __restrict__ attn_output,
     const uint8_t* __restrict__ staging,
@@ -8321,16 +8322,21 @@ __device__ __forceinline__ void combine_reduce(
     int top_k,
     const int32_t* retained_slots) {
     constexpr int kRowBytes = HiddenInt4 * 16;
-    constexpr int kSlotsPerBlock = kCombineReduceSlotsPerBlock;
-    constexpr int kUnroll = kCombineReduceUnroll;
-    constexpr int kRankGroup = kCombineReduceRankGroup;
-    constexpr int kChunkInt4 = kUnroll * 32;
-    constexpr int kNumChunks = (HiddenInt4 + kChunkInt4 - 1) / kChunkInt4;
+    // Flat spreads small batches across CTAs with four warps per token.
+    constexpr int kThreadsPerSlot = Flat
+        ? kLocalPermuteReduceThreads / kLocalPermuteReduceSlotsPerBlock : 32;
+    constexpr int kSlotsPerBlock = Flat ? kLocalPermuteReduceSlotsPerBlock : kCombineReduceSlotsPerBlock;
+    constexpr int kElemsPerThread = nccl_ep::ceil_div(HiddenInt4, kThreadsPerSlot);
+    constexpr int kFlatUnroll = kElemsPerThread < 4 ? kElemsPerThread : 4;
+    constexpr int kUnroll = Flat ? kFlatUnroll : kCombineReduceUnroll;
+    constexpr int kRankGroup = Flat ? 1 : kCombineReduceRankGroup;
+    constexpr int kChunkInt4 = kUnroll * kThreadsPerSlot;
+    constexpr int kNumChunks = nccl_ep::ceil_div(HiddenInt4, kChunkInt4);
     constexpr bool kExactChunks = (HiddenInt4 % kChunkInt4) == 0;
     constexpr int kPairs = nccl_ep::pairs_per_int4<kTokenDtype>();
 
     const int tid = threadIdx.x;
-    const int slot_in_block = tid / 32;
+    const int slot_in_block = tid / kThreadsPerSlot;
     const int slot_stride = kSlotsPerBlock * static_cast<int>(gridDim.x);
 
     // One expert per warp lane, so num_topk must fit the warp width.
@@ -8350,6 +8356,7 @@ __device__ __forceinline__ void combine_reduce(
         // one team; multi-team would need the global expert count and a team-aware decode. Out-of-range
         // / sentinel ids drop. Each warp lane holds one expert (num_topk <= MAX_NUM_TOPK).
         const int wlane = static_cast<int>(threadIdx.x) & 31;
+        const int slot_thread = Flat ? tid % kThreadsPerSlot : wlane;
         const int e_id = (wlane < num_topk)
                              ? static_cast<int>(topk_idx[static_cast<size_t>(t) * num_topk + wlane])
                              : -1;
@@ -8364,19 +8371,19 @@ __device__ __forceinline__ void combine_reduce(
         const bool rank_leader = rank_valid && ((__ffs(static_cast<int>(same_rank)) - 1) == wlane);
         const unsigned present_ranks = __ballot_sync(0xFFFFFFFFu, rank_leader);
 
-        // Backward: srcpos slot `wlane` was pushed by the rank hosting that expert
+        // Backward: srcpos slot `slot_thread` was pushed by the rank hosting that expert
         // (src_rank_of_lane), co-located in that rank's token staging row pad (offset kRowBytes).
         // Out-of-team / unrouted slots yield zero.
         if constexpr (BACKWARD_COMBINE) {
-            if (wlane < top_k) {
+            if (slot_thread < top_k) {
                 float w = 0.0f;
                 if (src_rank_of_lane >= 0) {
                     const float* prob_row = reinterpret_cast<const float*>(
                         staging + (static_cast<size_t>(t) * lsa_team_size + src_rank_of_lane) *
                                       comb_stage_stride_bytes(kRowBytes, /*reserve_prob=*/true) + kRowBytes);
-                    w = prob_row[wlane];
+                    w = prob_row[slot_thread];
                 }
-                combined_topk_weights[static_cast<size_t>(t) * top_k + wlane] = w;
+                combined_topk_weights[static_cast<size_t>(t) * top_k + slot_thread] = w;
             }
         }
 
@@ -8390,7 +8397,7 @@ __device__ __forceinline__ void combine_reduce(
             bool valid_u[kUnroll];
 #pragma unroll
             for (int u = 0; u < kUnroll; u++) {
-                js[u] = (c * kUnroll + u) * 32 + wlane;
+                js[u] = (c * kUnroll + u) * kThreadsPerSlot + slot_thread;
                 valid_u[u] = kExactChunks || (js[u] < HiddenInt4);
             }
 
