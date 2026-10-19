@@ -7213,11 +7213,13 @@ ncclResult_t ncclEpCombine(
         // Resolve x's own window binding (if any) -- combine_kernel_impl_1sided_rm_lsa pulls
         // directly from peer ranks' inData via ncclGetPeerPointer, which requires x (inputs->
         // tokens, typically the same window-backed tensor ncclEpDispatch wrote its zero-copy
-        // output into) to carry a window handle. Harmless/no-op when x isn't window-backed --
-        // call_combine's one_sided_eligible just stays false in that case and the 2-sided path is
-        // unaffected.
+        // output into) to carry a window handle. AFD attention ranks do not own experts and may
+        // omit inputs->tokens; they use the universal 2-sided path, which does not consume these
+        // window fields.
         ncclEpTensor_t x_local;
-        NCCLCHECK(resolveTensorWindowBinding(handle->group, x, &x_local, 0, &x));
+        if (x != nullptr) {
+            NCCLCHECK(resolveTensorWindowBinding(handle->group, x, &x_local, 0, &x));
+        }
 
         const ncclEpTensor_t* topk_idx = &handle->topk_idx;
         const ncclEpTensor_t* src_info = &handle->ll.expert_recv_source_indices;
@@ -7370,8 +7372,8 @@ ncclResult_t ncclEpCombine(
                 params.inGlobalScales = global_scales ? static_cast<const float*>(global_scales->data) : nullptr;
                 params.srcInfo = src_info_data;
                 params.dstInfo = dst_info_data;
-                params.inDataWindow = x->win_hdl;
-                params.inDataWindowOffset = static_cast<size_t>(x->win_offset);
+                params.inDataWindow = x ? x->win_hdl : ncclWindow_t{};
+                params.inDataWindowOffset = x ? static_cast<size_t>(x->win_offset) : 0;
                 params.layoutRange = layout_range_data;
                 params.inTopkIdx = topk_idx_data;
                 params.topkIdxIsInt64 = topk_is_int64;
