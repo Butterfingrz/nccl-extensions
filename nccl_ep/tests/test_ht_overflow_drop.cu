@@ -93,6 +93,7 @@ TEST_F(HtOverflowDropTest, DispatchCombineContinueOnOverflow) {
                        !ht_ag_scan_mode_active() && !ht_count_unfused_active() &&
                        ncclEpHandle_test_getNRanksPerNode(h) == g_nranks;
     NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_, fused ? nullptr : &li, g_stream));
+    EXPECT_EQ(ht_count_fused_active(h), fused);
     ASSERT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess)
         << "Rank " << g_rank << ": ncclEpUpdateHandle trapped on recv overflow; "
            "NCCL_EP_OVERFLOW_DROP should drop tokens instead of __trap().";
@@ -270,11 +271,11 @@ TEST_F(HtOverflowDropTest, FlatFusedDropRecount) {
     NCCL_ASSERT(ncclEpInitHandle(&h, g_ep_group_drop, NCCL_EP_LAYOUT_FLAT,
                                  /*config=*/nullptr, kTopK, /*handle_mem=*/nullptr));
     ASSERT_NE(h, nullptr);
+    NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_, nullptr, g_stream));
     if (!ht_count_fused_active(h)) {
         (void)ncclEpHandleDestroy(h);
         GTEST_SKIP() << "fused count mode only";
     }
-    NCCL_ASSERT(ncclEpUpdateHandle(h, t_topk_, nullptr, g_stream));
     CUDA_ASSERT(cudaStreamSynchronize(g_stream));
 
     const int E_local = kNumExperts / g_nranks;

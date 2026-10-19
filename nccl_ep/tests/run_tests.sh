@@ -252,7 +252,7 @@ for entry in "${SUITES[@]}"; do
     [[ " ${PULL_PUSH_SUITES} " == *" ${bin} "* ]] || continue
     run_suite "${bin}" "${desc} (Pull-Push)"
 done
-OVERFLOW_DROP_PULL_COUNT_FILTER="HtOverflowDropTest.DispatchCombineContinueOnOverflow:HtOverflowDropTest.EmLocalPermuteAlignedDropNoOob:HtOverflowDropTest.EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed"
+OVERFLOW_DROP_PULL_COUNT_FILTER="HtOverflowDropTest.DispatchCombineContinueOnOverflow:HtOverflowDropTest.FlatFusedDropRecount:HtOverflowDropTest.EmLocalPermuteAlignedDropNoOob:HtOverflowDropTest.EmLocalPermuteDeepFlatOverflowPhantomRowsZeroed"
 [[ -z "${TEST_SUITE}" || "${TEST_SUITE}" == "test_lifecycle" ]] && \
     run_suite "test_lifecycle" "EP HT Imported Handles (Pull-Count)" 4 \
         "LifecycleTest.ImportsRelocatedPreparedHandleMem:LifecycleTest.ImportedHandleSelectsDispatchChunkFromNumTokens"

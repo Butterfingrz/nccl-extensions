@@ -201,6 +201,7 @@ struct State {
         const bool fused = fused_count_mode() && !layout_info_at_update &&
                            ncclEpHandle_test_getNRanksPerNode(handle) == g_nranks;
         NCCL_ASSERT(ncclEpUpdateHandle(handle, ids, fused ? nullptr : &info, g_stream));
+        EXPECT_EQ(ht_count_fused_active(handle), fused);
         CUDA_ASSERT(cudaStreamSynchronize(g_stream));
     }
 
@@ -517,6 +518,102 @@ TEST_F(HtCompactProbTest, RejectsBackwardWidthMismatch) {
     ASSERT_NO_FATAL_FAILURE(s.backward());
 }
 
+TEST_F(HtCompactProbTest, FlatFusedMapsRequireMatchingForward) {
+    if (!fused_count_mode()) {
+        GTEST_SKIP() << "fused metadata only";
+    }
+    constexpr int topk = 8, experts = 256;
+    const int capacity = g_nranks * kTokens;
+    ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, capacity, false, kTokens, &group_));
+    State s;
+    ASSERT_NO_FATAL_FAILURE(s.initialize(group_, false, false, topk, experts, capacity, kAlignment, false));
+    if (ncclEpHandle_test_getNRanksPerNode(s.handle) != g_nranks) {
+        GTEST_SKIP() << "single LSA team only";
+    }
+    ncclEpDispatchInputs_t dispatch_input = NCCL_EP_DISPATCH_INPUTS_INIT;
+    ncclEpDispatchOutputs_t dispatch_output = NCCL_EP_DISPATCH_OUTPUTS_INIT;
+    ncclEpDispatchConfig_t dispatch_config = NCCL_EP_DISPATCH_CONFIG_INIT;
+    dispatch_input.tokens = s.x;
+    dispatch_output.tokens = s.rx;
+    dispatch_config.pass_direction = NCCL_EP_BWD_PASS;
+    ncclEpCombineInputs_t combine_input = NCCL_EP_COMBINE_INPUTS_INIT;
+    ncclEpCombineOutputs_t combine_output = NCCL_EP_COMBINE_OUTPUTS_INIT;
+    ncclEpCombineConfig_t combine_config = NCCL_EP_COMBINE_CONFIG_INIT;
+    combine_input.tokens = s.rx;
+    combine_output.tokens = s.cx;
+    for (int generation : {0, 1}) {
+        ASSERT_NO_FATAL_FAILURE(s.update(kTokens, generation, false));
+        ASSERT_TRUE(ht_count_fused_active(s.handle));
+        EXPECT_EQ(ncclEpDispatch(s.handle, &dispatch_input, &dispatch_output, nullptr,
+                                 &dispatch_config, g_stream), ncclInvalidUsage);
+        EXPECT_EQ(ncclEpCombine(s.handle, &combine_input, &combine_output,
+                                &combine_config, g_stream), ncclInvalidUsage);
+        ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
+        ASSERT_NO_FATAL_FAILURE(s.backward());
+    }
+}
+
+TEST_F(HtCompactProbTest, FlatPullCounterWindowAndIgnoredOffsets) {
+    if (!ht_pull_push_active() || !fused_count_mode()) {
+        GTEST_SKIP() << "fused flat pull metadata only";
+    }
+    constexpr int topk = 8, experts = 256;
+    const int capacity = g_nranks * kTokens;
+    const int local_experts = experts / g_nranks;
+    ASSERT_NO_FATAL_FAILURE(create_group(experts, topk, capacity, false, kTokens, &group_));
+    State s;
+    ASSERT_NO_FATAL_FAILURE(s.initialize(group_, false, false, topk, experts, capacity, kAlignment, false));
+    if (ncclEpHandle_test_getNRanksPerNode(s.handle) != g_nranks) {
+        GTEST_SKIP() << "single LSA team only";
+    }
+    ASSERT_NO_FATAL_FAILURE(s.update(kTokens, 0, false));
+    ncclWindow_t window{};
+    NCCL_ASSERT(ncclCommWindowRegister(g_comm, s.counts.p, s.counts.size * sizeof(int64_t),
+                                      &window, NCCL_WIN_COLL_SYMMETRIC));
+    ASSERT_NO_FATAL_FAILURE(s.tensor(&s.counts_tensor, 1, ncclInt32, nullptr, local_experts));
+    s.counts_tensor->win_hdl = window;
+    ASSERT_NO_FATAL_FAILURE(s.tensor(&s.offsets_tensor, 1, ncclInt64, s.offsets.p, local_experts));
+    CUDA_ASSERT(cudaMemset(s.offsets.p, 0xA5, s.offsets.size * sizeof(int64_t)));
+    ncclEpLayoutInfo_t info = NCCL_EP_LAYOUT_INFO_INIT;
+    info.expert_offsets = s.offsets_tensor;
+    NCCL_ASSERT(ncclEpUpdateHandle(s.handle, s.ids, &info, g_stream));
+    EXPECT_TRUE(ht_count_fused_active(s.handle));
+    info.expert_counters = s.counts_tensor;
+    NCCL_ASSERT(ncclEpUpdateHandle(s.handle, s.ids, &info, g_stream));
+    EXPECT_EQ(ncclEpHandle_test_getMetadataMode(s.handle), NCCL_EP_TEST_META_SCAN);
+    CUDA_ASSERT(cudaStreamSynchronize(g_stream));
+    auto check_counters = [&]() {
+        std::vector<int32_t> actual(local_experts), expected(local_experts, 0);
+        CUDA_ASSERT(cudaMemcpy(actual.data(), s.counts.p, actual.size() * sizeof(int32_t),
+                                cudaMemcpyDeviceToHost));
+        for (int source = 0; source < g_nranks; ++source) {
+            for (int token = 0; token < kTokens; ++token) {
+                for (int k = 0; k < topk; ++k) {
+                    const int64_t expert = route(source, token, k, topk, experts, 0);
+                    if (expert >= g_rank * local_experts && expert < (g_rank + 1) * local_experts) {
+                        ++expected[expert % local_experts];
+                    }
+                }
+            }
+        }
+        EXPECT_EQ(actual, expected);
+        std::vector<int64_t> offsets;
+        ASSERT_NO_FATAL_FAILURE(s.offsets.download(offsets, local_experts));
+        for (int64_t offset : offsets) {
+            EXPECT_EQ(static_cast<uint64_t>(offset), UINT64_C(0xA5A5A5A5A5A5A5A5));
+        }
+    };
+    ASSERT_NO_FATAL_FAILURE(check_counters());
+    ASSERT_NO_FATAL_FAILURE(s.update(kTokens, 0, false));
+    CUDA_ASSERT(cudaMemset(s.counts.p, 0xA5, s.counts.size * sizeof(int64_t)));
+    s.info.expert_counters = s.counts_tensor;
+    s.info.expert_offsets = s.offsets_tensor;
+    ASSERT_NO_FATAL_FAILURE(s.dispatch(0, false));
+    ASSERT_NO_FATAL_FAILURE(check_counters());
+    ASSERT_NO_FATAL_FAILURE(s.backward());
+    NCCL_ASSERT(ncclCommWindowDeregister(g_comm, window));
+}
+
 // Retain the process setting: this test creates differently configured groups
 // in one process to catch JIT fast-cache aliasing as well as late getenv reads.
 struct ScopedRecvTopkOrderEnv {
@@ -742,9 +839,6 @@ TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevel) {
 // Same exact rank-level budget on the fused path: no layout info at UpdateHandle, so the
 // dispatch MAP warps apply the budget check and publish recv_total_counter themselves.
 TEST_F(HtCompactProbTest, FlatRecvBudgetIsRankLevelFused) {
-    if (ht_pull_push_active()) {
-        GTEST_SKIP() << "This case exercises HT Flat count mode";
-    }
     if (enabled("NCCL_EP_HT_EM_LOCAL_DUP") || enabled("NCCL_EP_HT_EM_NVLINK_DUP"))
         GTEST_SKIP() << "EM duplication modes need more recv budget than the exact FLAT fixture";
     if (!fused_count_mode())

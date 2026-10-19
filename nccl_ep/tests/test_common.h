@@ -100,14 +100,13 @@ static int g_rank = -1;
 static int g_nranks = -1;
 static std::string g_uid_file;
 
-// Handle-aware variants of ht_count_mode_active / ht_count_fused_active: also require the single
-// LSA team count mode needs (internode groups fall back to scan).
+// Query the resolved handle path, including explicit policy and early layout outputs.
 static inline bool ht_count_mode_active(ncclEpHandle_t handle) {
-    return ht_count_mode_active() && ncclEpHandle_test_getNRanksPerNode(handle) == g_nranks;
+    return ncclEpHandle_test_getMetadataMode(handle) != NCCL_EP_TEST_META_SCAN;
 }
 
 static inline bool ht_count_fused_active(ncclEpHandle_t handle) {
-    return ht_count_mode_active(handle) && !ht_count_unfused_active();
+    return ncclEpHandle_test_getMetadataMode(handle) == NCCL_EP_TEST_META_FUSED;
 }
 
 static ncclComm_t g_comm = nullptr;
