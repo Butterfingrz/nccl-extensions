@@ -8770,6 +8770,7 @@ __device__ __forceinline__ void flat_consume_maps(
         }
         first_slot = __shfl_sync(0xffffffffu, first_slot, 0);
         count = __shfl_sync(0xffffffffu, count, 0);
+        __syncwarp();
         const int offset = ticket % kTileTokens;
         const int end = min(offset + static_cast<int>(kSlotBatch), count);
         for (int i = offset; i < end; ++i) {

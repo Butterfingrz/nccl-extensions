@@ -24,6 +24,7 @@ enum class JitKernelStatus {
     kLoadFailed,
     kAttributeFailed,
     kLaunchFailed,
+    kInsufficientResidency,
 };
 
 struct JitKernelVariant {
@@ -43,6 +44,8 @@ struct JitKernelVariant {
     // Cluster dim > 1 enables distributed shared memory across the cluster.
     bool nucs = false;
     bool cooperative = false;
+    // Validate grid residency using the compiled kernel before enqueueing it.
+    bool require_full_residency = false;
     int cluster_dim_x = 1;
     int cluster_dim_y = 1;
     int cluster_dim_z = 1;

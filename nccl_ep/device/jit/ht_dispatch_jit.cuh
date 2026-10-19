@@ -614,25 +614,6 @@ inline size_t pull_device_smem_optin() {
     return cached_cap;
 }
 
-// Grid-wide gates require the requested blocks to fit the resident-thread budget.
-inline int pull_device_max_threads_per_sm() {
-    static thread_local int cached_dev = -1;
-    static thread_local int cached_cap = 0;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) {
-        return 1024;
-    }
-    if (dev != cached_dev) {
-        int cap = 0;
-        if (cudaDeviceGetAttribute(&cap, cudaDevAttrMaxThreadsPerMultiProcessor, dev) != cudaSuccess || cap <= 0) {
-            return 1024;
-        }
-        cached_cap = cap;
-        cached_dev = dev;
-    }
-    return cached_cap;
-}
-
 // Non-zero => move the QUANT_FWD scale row by TMA through smem instead of a register-held
 // ld/st pair. Requires a 16B-multiple row (cp.async.bulk granularity) and enough smem.
 inline int pull_scale_tma_row_bytes(int hidden_int4, ncclEpDispQuant_t recipe, int scale_row_bytes,
@@ -678,15 +659,11 @@ inline std::string dispatch_pull_jit_source(int hidden_int4, int blocks_per_sm, 
 }
 
 inline ncclResult_t
-launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, ncclEpDispQuant_t recipe,
-                     cudaStream_t stream, bool nucs) {
+launch_dispatch_pull_variant(int num_blocks, int blocks_per_sm, ::ht_ep::dispatch_pull_param_t& param,
+                             ncclEpDispQuant_t recipe, cudaStream_t stream, bool nucs, bool* retry_residency) {
     static const int variant_identity = 0;
     assert((param.row_bytes % 16) == 0);
     const int hidden_int4 = param.row_bytes / 16;
-    const int max_cta_threads = param.flat ? ::ht_ep::kPullDispatchMaxPullWarps * 32
-        : ::ht_ep::pull_dispatch_threads(::ht_ep::kPullDispatchMaxPullWarps);
-    const int blocks_per_sm = std::max(1, std::min(pick_pull_blocks_per_sm(hidden_int4),
-        pull_device_max_threads_per_sm() / max_cta_threads));
     // Per-lane int4 capacity for the FWD scale row, sized from the actual scale row so
     // any scale dtype / quantization block size fits (1 for NONE, where scale_row_bytes==0).
     const int scale_int4_per_lane = std::max(1, ((param.scale_row_bytes / 16) + 31) / 32);
@@ -775,9 +752,15 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
     variant.dynamic_smem_bytes = pull_dynamic_smem_bytes(hidden_int4, scale_tma_row_bytes, payload_warps) +
         static_cast<int>(map_smem_bytes);
     variant.nucs = nucs;
+    variant.require_full_residency = param.flat && fused_map && !param.unfused_sync;
+    variant.cooperative = variant.require_full_residency;
 
     std::string error;
     const ::nccl_ep::jit::JitKernelStatus status = ::nccl_ep::jit::launch_jit_kernel(variant, &param, stream, &error);
+    if (status == ::nccl_ep::jit::JitKernelStatus::kInsufficientResidency && blocks_per_sm > 1) {
+        *retry_residency = true;
+        return ncclInvalidUsage;
+    }
 
     if (status != ::nccl_ep::jit::JitKernelStatus::kLaunched) {
         // The oversize-hidden smem case (kAttributeFailed) is pre-rejected in ncclEpDispatch
@@ -790,6 +773,20 @@ launch_dispatch_pull(int num_blocks, ::ht_ep::dispatch_pull_param_t& param, nccl
         return ncclInternalError;
     }
     return ncclSuccess;
+}
+
+inline ncclResult_t launch_dispatch_pull(
+    int num_blocks, ::ht_ep::dispatch_pull_param_t& param, ncclEpDispQuant_t recipe,
+    cudaStream_t stream, bool nucs) {
+    const int blocks_per_sm = pick_pull_blocks_per_sm(param.row_bytes / 16);
+    bool retry_residency = false;
+    ncclResult_t result = launch_dispatch_pull_variant(
+        num_blocks, blocks_per_sm, param, recipe, stream, nucs, &retry_residency);
+    if (retry_residency) {
+        retry_residency = false;
+        result = launch_dispatch_pull_variant(num_blocks, 1, param, recipe, stream, nucs, &retry_residency);
+    }
+    return result;
 }
 
 } // namespace jit
