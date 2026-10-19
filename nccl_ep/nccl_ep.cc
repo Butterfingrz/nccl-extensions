@@ -3675,11 +3675,13 @@ struct HtBlockLayout {
         const size_t ler_rows = em_staging_indexed_by_em_slot(ep_group)
                                     ? static_cast<size_t>(ep_group->max_recv_tokens)
                                     : ht_max_flat_recv_tokens(ep_group);
-        // Only EM count mode saves packed expert-membership rows.
-        const size_t ler_row_bytes = count_mode_capable && has_expert_major
-            ? nccl_ep::bit_words(experts_per_rank) * sizeof(uint64_t)
-            : experts_per_rank * sizeof(bool);
-        L.sz_ler = needs_pull_buffers && !has_expert_major ? 0 : align256(ler_rows * ler_row_bytes);
+        L.sz_ler = count_mode_capable ?
+                       align256(ht_max_flat_recv_tokens(ep_group) *
+                                nccl_ep::bit_words(experts_per_rank) * sizeof(uint64_t)) :
+                       align256(ler_rows * experts_per_rank * sizeof(bool));
+        if (needs_pull_buffers && !has_expert_major) {
+            L.sz_ler = 0;
+        }
         L.sz_ntfe = align256(sizeof(int32_t));
         // Match the existing receiver conversion's row capacity. Native EM has
         // one weight per slot; FLAT and EM-permute's internal FLAT scratch need
@@ -3703,13 +3705,13 @@ struct HtBlockLayout {
                        : align256(static_cast<size_t>(rdma_team_size) * max_tokens * s2d_inner_dim * sizeof(int32_t));
         // rank_mask and scan_tmp back the preprocessing scan only; count mode rebuilds the recv
         // tables from a device-side histogram and never runs it, so skip both for count handles.
-        L.sz_rank_mask = count_mode_capable && has_expert_major ? 0 : align256(
+        L.sz_rank_mask = count_mode_capable ? 0 : align256(
             static_cast<size_t>(rdma_team_size) * max_tokens * lsa_team_size *
             nccl_ep::ht::get_rank_mask_elem_size(lsa_team_size));
         // Size for device_sm_count blocks: the upper bound on the preprocessing
         // scan's block count (ep_group->preprocess_num_sms, incl. any
         // NCCL_EP_PREPROCESS_NUM_SMS override) so the buffer always fits.
-        L.sz_scan_tmp = count_mode_capable && has_expert_major ? 0 : align256(
+        L.sz_scan_tmp = count_mode_capable ? 0 : align256(
             nccl_ep::ht::get_preprocessing_scan_tmp_size(
                 static_cast<int>(ep_group->device_sm_count),
                 lsa_team_size));

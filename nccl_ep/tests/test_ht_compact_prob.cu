@@ -31,7 +31,8 @@ bool enabled(const char* name) {
 // dispatch_push_count_capable).
 bool fused_count_mode() {
     return !enabled("NCCL_EP_HT_EM_LOCAL_DUP") && !enabled("NCCL_EP_HT_EM_NVLINK_DUP") &&
-           !enabled("NCCL_EP_HT_EM_AG_SCAN_MODE") && !enabled("NCCL_EP_HT_EM_COUNT_UNFUSED");
+           !enabled("NCCL_EP_HT_PULL_PUSH") && !enabled("NCCL_EP_HT_EM_AG_SCAN_MODE") &&
+           !enabled("NCCL_EP_HT_EM_COUNT_UNFUSED");
 }
 
 template <typename T> struct DeviceBuffer {
