@@ -897,7 +897,9 @@ protected:
 };
 
 TEST_P(HtBwdChunkedCombineTest, CombineWithGradExpertMajorChunked) {
-    if (!ht_pull_push_active()) return;  // SetUp already emitted GTEST_SKIP
+    if (!ht_pull_push_active()) {
+        return;
+    }
 
     ncclEpHandle_t h = nullptr;
     NCCL_ASSERT(ncclEpCreateHandle(&h, group_, NCCL_EP_LAYOUT_EXPERT_MAJOR, topk_idx_em_, nullptr, nullptr, g_stream));

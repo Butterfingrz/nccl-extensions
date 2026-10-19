@@ -363,7 +363,9 @@ TEST_F(PublicStructAbiRuntimeTest, ExplicitPullPushSupportsFlatLayout) {
             &handle, group, NCCL_EP_LAYOUT_FLAT, topk_idx_, nullptr, nullptr, g_stream),
         ncclSuccess);
     EXPECT_EQ(cudaStreamSynchronize(g_stream), cudaSuccess);
-    if (handle != nullptr) EXPECT_EQ(ncclEpHandleDestroy(handle), ncclSuccess);
+    if (handle != nullptr) {
+        EXPECT_EQ(ncclEpHandleDestroy(handle), ncclSuccess);
+    }
     EXPECT_EQ(ncclEpGroupDestroy(group), ncclSuccess);
 }
 

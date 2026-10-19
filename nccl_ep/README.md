@@ -586,7 +586,6 @@ ranks. Imported handles retain the scan-built routing maps.
 Combine supports `NCCL_EP_COMB_QUANT_NONE`; MXFP8 combine is not supported.
 Backward weight tensors use the handle's top-k width. Each token's nonnegative
 expert IDs must be unique; duplicate-ID handling is tracked separately in #138.
-See [the flat pull/push design](docs/plc/310-flat-pull-push/README.md).
 
 ### Eager mode
 
