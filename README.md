@@ -27,6 +27,7 @@ and `nccl_m2n` as `nccl.ep` and `nccl.m2n`. See
 ## Blogs and Papers
 
 - [NCCL EP powers dropless MoE training in JAX](https://developer.nvidia.com/blog/accelerating-dropless-moe-training-in-jax-with-nvidia-transformer-engine/)
+- [NCCL M2N: A Layout- and Topology-Aware Collective for Distributed Tensor Resharding](https://arxiv.org/abs/2610.07516)
 
 ## Installation
 
